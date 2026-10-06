@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Vintana — Financial Planning</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📊</text></svg>">
+  <link rel="stylesheet" href="https://fonts.bunny.net/css?family=inter:400,500,600,700&display=swap" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="tailwind.config.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/lucide@latest/dist/umd/lucide.min.js"></script>
+  <link rel="stylesheet" href="css/app.css" />
+</head>
+<body class="bg-gray-50 text-gray-900">
+  <div id="app" v-cloak>
+    <template v-if="!isLoggedIn">
+      <router-view></router-view>
+    </template>
+    <template v-else>
+      <app-sidebar :collapsed="sidebarCollapsed" @toggle="sidebarCollapsed = !sidebarCollapsed" />
+      <div :class="['transition-all duration-200 min-h-screen', sidebarCollapsed ? 'ml-16' : 'ml-56']">
+        <header class="sticky top-0 z-30 bg-white/80 backdrop-blur-sm border-b border-gray-200">
+          <div class="flex items-center justify-between px-6 h-14">
+            <div class="flex items-center gap-4">
+              <h2 class="text-sm font-semibold text-gray-900">{{ companyName }}</h2>
+            </div>
+            <div class="flex items-center gap-4">
+              <scenario-selector
+                v-if="scenarios.length > 0"
+                :scenarios="scenarios"
+                :model-value="scenarioId"
+                @update:model-value="scenarioId = $event"
+              />
+              <div class="flex items-center gap-2">
+                <month-picker :model-value="dateRange.start" @update:model-value="dateRange.start = $event" label="" />
+                <span class="text-gray-400 text-sm">to</span>
+                <month-picker :model-value="dateRange.end" @update:model-value="dateRange.end = $event" label="" />
+              </div>
+            </div>
+          </div>
+        </header>
+        <main class="p-6">
+          <router-view></router-view>
+        </main>
+      </div>
+      <div class="fixed bottom-4 right-4 z-50 space-y-2">
+        <transition-group name="toast">
+          <div
+            v-for="t in toasts"
+            :key="t.id"
+            :class="[
+              'px-4 py-3 rounded-lg shadow-lg text-sm font-medium max-w-sm',
+              t.type === 'error' ? 'bg-red-600 text-white' : 'bg-gray-900 text-white'
+            ]"
+          >
+            {{ t.message }}
+          </div>
+        </transition-group>
+      </div>
+    </template>
+  </div>
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
