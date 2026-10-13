@@ -1,5 +1,8 @@
 import { query, execute } from '../db.js';
-import { formatCents, monthLabel, generateMonthRange, currentMonth, ordinalDay } from '../utils.js';
+import {
+  formatCents, monthLabel, generateMonthRange, currentMonth, ordinalDay,
+  chargeFromMonthly, expenseMonthlyValues, forecastEnd, isChargeMonth,
+} from '../utils.js';
 
 export default {
   name: 'ExpensesView',
@@ -149,9 +152,10 @@ export default {
         .map(i => {
           let d = new Date(today.getFullYear(), today.getMonth(), i.renewal_day);
           if (d < today) d = new Date(today.getFullYear(), today.getMonth() + 1, i.renewal_day);
-          return { ...i, renewalDate: d };
+          const month = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+          return { ...i, renewalDate: d, renewalMonth: month, chargeAmount: chargeFromMonthly(i.cur_amount || 0, i.recurrence) };
         })
-        .filter(i => i.renewalDate <= in30)
+        .filter(i => i.renewalDate <= in30 && isChargeMonth(i.recurrence, i.start_month, i.renewalMonth))
         .sort((a, b) => a.renewalDate - b.renewalDate);
     });
 
@@ -171,7 +175,7 @@ export default {
         name: item.name, alias: item.alias || '', company: item.company || '',
         charge_label: item.charge_label || '', category_id: item.category_id,
         formula: item.formula || '', entryMode: item.formula ? 'formula' : 'manual',
-        amount: item.cur_amount ? (item.cur_amount / 100).toFixed(2) : '',
+        amount: item.cur_amount ? (chargeFromMonthly(item.cur_amount, item.recurrence) / 100).toFixed(2) : '',
         recurrence: item.recurrence, renewal_day: item.renewal_day,
         start_month: item.start_month || '', end_month: item.end_month || '',
         notes: item.notes || '',
@@ -219,9 +223,11 @@ export default {
             const cents = Math.round(parseFloat(f.amount) * 100);
             const itemId = res.lastInsertRowid;
             if (itemId) {
-              for (const m of months.value) {
+              const start = f.start_month || dateRange.value.start;
+              const end = f.end_month || forecastEnd(dateRange.value.end);
+              for (const v of expenseMonthlyValues(cents, f.recurrence, start, end)) {
                 await execute('INSERT OR REPLACE INTO expense_values (expense_item_id, scenario_id, month, amount, is_actual) VALUES (?,?,?,?,0)',
-                  [itemId, scenarioId.value, m, cents]);
+                  [itemId, scenarioId.value, v.month, v.amount]);
               }
             }
           }
@@ -300,7 +306,7 @@ export default {
                 <span v-if="r.company" class="text-gray-400 ml-2">{{ r.company }}</span>
               </div>
               <div class="flex items-center gap-4">
-                <span class="text-gray-900">{{ formatCents(r.cur_amount) }}</span>
+                <span class="text-gray-900">{{ formatCents(r.chargeAmount) }}</span>
                 <span class="text-gray-500 text-xs">{{ fmtDate(r.renewalDate) }}</span>
               </div>
             </div>
@@ -409,7 +415,7 @@ export default {
               <input v-model.number="form.renewal_day" type="number" min="1" max="31" class="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
             </div>
             <div v-if="form.entryMode === 'manual'" class="col-span-2">
-              <label class="block text-xs font-medium text-gray-500 mb-1">Amount (EUR)</label>
+              <label class="block text-xs font-medium text-gray-500 mb-1">Amount per charge (EUR)</label>
               <input v-model="form.amount" type="number" step="0.01" placeholder="0.00" class="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
             </div>
             <div v-if="form.entryMode === 'formula'" class="col-span-2">

@@ -1,5 +1,10 @@
 import { clearCredentials } from '../db.js';
 import { getSettings, updateSettings, resetAllData } from '../schema.js';
+import {
+  EXPENSE_COLUMNS, PAYROLL_COLUMNS,
+  exportExpensesCsv, importExpensesCsv, exportPayrollCsv, importPayrollCsv,
+} from '../csvTransfer.js';
+import { downloadCsv } from '../csv.js';
 
 export default {
   name: 'SettingsView',
@@ -7,6 +12,7 @@ export default {
     const { ref, onMounted, inject } = Vue;
     const router = VueRouter.useRouter();
     const toast = inject('toast');
+    const dateRange = inject('dateRange');
 
     const settings = ref(null);
     const loading = ref(true);
@@ -143,6 +149,52 @@ export default {
       input.click();
     };
 
+    const csvKinds = {
+      expenses: { label: 'Expenses', columns: EXPENSE_COLUMNS, exporter: exportExpensesCsv,
+        importer: text => importExpensesCsv(text, dateRange.value) },
+      payroll: { label: 'Payroll', columns: PAYROLL_COLUMNS, exporter: exportPayrollCsv,
+        importer: importPayrollCsv },
+    };
+    const csvBusy = ref('');
+    const csvErrors = ref({ kind: '', list: [] });
+
+    const exportCsv = async (kind) => {
+      csvBusy.value = kind;
+      try {
+        downloadCsv(`vintana-${kind}-${new Date().toISOString().slice(0, 10)}.csv`, await csvKinds[kind].exporter());
+      } catch (e) {
+        toast('Export failed: ' + e.message, 'error');
+      } finally {
+        csvBusy.value = '';
+      }
+    };
+
+    const importCsv = (kind) => {
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.accept = '.csv,text/csv';
+      input.onchange = async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        csvBusy.value = kind;
+        csvErrors.value = { kind: '', list: [] };
+        try {
+          const result = await csvKinds[kind].importer(await file.text());
+          if (result.errors.length) {
+            csvErrors.value = { kind, list: result.errors };
+            toast(`Nothing imported: fix the ${result.errors.length} problem(s) listed below`, 'error');
+          } else {
+            toast(`${csvKinds[kind].label}: ${result.created} added, ${result.updated} updated`, 'success');
+          }
+        } catch (e) {
+          toast('Import failed: ' + e.message, 'error');
+        } finally {
+          csvBusy.value = '';
+        }
+      };
+      input.click();
+    };
+
     const doReset = async () => {
       try {
         await resetAllData();
@@ -163,6 +215,7 @@ export default {
       settings, loading, saving, save, months, categories,
       deptEntries, addDeptEntry, removeDeptEntry,
       exportData, importData,
+      csvKinds, csvBusy, csvErrors, exportCsv, importCsv,
       showResetConfirm, doReset, disconnect,
     };
   },
@@ -215,6 +268,37 @@ export default {
             {{ saving ? 'Saving...' : 'Save Settings' }}
           </button>
         </div>
+
+        <section class="bg-white rounded-xl border border-gray-200 p-6">
+          <h2 class="text-lg font-semibold text-gray-900 mb-1">Expenses and Payroll (CSV)</h2>
+          <p class="text-sm text-gray-500 mb-4">
+            Rows are matched by name: existing ones are updated, new ones are added. Months use the format 2025-01.
+            Quarterly and annual amounts are spread evenly over their months. Export with no data to get a template.
+          </p>
+          <div class="space-y-4">
+            <div v-for="(kind, id) in csvKinds" :key="id" class="flex items-start justify-between gap-4">
+              <div class="min-w-0">
+                <div class="text-sm font-medium text-gray-900">{{ kind.label }}</div>
+                <div class="text-xs text-gray-500 font-mono break-words">{{ kind.columns.join(', ') }}</div>
+              </div>
+              <div class="flex gap-2 flex-shrink-0">
+                <button @click="importCsv(id)" :disabled="!!csvBusy" class="px-4 py-2 text-sm border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors disabled:opacity-50">
+                  <i data-lucide="upload" class="w-4 h-4 inline mr-1"></i> {{ csvBusy === id ? 'Working...' : 'Import CSV' }}
+                </button>
+                <button @click="exportCsv(id)" :disabled="!!csvBusy" class="px-4 py-2 text-sm border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors disabled:opacity-50">
+                  <i data-lucide="download" class="w-4 h-4 inline mr-1"></i> Export CSV
+                </button>
+              </div>
+            </div>
+          </div>
+          <div v-if="csvErrors.list.length" class="mt-4 p-3 bg-red-50 border border-red-200 rounded-lg text-sm text-red-700">
+            <div class="font-medium mb-1">{{ csvKinds[csvErrors.kind].label }} file not imported:</div>
+            <ul class="list-disc pl-5 space-y-0.5">
+              <li v-for="err in csvErrors.list.slice(0, 20)" :key="err">{{ err }}</li>
+            </ul>
+            <div v-if="csvErrors.list.length > 20" class="mt-1">and {{ csvErrors.list.length - 20 }} more</div>
+          </div>
+        </section>
 
         <section class="bg-white rounded-xl border border-gray-200 p-6">
           <h2 class="text-lg font-semibold text-gray-900 mb-4">Data Management</h2>
