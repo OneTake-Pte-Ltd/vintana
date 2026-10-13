@@ -5,16 +5,22 @@ let _url = '';
 let _token = '';
 let _queue = Promise.resolve();
 
+// Browsers can't fetch libsql:// or ws(s):// URLs; the same host serves HTTP on https://
+export function normalizeUrl(url) {
+  const host = url.trim().replace(/^(libsql|wss|https?|ws):\/\//i, '').replace(/\/+$/, '');
+  return host ? `https://${host}` : '';
+}
+
 export function getCredentials() {
   if (!_url || !_token) {
-    _url = localStorage.getItem(DB_URL_KEY) || '';
+    _url = normalizeUrl(localStorage.getItem(DB_URL_KEY) || '');
     _token = localStorage.getItem(DB_TOKEN_KEY) || '';
   }
   return { url: _url, token: _token };
 }
 
 export function setCredentials(url, token) {
-  _url = url.replace(/\/+$/, '');
+  _url = normalizeUrl(url);
   _token = token;
   localStorage.setItem(DB_URL_KEY, _url);
   localStorage.setItem(DB_TOKEN_KEY, _token);
