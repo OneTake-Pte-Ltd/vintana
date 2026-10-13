@@ -98,3 +98,36 @@ export function debounce(fn, ms = 300) {
 export function departmentToKey(name) {
   return (name || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
 }
+
+// Number of months one charge covers; quarterly and annual charges are spread evenly over them
+export const RECURRENCE_MONTHS = { monthly: 1, quarterly: 3, annual: 12 };
+
+export function monthlyShare(chargeCents, recurrence) {
+  return Math.round(chargeCents / (RECURRENCE_MONTHS[recurrence] || 1));
+}
+
+export function chargeFromMonthly(monthlyCents, recurrence) {
+  return monthlyCents * (RECURRENCE_MONTHS[recurrence] || 1);
+}
+
+// Forecast horizon for expenses without an end month: the visible range or two years out, whichever is later
+export function forecastEnd(rangeEnd) {
+  const twoYears = addMonths(currentMonth(), 24);
+  return rangeEnd && rangeEnd > twoYears ? rangeEnd : twoYears;
+}
+
+// Monthly values (in cents) for an expense charged `chargeCents` on the given recurrence
+export function expenseMonthlyValues(chargeCents, recurrence, startMonth, endMonth) {
+  if (recurrence === 'one_time') return [{ month: startMonth, amount: chargeCents }];
+  const amount = monthlyShare(chargeCents, recurrence);
+  return generateMonthRange(startMonth, endMonth).map(month => ({ month, amount }));
+}
+
+// True when a renewal falls in `month`: every month, every 3 months or every 12 months from the start month
+export function isChargeMonth(recurrence, startMonth, month) {
+  const every = RECURRENCE_MONTHS[recurrence];
+  if (!every) return false;
+  if (!startMonth || every === 1) return true;
+  const diff = monthDiff(startMonth, month);
+  return diff >= 0 && diff % every === 0;
+}

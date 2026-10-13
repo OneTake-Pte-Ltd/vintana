@@ -66,7 +66,8 @@ function parseResponse(result) {
       return cell.value;
     })
   );
-  return { cols, rows, affectedRowCount: r.affected_row_count || 0 };
+  const lastInsertRowid = r.last_insert_rowid != null ? parseInt(r.last_insert_rowid, 10) : null;
+  return { cols, rows, affectedRowCount: r.affected_row_count || 0, lastInsertRowid };
 }
 
 async function rawPipeline(requests) {
@@ -128,7 +129,7 @@ export async function batch(statements) {
         requests.push({ type: 'close' });
         const data = await rawPipeline(requests);
         const results = data.results
-          .filter(r => r.type !== 'close')
+          .filter(r => r.response?.type !== 'close')
           .map(parseResponse);
         resolve(results);
       } catch (e) {

@@ -2,6 +2,7 @@ import { query } from '../db.js';
 import {
   formatCents, formatPct, formatDelta, monthLabel,
   generateMonthRange, currentMonth, prevMonth, ordinalDay,
+  chargeFromMonthly, isChargeMonth,
 } from '../utils.js';
 
 const COLORS = ['#6366f1', '#f59e0b', '#10b981', '#ef4444', '#8b5cf6'];
@@ -57,7 +58,7 @@ export default {
             query(`SELECT month, COALESCE(SUM(customers * arpu), 0) AS mrr FROM revenue_values WHERE scenario_id = ? AND month >= ? AND month <= ? GROUP BY month ORDER BY month`, [sid, range?.start || month, range?.end || month]),
             query(`SELECT ec.name AS category, COALESCE(SUM(ev.amount), 0) AS total FROM expense_values ev JOIN expense_items ei ON ev.expense_item_id = ei.id JOIN expense_categories ec ON ei.category_id = ec.id WHERE ev.scenario_id = ? AND ev.month = ? GROUP BY ec.name ORDER BY total DESC`, [sid, month]),
             query(`SELECT name, department FROM employees WHERE start_date <= ? AND (end_date IS NULL OR end_date >= ?)`, [month + '-31', month + '-01']),
-            query(`SELECT ei.name, ei.company, ev.amount, ei.renewal_day, ei.recurrence FROM expense_items ei JOIN expense_values ev ON ev.expense_item_id = ei.id WHERE ev.scenario_id = ? AND ev.month = ? AND ei.renewal_day IS NOT NULL ORDER BY ei.renewal_day ASC`, [sid, month]),
+            query(`SELECT ei.name, ei.company, ev.amount, ei.renewal_day, ei.recurrence, ei.start_month FROM expense_items ei JOIN expense_values ev ON ev.expense_item_id = ei.id WHERE ev.scenario_id = ? AND ev.month = ? AND ei.renewal_day IS NOT NULL ORDER BY ei.renewal_day ASC`, [sid, month]),
           ]);
 
         revenueNow.value = revNow[0]?.v || 0;
@@ -77,8 +78,9 @@ export default {
           if (!r.renewal_day) return false;
           const d = new Date(now.getFullYear(), now.getMonth(), r.renewal_day);
           if (d < now) d.setMonth(d.getMonth() + 1);
-          return (d - now) / 864e5 <= 30;
-        });
+          const renewalMonth = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+          return (d - now) / 864e5 <= 30 && isChargeMonth(r.recurrence, r.start_month, renewalMonth);
+        }).map(r => ({ ...r, amount: chargeFromMonthly(r.amount, r.recurrence) }));
       } catch (e) { console.error('Dashboard load error:', e); }
       finally { loading.value = false; await nextTick(); renderCharts(); }
     }

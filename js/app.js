@@ -61,7 +61,8 @@ const app = Vue.createApp({
     });
 
     const isLoggedIn = computed(() => {
-      return hasCredentials() && route.path !== '/login';
+      // Read route.path first so Vue tracks it even while credentials are missing
+      return route.path !== '/login' && hasCredentials();
     });
 
     const companyName = computed(() => settings.value?.company_name || 'Vintana');
@@ -101,19 +102,26 @@ const app = Vue.createApp({
     provide('toast', toast);
     provide('loadScenarios', loadScenarios);
 
-    onMounted(async () => {
-      if (hasCredentials()) {
-        try {
-          const ok = await checkSchema();
-          if (ok) {
-            await Promise.all([loadScenarios(), loadSettings()]);
-          }
-        } catch {
-          // will redirect to login via router guard
+    const loadAppData = async () => {
+      try {
+        const ok = await checkSchema();
+        if (ok) {
+          await Promise.all([loadScenarios(), loadSettings()]);
         }
+      } catch {
+        // will redirect to login via router guard
       }
+    };
+
+    onMounted(async () => {
+      if (hasCredentials()) await loadAppData();
       await nextTick();
       if (window.lucide) lucide.createIcons();
+    });
+
+    // Leaving the login screen means credentials (and possibly a fresh schema) were just set up
+    watch(isLoggedIn, async (loggedIn, wasLoggedIn) => {
+      if (loggedIn && !wasLoggedIn) await loadAppData();
     });
 
     watch(route, async () => {
