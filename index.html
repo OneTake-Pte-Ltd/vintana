@@ -20,7 +20,7 @@
       <router-view></router-view>
     </template>
     <template v-else>
-      <app-sidebar :collapsed="sidebarCollapsed" @toggle="sidebarCollapsed = !sidebarCollapsed" />
+      <app-sidebar :collapsed="sidebarCollapsed" @toggle="sidebarCollapsed = !sidebarCollapsed"></app-sidebar>
       <div :class="['transition-all duration-200 min-h-screen', sidebarCollapsed ? 'ml-16' : 'ml-56']">
         <header class="sticky top-0 z-30 bg-white/80 backdrop-blur-sm border-b border-gray-200">
           <div class="flex items-center justify-between px-6 h-14">
@@ -33,11 +33,11 @@
                 :scenarios="scenarios"
                 :model-value="scenarioId"
                 @update:model-value="scenarioId = $event"
-              />
+              ></scenario-selector>
               <div class="flex items-center gap-2">
-                <month-picker :model-value="dateRange.start" @update:model-value="dateRange.start = $event" label="" />
+                <month-picker :model-value="dateRange.start" @update:model-value="dateRange.start = $event" label=""></month-picker>
                 <span class="text-gray-400 text-sm">to</span>
-                <month-picker :model-value="dateRange.end" @update:model-value="dateRange.end = $event" label="" />
+                <month-picker :model-value="dateRange.end" @update:model-value="dateRange.end = $event" label=""></month-picker>
               </div>
             </div>
           </div>

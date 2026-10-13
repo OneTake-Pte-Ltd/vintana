@@ -217,7 +217,7 @@ export default {
           // For manual entry, seed values across date range
           if (f.entryMode === 'manual' && f.amount) {
             const cents = Math.round(parseFloat(f.amount) * 100);
-            const itemId = res.affectedRowCount ? (await query('SELECT last_insert_rowid() AS id'))[0].id : null;
+            const itemId = res.lastInsertRowid;
             if (itemId) {
               for (const m of months.value) {
                 await execute('INSERT OR REPLACE INTO expense_values (expense_item_id, scenario_id, month, amount, is_actual) VALUES (?,?,?,?,0)',
