@@ -46,24 +46,33 @@ export default {
           <h1 class="text-2xl font-bold text-gray-900">Vintana</h1>
           <p class="text-sm text-gray-500 mt-1">Financial Planning</p>
         </div>
-        <form @submit.prevent="connect" class="bg-white rounded-2xl border border-gray-200 p-8 shadow-sm">
+        <form @submit.prevent="connect" method="post" autocomplete="on" class="bg-white rounded-2xl border border-gray-200 p-8 shadow-sm">
           <h2 class="text-lg font-semibold text-gray-900 mb-6">Connect to Database</h2>
           <div class="space-y-4">
             <div>
-              <label class="block text-sm font-medium text-gray-700 mb-1">Database URL</label>
+              <label for="db-url" class="block text-sm font-medium text-gray-700 mb-1">Database URL</label>
               <input
+                id="db-url"
                 v-model="dbUrl"
-                type="url"
-                placeholder="https://abc123.lite.bunnydb.net"
+                type="text"
+                name="username"
+                autocomplete="username"
+                autocapitalize="off"
+                spellcheck="false"
+                inputmode="url"
+                placeholder="libsql://your-database.lite.bunnydb.net"
                 class="w-full px-4 py-2.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
                 :disabled="loading"
               />
             </div>
             <div>
-              <label class="block text-sm font-medium text-gray-700 mb-1">Access Token</label>
+              <label for="db-token" class="block text-sm font-medium text-gray-700 mb-1">Access Token</label>
               <input
+                id="db-token"
                 v-model="dbToken"
                 type="password"
+                name="password"
+                autocomplete="current-password"
                 placeholder="bdb_tok_xxxxxxxxxxxx"
                 class="w-full px-4 py-2.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
                 :disabled="loading"
