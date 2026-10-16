@@ -123,11 +123,13 @@ export function expenseMonthlyValues(chargeCents, recurrence, startMonth, endMon
   return generateMonthRange(startMonth, endMonth).map(month => ({ month, amount }));
 }
 
-// True when a renewal falls in `month`: every month, every 3 months or every 12 months from the start month
-export function isChargeMonth(recurrence, startMonth, month) {
+// True when a renewal falls in `month`: every month, every 3 months or every 12 months from the start month,
+// and never outside the start/end months
+export function isChargeMonth(recurrence, startMonth, month, endMonth = null) {
   const every = RECURRENCE_MONTHS[recurrence];
   if (!every) return false;
-  if (!startMonth || every === 1) return true;
+  if (endMonth && month > endMonth) return false;
+  if (!startMonth || every === 1) return !startMonth || month >= startMonth;
   const diff = monthDiff(startMonth, month);
   return diff >= 0 && diff % every === 0;
 }

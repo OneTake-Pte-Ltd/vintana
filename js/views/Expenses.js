@@ -155,7 +155,7 @@ export default {
           const month = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
           return { ...i, renewalDate: d, renewalMonth: month, chargeAmount: chargeFromMonthly(i.cur_amount || 0, i.recurrence) };
         })
-        .filter(i => i.renewalDate <= in30 && isChargeMonth(i.recurrence, i.start_month, i.renewalMonth))
+        .filter(i => i.renewalDate <= in30 && isChargeMonth(i.recurrence, i.start_month, i.renewalMonth, i.end_month))
         .sort((a, b) => a.renewalDate - b.renewalDate);
     });
 
