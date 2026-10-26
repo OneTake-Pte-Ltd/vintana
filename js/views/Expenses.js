@@ -3,6 +3,8 @@ import {
   formatCents, monthLabel, generateMonthRange, currentMonth, ordinalDay,
   chargeFromMonthly, expenseMonthlyValues, forecastEnd, isChargeMonth,
 } from '../utils.js';
+import { loadScenarioEmployees, employeeCost, isEmployedIn, payrollCategory } from '../payroll.js';
+import { donutConfig, trendConfig } from '../miniCharts.js';
 
 export default {
   name: 'ExpensesView',
@@ -21,6 +23,9 @@ export default {
     const editingItem = ref(null);
     const deleteTarget = ref(null);
     const saving = ref(false);
+    const includePayroll = ref(true);
+    const employees = ref([]);
+    const monthlyExpenses = ref({});
 
     const months = computed(() => {
       if (!dateRange.value) return [];
@@ -66,7 +71,37 @@ export default {
       }
     };
 
-    const load = async () => { await loadCategories(); await loadItems(); };
+    const loadEmployees = async () => {
+      try { employees.value = (await loadScenarioEmployees(scenarioId.value)).employees; }
+      catch (e) { toast('Failed to load payroll: ' + e.message, 'error'); }
+    };
+
+    // Expense total per month over the visible range; a scenario value replaces the base value
+    const loadMonthly = async () => {
+      if (!months.value.length) return;
+      const sid = scenarioId.value;
+      const baseRows = await query('SELECT id FROM scenarios WHERE is_base = 1 LIMIT 1');
+      const baseId = baseRows[0]?.id || 1;
+      const rows = await query(`
+        SELECT ev.expense_item_id, ev.month, ev.amount, ev.scenario_id
+        FROM expense_values ev
+        JOIN expense_items ei ON ei.id = ev.expense_item_id AND ei.visible = 1
+        WHERE ev.scenario_id IN (?, ?) AND ev.month >= ? AND ev.month <= ?
+      `, [sid, baseId, dateRange.value.start, dateRange.value.end]);
+      const byKey = {};
+      rows.forEach(r => {
+        const k = `${r.expense_item_id}:${r.month}`;
+        if (!byKey[k] || r.scenario_id === sid) byKey[k] = r;
+      });
+      const totals = {};
+      Object.values(byKey).forEach(r => { totals[r.month] = (totals[r.month] || 0) + r.amount; });
+      monthlyExpenses.value = totals;
+    };
+
+    const load = async () => {
+      await loadCategories();
+      await Promise.all([loadItems(), loadEmployees(), loadMonthly()]);
+    };
     onMounted(load);
     watch([scenarioId, dateRange], load, { deep: true });
 
@@ -81,67 +116,47 @@ export default {
       );
     });
 
-    // --- Charts data ---
+    // --- KPI cards ---
     const catColors = { 'Cost of Goods Sold (COGS)': '#6366f1', 'Research & Development': '#8b5cf6', 'Sales & Marketing': '#ec4899', 'General & Administrative': '#f59e0b', 'Uncategorized / Other': '#94a3b8' };
+    // Short names keep the donut legend inside its card
+    const catShort = { 'Cost of Goods Sold (COGS)': 'COGS', 'Research & Development': 'R&D', 'Sales & Marketing': 'S&M', 'General & Administrative': 'G&A', 'Uncategorized / Other': 'Other' };
 
-    const breakdownData = computed(() => {
+    const payrollIn = (month) => employees.value
+      .filter(e => isEmployedIn(e, month))
+      .reduce((s, e) => s + employeeCost(e), 0);
+    const currentPayroll = computed(() => payrollIn(currentMonth()));
+
+    const categoryTotals = computed(() => {
       const totals = {};
       items.value.forEach(i => {
-        const cat = i.category_name || 'Other';
+        const cat = i.category_name || 'Uncategorized / Other';
         totals[cat] = (totals[cat] || 0) + (i.cur_amount || 0);
       });
-      const grand = Object.values(totals).reduce((a, b) => a + b, 0) || 1;
-      const labels = Object.keys(totals);
-      const data = labels.map(l => totals[l]);
-      const pctLabels = data.map(d => ((d / grand) * 100).toFixed(1) + '%');
-      return {
-        data: {
-          labels: ['Expenses'],
-          datasets: labels.map((l, i) => ({
-            label: l, data: [data[i]],
-            backgroundColor: catColors[l] || '#94a3b8',
-          })),
-        },
-        options: {
-          indexAxis: 'y', responsive: true, maintainAspectRatio: false,
-          plugins: {
-            tooltip: { callbacks: { label: ctx => `${ctx.dataset.label}: ${formatCents(ctx.raw)}` } },
-            legend: { position: 'bottom', labels: { boxWidth: 12, font: { size: 11 } } },
-          },
-          scales: { x: { stacked: true, display: false }, y: { stacked: true, display: false } },
-        },
-      };
+      if (includePayroll.value) {
+        const deptMap = settings.value?.dept_mapping;
+        employees.value.filter(e => isEmployedIn(e, currentMonth())).forEach(e => {
+          const cat = payrollCategory(e.department, deptMap);
+          totals[cat] = (totals[cat] || 0) + employeeCost(e);
+        });
+      }
+      return totals;
     });
 
-    const trendData = computed(() => {
-      // We'll load monthly totals separately; for now use a placeholder
-      return { labels: [], datasets: [] };
+    const monthlyTotal = computed(() => Object.values(categoryTotals.value).reduce((a, b) => a + b, 0));
+
+    const categoryDonut = computed(() => {
+      const order = categories.value.map(c => c.name);
+      const labels = Object.keys(categoryTotals.value)
+        .filter(l => categoryTotals.value[l] > 0)
+        .sort((a, b) => (order.indexOf(a) + 1 || 99) - (order.indexOf(b) + 1 || 99));
+      return donutConfig(labels.map(l => catShort[l] || l), labels.map(l => categoryTotals.value[l]), labels.map(l => catColors[l] || '#94a3b8'));
     });
 
-    // Monthly trend (loaded async)
-    const trendChart = ref({ labels: [], datasets: [] });
-    const trendOpts = { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false }, tooltip: { callbacks: { label: ctx => formatCents(ctx.raw) } } }, scales: { y: { ticks: { callback: v => formatCents(v) } } } };
-
-    const loadTrend = async () => {
-      if (!months.value.length) return;
-      const sid = scenarioId.value;
-      const baseRows = await query('SELECT id FROM scenarios WHERE is_base = 1 LIMIT 1');
-      const baseId = baseRows[0]?.id || 1;
-      const rows = await query(`
-        SELECT m.month, COALESCE(SUM(COALESCE(sv.amount, bv.amount, 0)), 0) AS total
-        FROM (SELECT DISTINCT month FROM expense_values WHERE month >= ? AND month <= ?) m
-        LEFT JOIN expense_items ei ON ei.visible = 1
-        LEFT JOIN expense_values sv ON sv.expense_item_id = ei.id AND sv.scenario_id = ? AND sv.month = m.month
-        LEFT JOIN expense_values bv ON bv.expense_item_id = ei.id AND bv.scenario_id = ? AND bv.month = m.month AND sv.id IS NULL
-        GROUP BY m.month ORDER BY m.month
-      `, [dateRange.value.start, dateRange.value.end, sid, baseId]);
-      trendChart.value = {
-        labels: rows.map(r => monthLabel(r.month)),
-        datasets: [{ label: 'Total Expenses', data: rows.map(r => r.total), borderColor: '#6366f1', backgroundColor: 'rgba(99,102,241,0.1)', fill: true, tension: 0.3 }],
-      };
-    };
-    onMounted(loadTrend);
-    watch([scenarioId, dateRange], loadTrend, { deep: true });
+    const expensesTrend = computed(() => trendConfig(
+      months.value.map(monthLabel),
+      months.value.map(m => (monthlyExpenses.value[m] || 0) + (includePayroll.value ? payrollIn(m) : 0)),
+      'Total Expenses',
+    ));
 
     // --- Upcoming renewals ---
     const renewals = computed(() => {
@@ -158,6 +173,8 @@ export default {
         .filter(i => i.renewalDate <= in30 && isChargeMonth(i.recurrence, i.start_month, i.renewalMonth))
         .sort((a, b) => a.renewalDate - b.renewalDate);
     });
+
+    const renewalsTotal = computed(() => renewals.value.reduce((s, r) => s + r.chargeAmount, 0));
 
     const fmtDate = (d) => d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
 
@@ -235,7 +252,6 @@ export default {
         showModal.value = false;
         toast(editingItem.value ? 'Expense updated' : 'Expense created', 'success');
         await load();
-        await loadTrend();
       } catch (e) {
         toast('Save failed: ' + e.message, 'error');
       } finally {
@@ -256,7 +272,6 @@ export default {
         deleteTarget.value = null;
         toast('Expense deleted', 'success');
         await load();
-        await loadTrend();
       } catch (e) {
         toast('Delete failed: ' + e.message, 'error');
       }
@@ -265,7 +280,7 @@ export default {
     return {
       items, categories, loading, search, filtered, showModal, editingItem,
       form, editValues, saving, months, renewals, deleteTarget,
-      breakdownData, trendChart, trendOpts, catColors,
+      includePayroll, currentPayroll, monthlyTotal, categoryDonut, expensesTrend, renewalsTotal,
       openAdd, openEdit, autoAlias, saveExpense, saveCellValue, confirmDelete,
       fmtDate, formatCents, monthLabel, ordinalDay,
     };
@@ -274,24 +289,42 @@ export default {
     <div class="space-y-6">
       <div class="flex items-center justify-between">
         <h1 class="text-2xl font-bold text-gray-900">Expenses</h1>
-        <button @click="openAdd" class="px-4 py-2 bg-indigo-600 text-white text-sm font-medium rounded-lg hover:bg-indigo-700 transition-colors">
-          + Add Expense
-        </button>
+        <div class="flex items-center gap-4">
+          <button @click="includePayroll = !includePayroll" role="switch" :aria-checked="includePayroll" class="flex items-center gap-2 text-sm text-gray-600">
+            <span :class="['relative inline-flex h-5 w-9 rounded-full transition-colors', includePayroll ? 'bg-indigo-600' : 'bg-gray-200']">
+              <span :class="['absolute top-0.5 left-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform', includePayroll ? 'translate-x-4' : '']"></span>
+            </span>
+            Include payroll
+          </button>
+          <button @click="openAdd" class="px-4 py-2 bg-indigo-600 text-white text-sm font-medium rounded-lg hover:bg-indigo-700 transition-colors">
+            + Add Expense
+          </button>
+        </div>
       </div>
 
       <div v-if="loading" class="text-gray-400 py-12 text-center">Loading...</div>
 
       <template v-else>
-        <!-- Charts -->
-        <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
-          <div class="bg-white rounded-xl border border-gray-200 p-4">
-            <h3 class="text-sm font-medium text-gray-500 mb-3">Breakdown by Category</h3>
-            <chart-wrapper v-if="breakdownData.data.datasets.length" type="bar" :data="breakdownData.data" :options="breakdownData.options" height="180px"/>
+        <!-- KPI cards -->
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+          <div class="bg-white rounded-xl border border-gray-200 p-5">
+            <span class="text-xs font-medium text-gray-500 uppercase tracking-wider">Monthly Expenses</span>
+            <div class="text-2xl font-bold text-gray-900 mt-2">{{ formatCents(monthlyTotal) }}</div>
+            <div class="text-xs text-gray-400 mt-1">{{ includePayroll ? 'Incl. ' + formatCents(currentPayroll) + ' payroll' : 'Excl. payroll' }}</div>
+          </div>
+          <div class="bg-white rounded-xl border border-gray-200 p-5">
+            <span class="text-xs font-medium text-gray-500 uppercase tracking-wider">Renewals (Next 30 Days)</span>
+            <div class="text-2xl font-bold text-gray-900 mt-2">{{ formatCents(renewalsTotal) }}</div>
+            <div class="text-xs text-gray-400 mt-1">{{ renewals.length }} renewal{{ renewals.length !== 1 ? 's' : '' }}</div>
+          </div>
+          <div class="bg-white rounded-xl border border-gray-200 p-5">
+            <span class="text-xs font-medium text-gray-500 uppercase tracking-wider">Cost by Category</span>
+            <chart-wrapper v-if="categoryDonut.data.labels.length" type="doughnut" :data="categoryDonut.data" :options="categoryDonut.options" height="160px" class="mt-2"/>
             <p v-else class="text-gray-400 text-sm text-center py-8">No expense data</p>
           </div>
-          <div class="bg-white rounded-xl border border-gray-200 p-4">
-            <h3 class="text-sm font-medium text-gray-500 mb-3">Monthly Trend</h3>
-            <chart-wrapper v-if="trendChart.datasets.length" type="line" :data="trendChart" :options="trendOpts" height="180px"/>
+          <div class="bg-white rounded-xl border border-gray-200 p-5">
+            <span class="text-xs font-medium text-gray-500 uppercase tracking-wider">Expenses Over Time</span>
+            <chart-wrapper v-if="expensesTrend.data.labels.length" type="line" :data="expensesTrend.data" :options="expensesTrend.options" height="160px" class="mt-2"/>
             <p v-else class="text-gray-400 text-sm text-center py-8">No trend data</p>
           </div>
         </div>

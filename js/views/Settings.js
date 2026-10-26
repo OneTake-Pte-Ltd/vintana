@@ -1,5 +1,6 @@
 import { clearCredentials } from '../db.js';
 import { getSettings, updateSettings, resetAllData } from '../schema.js';
+import { DEFAULT_DEPT_MAPPING } from '../payroll.js';
 import {
   EXPENSE_COLUMNS, PAYROLL_COLUMNS,
   exportExpensesCsv, importExpensesCsv, exportPayrollCsv, importPayrollCsv,
@@ -24,18 +25,6 @@ export default {
       'July', 'August', 'September', 'October', 'November', 'December',
     ];
 
-    const defaultDeptMapping = {
-      Engineering: 'Research & Development',
-      Product: 'Research & Development',
-      Design: 'Research & Development',
-      Sales: 'Sales & Marketing',
-      Marketing: 'Sales & Marketing',
-      Admin: 'General & Administrative',
-      Finance: 'General & Administrative',
-      HR: 'General & Administrative',
-      Legal: 'General & Administrative',
-      Operations: 'General & Administrative',
-    };
 
     const categories = [
       'Cost of Goods Sold (COGS)',
@@ -53,7 +42,7 @@ export default {
         const mapping = settings.value?.dept_mapping || {};
         const entries = Object.keys(mapping).length > 0
           ? Object.entries(mapping)
-          : Object.entries(defaultDeptMapping);
+          : Object.entries(DEFAULT_DEPT_MAPPING);
         deptEntries.value = entries.map(([dept, cat]) => ({ dept, cat }));
       } catch (e) {
         toast('Failed to load settings: ' + e.message, 'error');
