@@ -1,5 +1,6 @@
-import { query, execute } from '../db.js';
+import { execute } from '../db.js';
 import { formatCents, currentMonth, generateMonthRange, monthLabel } from '../utils.js';
+import { loadScenarioEmployees, employeeCost, isEmployedIn } from '../payroll.js';
 
 const COLORS = ['#6366f1','#10b981','#f59e0b','#ef4444','#8b5cf6','#06b6d4','#ec4899','#84cc16','#f97316','#14b8a6'];
 const INPUT = 'w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500';
@@ -32,34 +33,16 @@ export default {
     async function loadEmployees() {
       loading.value = true;
       try {
-        const scId = scenarioId.value;
-        const scRows = await query('SELECT is_base FROM scenarios WHERE id = ?', [scId]);
-        scenarioIsBase.value = scRows.length > 0 ? !!scRows[0].is_base : true;
-        const base = await query('SELECT * FROM employees ORDER BY name');
-        let merged;
-        if (scenarioIsBase.value) {
-          merged = base.map(e => ({ ...e, _source: 'base' }));
-        } else {
-          const overrides = await query('SELECT * FROM employee_overrides WHERE scenario_id = ?', [scId]);
-          const overMap = {};
-          overrides.forEach(o => { overMap[o.employee_id] = o; });
-          merged = base.map(e => {
-            const o = overMap[e.id];
-            return { ...e, salary_monthly: o?.salary_monthly ?? e.salary_monthly, tax_pct: o?.tax_pct ?? e.tax_pct,
-              start_date: o?.start_date ?? e.start_date, end_date: o?.end_date ?? e.end_date, _source: o ? 'override' : 'base' };
-          });
-          const extras = await query('SELECT * FROM scenario_employees WHERE scenario_id = ? ORDER BY name', [scId]);
-          extras.forEach(e => merged.push({ ...e, _source: 'scenario', _scenarioEmployeeId: e.id }));
-        }
-        employees.value = merged;
+        const res = await loadScenarioEmployees(scenarioId.value);
+        scenarioIsBase.value = res.isBase;
+        employees.value = res.employees;
       } catch (e) { toast('Failed to load employees: ' + e.message, 'error'); }
       finally { loading.value = false; }
     }
 
     const cm = computed(() => currentMonth());
-    const activeEmployees = computed(() => employees.value.filter(e =>
-      e.start_date <= cm.value && (!e.end_date || e.end_date >= cm.value)));
-    const empCost = e => Math.round(e.salary_monthly * (1 + (e.tax_pct || 0) / 100));
+    const activeEmployees = computed(() => employees.value.filter(e => isEmployedIn(e, cm.value)));
+    const empCost = employeeCost;
     const totalCost = computed(() => activeEmployees.value.reduce((s, e) => s + empCost(e), 0));
     const headcount = computed(() => activeEmployees.value.length);
     const departments = computed(() => [...new Set(employees.value.map(e => e.department).filter(Boolean))].sort());
@@ -143,7 +126,7 @@ export default {
       if (lineCanvas.value && dateRange.value) {
         const months = generateMonthRange(dateRange.value.start, dateRange.value.end);
         const data = months.map(m => {
-          const act = employees.value.filter(e => e.start_date <= m && (!e.end_date || e.end_date >= m));
+          const act = employees.value.filter(e => isEmployedIn(e, m));
           return act.reduce((s,e) => s + empCost(e), 0) / 100;
         });
         lineChart = new Chart(lineCanvas.value.getContext('2d'), { type:'line',

@@ -1,5 +1,6 @@
 import { query, execute } from '../db.js';
 import { formatCents, monthLabel, generateMonthRange, currentMonth } from '../utils.js';
+import { donutConfig, trendConfig } from '../miniCharts.js';
 
 const COLORS = ['#6366f1','#f59e0b','#10b981','#ef4444','#8b5cf6','#ec4899','#14b8a6','#f97316'];
 
@@ -109,6 +110,20 @@ export default {
       return products.value.reduce((sum, p) => sum + (getVal(p.id, m).customers || 0), 0);
     });
 
+    const productDonut = computed(() => {
+      const m = curMonth.value;
+      const live = products.value
+        .map((p, i) => ({ name: p.name, value: mrr(p.id, m), color: COLORS[i % COLORS.length] }))
+        .filter(p => p.value > 0);
+      return donutConfig(live.map(p => p.name), live.map(p => p.value), live.map(p => p.color));
+    });
+
+    const revenueTrend = computed(() => trendConfig(
+      months.value.map(monthLabel),
+      months.value.map(m => products.value.reduce((s, p) => s + mrr(p.id, m), 0)),
+      'Total Revenue',
+    ));
+
     const chartData = computed(() => {
       const ms = months.value;
       if (!ms.length || !products.value.length) return null;
@@ -214,7 +229,7 @@ export default {
 
     return {
       products, months, expandedId, showAddModal, newProduct, deleteTarget,
-      totalMrr, totalArr, totalCustomers, chartData, chartOptions,
+      totalMrr, totalArr, totalCustomers, chartData, chartOptions, productDonut, revenueTrend,
       curMonth, isForecast, getVal, mrr, formatCents,
       toggleExpand, saveCell, addProduct, confirmDelete, markAliasEdited,
     };
@@ -223,16 +238,25 @@ export default {
     <div class="space-y-6">
       <h1 class="text-2xl font-bold text-gray-900">Revenue</h1>
 
+      <!-- KPI cards -->
+      <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+        <kpi-card title="Monthly Recurring Revenue" :value="totalMrr" format="currency" :subtitle="formatCents(totalArr) + ' ARR'" />
+        <kpi-card title="Customers" :value="totalCustomers" format="number" />
+        <div class="bg-white rounded-xl border border-gray-200 p-5">
+          <span class="text-xs font-medium text-gray-500 uppercase tracking-wider">Revenue by Product</span>
+          <chart-wrapper v-if="productDonut.data.labels.length" type="doughnut" :data="productDonut.data" :options="productDonut.options" height="160px" class="mt-2" />
+          <p v-else class="text-gray-400 text-sm text-center py-8">No revenue this month</p>
+        </div>
+        <div class="bg-white rounded-xl border border-gray-200 p-5">
+          <span class="text-xs font-medium text-gray-500 uppercase tracking-wider">Revenue Over Time</span>
+          <chart-wrapper v-if="revenueTrend.data.labels.length" type="line" :data="revenueTrend.data" :options="revenueTrend.options" height="160px" class="mt-2" />
+          <p v-else class="text-gray-400 text-sm text-center py-8">No trend data</p>
+        </div>
+      </div>
+
       <!-- Chart -->
       <div class="bg-white rounded-xl border border-gray-200 p-5" v-if="chartData">
         <chart-wrapper type="line" :data="chartData" :options="chartOptions" height="280px" />
-      </div>
-
-      <!-- KPIs -->
-      <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
-        <kpi-card title="Monthly Recurring Revenue" :value="totalMrr" format="currency" />
-        <kpi-card title="Annual Recurring Revenue" :value="totalArr" format="currency" />
-        <kpi-card title="Total Customers" :value="totalCustomers" format="number" />
       </div>
 
       <!-- Product lines -->
