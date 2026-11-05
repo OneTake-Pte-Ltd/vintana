@@ -51,8 +51,17 @@ export default {
       activeEmployees.value.forEach(e => { const d = e.department || 'Unassigned'; m[d] = (m[d] || 0) + empCost(e); });
       return m;
     });
+    // Hidden by default: employment dates that don't overlap the viewed period
+    const showAll = ref(false);
+    const isCurrent = (e) => {
+      const { start, end } = dateRange.value;
+      return (e.start_date || '').slice(0, 7) <= end && (!e.end_date || e.end_date.slice(0, 7) >= start);
+    };
+    const hiddenCount = computed(() => employees.value.filter(e => !isCurrent(e)
+      && (!deptFilter.value || e.department === deptFilter.value)).length);
     const filteredEmployees = computed(() => {
       let list = deptFilter.value ? employees.value.filter(e => e.department === deptFilter.value) : employees.value;
+      if (!showAll.value) list = list.filter(isCurrent);
       const col = sortCol.value, asc = sortAsc.value ? 1 : -1;
       return [...list].sort((a, b) => {
         let va = col === 'total_cost' ? empCost(a) : a[col];
@@ -141,7 +150,7 @@ export default {
     onBeforeUnmount(() => { if (donutChart) donutChart.destroy(); if (lineChart) lineChart.destroy(); });
     watch([scenarioId, dateRange], async () => { await loadEmployees(); await nextTick(); renderCharts(); }, { deep:true });
 
-    return { loading, filteredEmployees, departments, deptFilter, sortCol, sortAsc, toggleSort,
+    return { loading, filteredEmployees, showAll, hiddenCount, departments, deptFilter, sortCol, sortAsc, toggleSort,
       totalCost, headcount, showModal, editingEmployee, form, openAdd, openEdit, saveEmployee,
       confirmDelete, deleteEmployee, empCost, donutCanvas, lineCanvas, formatCents, scenarioIsBase, INPUT };
   },
@@ -177,6 +186,10 @@ export default {
           <option value="">All Departments</option>
           <option v-for="d in departments" :key="d" :value="d">{{ d }}</option>
         </select>
+        <button v-if="hiddenCount || showAll" @click="showAll = !showAll" class="text-sm text-indigo-600 hover:text-indigo-800"
+          title="Employees whose contract doesn't overlap the viewed period">
+          {{ showAll ? 'Hide ' + hiddenCount + ' not current' : 'Show ' + hiddenCount + ' not current' }}
+        </button>
         <span class="text-xs text-gray-400 ml-auto">{{ filteredEmployees.length }} employee{{ filteredEmployees.length !== 1 ? 's' : '' }}</span>
       </div>
       <div class="overflow-x-auto">

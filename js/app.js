@@ -1,5 +1,5 @@
 import { hasCredentials, query } from './db.js';
-import { checkSchema, getSettings, getBaseScenarioId } from './schema.js';
+import { checkSchema, getSettings, ensureSettingsColumns } from './schema.js';
 import { currentMonth, addMonths } from './utils.js';
 
 import Sidebar from '../components/Sidebar.js';
@@ -18,12 +18,15 @@ import PayrollView from './views/Payroll.js';
 import ProfitLossView from './views/ProfitLoss.js';
 import CashFlowView from './views/CashFlow.js';
 import ScenariosView from './views/Scenarios.js';
+import UpcomingChargesView from './views/UpcomingCharges.js';
+import AssistantPanel from '../components/AssistantPanel.js';
 import SettingsView from './views/Settings.js';
 
 const routes = [
   { path: '/login', component: LoginView, meta: { public: true } },
   { path: '/', component: DashboardView },
   { path: '/expenses', component: ExpensesView },
+  { path: '/upcoming', component: UpcomingChargesView },
   { path: '/revenue', component: RevenueView },
   { path: '/payroll', component: PayrollView },
   { path: '/pnl', component: ProfitLossView },
@@ -55,10 +58,31 @@ const app = Vue.createApp({
     const toasts = ref([]);
     let toastCounter = 0;
 
-    const dateRange = ref({
-      start: addMonths(currentMonth(), -11),
-      end: addMonths(currentMonth(), 12),
-    });
+    // Default: 12 months centred on the 1st of the current month (6 before, 6 from it).
+    // A range picked by hand is remembered in this browser until reset.
+    const RANGE_KEY = 'vintana_date_range';
+    const defaultRange = () => ({ start: addMonths(currentMonth(), -6), end: addMonths(currentMonth(), 5) });
+    const savedRange = () => {
+      try {
+        const r = JSON.parse(localStorage.getItem(RANGE_KEY) || 'null');
+        if (r && /^\d{4}-\d{2}$/.test(r.start) && /^\d{4}-\d{2}$/.test(r.end)) return r;
+      } catch { /* storage unavailable */ }
+      return null;
+    };
+    const dateRange = ref(savedRange() || defaultRange());
+    const rangeIsCustom = ref(!!savedRange());
+
+    const setRange = (field, value) => {
+      if (!/^\d{4}-\d{2}$/.test(value || '')) return;
+      dateRange.value = { ...dateRange.value, [field]: value };
+      rangeIsCustom.value = true;
+      try { localStorage.setItem(RANGE_KEY, JSON.stringify(dateRange.value)); } catch { /* storage unavailable */ }
+    };
+    const resetRange = () => {
+      dateRange.value = defaultRange();
+      rangeIsCustom.value = false;
+      try { localStorage.removeItem(RANGE_KEY); } catch { /* storage unavailable */ }
+    };
 
     const isLoggedIn = computed(() => {
       // Read route.path first so Vue tracks it even while credentials are missing
@@ -101,11 +125,14 @@ const app = Vue.createApp({
     provide('settings', Vue.computed(() => settings.value));
     provide('toast', toast);
     provide('loadScenarios', loadScenarios);
+    provide('loadSettings', loadSettings);
 
     const loadAppData = async () => {
       try {
         const ok = await checkSchema();
         if (ok) {
+          // Read-only tokens can't add columns; the app works without them
+          await ensureSettingsColumns().catch(() => {});
           await Promise.all([loadScenarios(), loadSettings()]);
         }
       } catch {
@@ -136,7 +163,7 @@ const app = Vue.createApp({
 
     return {
       sidebarCollapsed, scenarioId, scenarios, settings,
-      dateRange, isLoggedIn, companyName, toasts, toast,
+      dateRange, rangeIsCustom, setRange, resetRange, isLoggedIn, companyName, toasts, toast,
     };
   },
 });
@@ -148,6 +175,7 @@ app.component('month-picker', MonthPicker);
 app.component('scenario-selector', ScenarioSelector);
 app.component('chart-wrapper', ChartWrapper);
 app.component('formula-input', FormulaInput);
+app.component('assistant-panel', AssistantPanel);
 
 app.use(router);
 app.mount('#app');

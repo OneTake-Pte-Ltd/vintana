@@ -13,6 +13,27 @@ export default {
     const loading = ref(true);
     const rows = ref([]);
 
+    // Line order inside each category: alphabetical, or largest total over the viewed period first
+    const SORT_KEY = 'vintana_pnl_sort';
+    const sortMode = ref((() => { try { return localStorage.getItem(SORT_KEY) === 'amount' ? 'amount' : 'alpha'; } catch { return 'alpha'; } })());
+    watch(sortMode, v => { try { localStorage.setItem(SORT_KEY, v); } catch { /* storage unavailable */ } });
+
+    const rowTotal = r => Object.values(r.values || {}).reduce((a, b) => a + b, 0);
+    const sortedRows = computed(() => {
+      const cmp = sortMode.value === 'amount'
+        ? (a, b) => rowTotal(b) - rowTotal(a) || a.label.localeCompare(b.label)
+        : (a, b) => a.label.localeCompare(b.label, undefined, { sensitivity: 'base' });
+      const out = [];
+      let run = [];
+      const flush = () => { out.push(...run.sort(cmp)); run = []; };
+      for (const r of rows.value) {
+        if (r.type === 'item') run.push(r);
+        else { flush(); out.push(r); }
+      }
+      flush();
+      return out;
+    });
+
     const months = computed(() => {
       const dr = dateRange.value;
       return dr ? generateMonthRange(dr.start, dr.end) : [];
@@ -191,11 +212,23 @@ export default {
       return isForecast(m) ? 'bg-blue-50' : 'bg-white';
     };
 
-    return { rows, months, loading, isForecast, formatCents, monthLabel, labelBg, cellBg };
+    return { rows, sortedRows, sortMode, months, loading, isForecast, formatCents, monthLabel, labelBg, cellBg };
   },
   template: `
     <div>
-      <h1 class="text-2xl font-bold text-gray-900 mb-6">Profit & Loss</h1>
+      <div class="flex items-center justify-between mb-6">
+        <h1 class="text-2xl font-bold text-gray-900">Profit & Loss</h1>
+        <div class="flex items-center gap-2 text-sm text-gray-500">
+          <span>Sort lines</span>
+          <div class="inline-flex rounded-lg border border-gray-200 bg-white p-0.5" role="group" aria-label="Sort lines">
+            <button @click="sortMode = 'alpha'" :aria-pressed="sortMode === 'alpha'"
+              :class="['px-3 py-1 rounded-md transition-colors', sortMode === 'alpha' ? 'bg-indigo-600 text-white' : 'text-gray-600 hover:bg-gray-50']">A to Z</button>
+            <button @click="sortMode = 'amount'" :aria-pressed="sortMode === 'amount'"
+              :class="['px-3 py-1 rounded-md transition-colors', sortMode === 'amount' ? 'bg-indigo-600 text-white' : 'text-gray-600 hover:bg-gray-50']"
+              title="Largest total over the viewed period first">By amount</button>
+          </div>
+        </div>
+      </div>
 
       <div v-if="loading" class="text-gray-400 py-12 text-center">Loading...</div>
 
@@ -218,7 +251,7 @@ export default {
             </tr>
           </thead>
           <tbody>
-            <tr v-for="(row, idx) in rows" :key="idx">
+            <tr v-for="(row, idx) in sortedRows" :key="idx">
               <td class="sticky left-0 z-10 px-4 py-1.5 border-r border-gray-200 whitespace-nowrap"
                   :class="[
                     labelBg(row),

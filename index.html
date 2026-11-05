@@ -35,18 +35,20 @@
                 @update:model-value="scenarioId = $event"
               ></scenario-selector>
               <div class="flex items-center gap-2">
-                <month-picker :model-value="dateRange.start" @update:model-value="dateRange.start = $event" label=""></month-picker>
+                <month-picker :model-value="dateRange.start" @update:model-value="setRange('start', $event)" label=""></month-picker>
                 <span class="text-gray-400 text-sm">to</span>
-                <month-picker :model-value="dateRange.end" @update:model-value="dateRange.end = $event" label=""></month-picker>
+                <month-picker :model-value="dateRange.end" @update:model-value="setRange('end', $event)" label=""></month-picker>
+                <button v-if="rangeIsCustom" @click="resetRange" class="text-xs text-indigo-600 hover:text-indigo-800" title="Back to 12 months around the current month">Reset</button>
               </div>
             </div>
           </div>
         </header>
-        <main class="p-6">
+        <main class="p-6 pb-24">
           <router-view></router-view>
         </main>
       </div>
-      <div class="fixed bottom-4 right-4 z-50 space-y-2">
+      <assistant-panel></assistant-panel>
+      <div class="fixed bottom-20 right-4 z-50 space-y-2">
         <transition-group name="toast">
           <div
             v-for="t in toasts"

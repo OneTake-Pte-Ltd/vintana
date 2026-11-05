@@ -1,7 +1,7 @@
 import { query, execute } from '../db.js';
 import {
   formatCents, monthLabel, generateMonthRange, currentMonth, ordinalDay,
-  chargeFromMonthly, expenseMonthlyValues, forecastEnd, isChargeMonth,
+  chargeFromMonthly, expenseMonthlyValues, forecastEnd,
 } from '../utils.js';
 import { loadScenarioEmployees, employeeCost, isEmployedIn, payrollCategory } from '../payroll.js';
 import { donutConfig, trendConfig } from '../miniCharts.js';
@@ -26,6 +26,10 @@ export default {
     const includePayroll = ref(true);
     const employees = ref([]);
     const monthlyExpenses = ref({});
+    const spentInRange = ref(new Set());
+    const showAll = ref(false);
+    const sortCol = ref(null);
+    const sortAsc = ref(true);
 
     const months = computed(() => {
       if (!dateRange.value) return [];
@@ -94,8 +98,13 @@ export default {
         if (!byKey[k] || r.scenario_id === sid) byKey[k] = r;
       });
       const totals = {};
-      Object.values(byKey).forEach(r => { totals[r.month] = (totals[r.month] || 0) + r.amount; });
+      const spent = new Set();
+      Object.values(byKey).forEach(r => {
+        totals[r.month] = (totals[r.month] || 0) + r.amount;
+        if (r.amount) spent.add(r.expense_item_id);
+      });
       monthlyExpenses.value = totals;
+      spentInRange.value = spent;
     };
 
     const load = async () => {
@@ -106,15 +115,60 @@ export default {
     watch([scenarioId, dateRange], load, { deep: true });
 
     // --- Filtered rows ---
+    // Current during the viewed period: its start/end months overlap the range (a one-time expense: its month is in it)
+    const isCurrent = (r) => {
+      const { start, end } = dateRange.value;
+      if (r.recurrence === 'one_time') return !r.start_month || (r.start_month >= start && r.start_month <= end);
+      return (!r.start_month || r.start_month <= end) && (!r.end_month || r.end_month >= start);
+    };
+    // Hidden by default: not current and no non-zero value anywhere in the viewed period
+    const isRelevant = (r) => isCurrent(r) || spentInRange.value.has(r.id);
+    const hiddenCount = computed(() => items.value.filter(r => !isRelevant(r)).length);
+
+    const sortValue = {
+      name: r => (r.name || '').toLowerCase(),
+      category: r => (r.category_name || '').toLowerCase(),
+      budget: r => r.cur_amount || 0,
+      renewal: r => r.renewal_day,
+      recurrence: r => ({ monthly: 1, quarterly: 2, annual: 3, one_time: 4 }[r.recurrence] || 9),
+      period: r => r.start_month || '',
+    };
+    const toggleSort = (col) => {
+      if (sortCol.value === col) sortAsc.value = !sortAsc.value;
+      else { sortCol.value = col; sortAsc.value = true; }
+    };
+
     const filtered = computed(() => {
-      if (!search.value) return items.value;
-      const q = search.value.toLowerCase();
-      return items.value.filter(r =>
-        (r.name || '').toLowerCase().includes(q) ||
-        (r.company || '').toLowerCase().includes(q) ||
-        (r.charge_label || '').toLowerCase().includes(q)
-      );
+      let list = showAll.value ? items.value : items.value.filter(isRelevant);
+      if (search.value) {
+        const q = search.value.toLowerCase();
+        list = list.filter(r =>
+          (r.name || '').toLowerCase().includes(q) ||
+          (r.company || '').toLowerCase().includes(q) ||
+          (r.charge_label || '').toLowerCase().includes(q)
+        );
+      }
+      if (!sortCol.value) return list;
+      const get = sortValue[sortCol.value];
+      const dir = sortAsc.value ? 1 : -1;
+      return [...list].sort((a, b) => {
+        const va = get(a), vb = get(b);
+        // Empty values always go last, whichever the direction
+        if (va == null || va === '') return vb == null || vb === '' ? 0 : 1;
+        if (vb == null || vb === '') return -1;
+        const cmp = typeof va === 'number' ? va - vb : String(va).localeCompare(String(vb));
+        return (cmp || (a.name || '').localeCompare(b.name || '')) * dir;
+      });
     });
+
+    const columns = [
+      { key: 'name', label: 'Expense', align: 'left' },
+      { key: 'category', label: 'Category', align: 'left' },
+      { key: 'budget', label: 'Budget', align: 'right' },
+      { key: 'renewal', label: 'Renewal', align: 'left' },
+      { key: 'recurrence', label: 'Recurrence', align: 'left' },
+      { key: 'period', label: 'Period', align: 'left' },
+    ];
 
     // --- KPI cards ---
     const catColors = { 'Cost of Goods Sold (COGS)': '#6366f1', 'Research & Development': '#8b5cf6', 'Sales & Marketing': '#ec4899', 'General & Administrative': '#f59e0b', 'Uncategorized / Other': '#94a3b8' };
@@ -157,26 +211,6 @@ export default {
       months.value.map(m => (monthlyExpenses.value[m] || 0) + (includePayroll.value ? payrollIn(m) : 0)),
       'Total Expenses',
     ));
-
-    // --- Upcoming renewals ---
-    const renewals = computed(() => {
-      const today = new Date();
-      const in30 = new Date(today.getTime() + 30 * 86400000);
-      return items.value
-        .filter(i => i.renewal_day && i.recurrence !== 'one_time')
-        .map(i => {
-          let d = new Date(today.getFullYear(), today.getMonth(), i.renewal_day);
-          if (d < today) d = new Date(today.getFullYear(), today.getMonth() + 1, i.renewal_day);
-          const month = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
-          return { ...i, renewalDate: d, renewalMonth: month, chargeAmount: chargeFromMonthly(i.cur_amount || 0, i.recurrence) };
-        })
-        .filter(i => i.renewalDate <= in30 && isChargeMonth(i.recurrence, i.start_month, i.renewalMonth))
-        .sort((a, b) => a.renewalDate - b.renewalDate);
-    });
-
-    const renewalsTotal = computed(() => renewals.value.reduce((s, r) => s + r.chargeAmount, 0));
-
-    const fmtDate = (d) => d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
 
     // --- Modal ---
     const openAdd = () => {
@@ -279,10 +313,11 @@ export default {
 
     return {
       items, categories, loading, search, filtered, showModal, editingItem,
-      form, editValues, saving, months, renewals, deleteTarget,
-      includePayroll, currentPayroll, monthlyTotal, categoryDonut, expensesTrend, renewalsTotal,
+      form, editValues, saving, months, deleteTarget,
+      includePayroll, currentPayroll, monthlyTotal, categoryDonut, expensesTrend,
+      showAll, hiddenCount, columns, sortCol, sortAsc, toggleSort,
       openAdd, openEdit, autoAlias, saveExpense, saveCellValue, confirmDelete,
-      fmtDate, formatCents, monthLabel, ordinalDay,
+      formatCents, monthLabel, ordinalDay,
     };
   },
   template: `
@@ -306,16 +341,11 @@ export default {
 
       <template v-else>
         <!-- KPI cards -->
-        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div class="bg-white rounded-xl border border-gray-200 p-5">
             <span class="text-xs font-medium text-gray-500 uppercase tracking-wider">Monthly Expenses</span>
             <div class="text-2xl font-bold text-gray-900 mt-2">{{ formatCents(monthlyTotal) }}</div>
             <div class="text-xs text-gray-400 mt-1">{{ includePayroll ? 'Incl. ' + formatCents(currentPayroll) + ' payroll' : 'Excl. payroll' }}</div>
-          </div>
-          <div class="bg-white rounded-xl border border-gray-200 p-5">
-            <span class="text-xs font-medium text-gray-500 uppercase tracking-wider">Renewals (Next 30 Days)</span>
-            <div class="text-2xl font-bold text-gray-900 mt-2">{{ formatCents(renewalsTotal) }}</div>
-            <div class="text-xs text-gray-400 mt-1">{{ renewals.length }} renewal{{ renewals.length !== 1 ? 's' : '' }}</div>
           </div>
           <div class="bg-white rounded-xl border border-gray-200 p-5">
             <span class="text-xs font-medium text-gray-500 uppercase tracking-wider">Cost by Category</span>
@@ -329,27 +359,16 @@ export default {
           </div>
         </div>
 
-        <!-- Upcoming Renewals -->
-        <div v-if="renewals.length" class="bg-white rounded-xl border border-gray-200 p-4">
-          <h3 class="text-sm font-medium text-gray-500 mb-3">Upcoming Renewals (next 30 days)</h3>
-          <div class="divide-y divide-gray-100">
-            <div v-for="r in renewals" :key="r.id" class="flex items-center justify-between py-2 text-sm">
-              <div>
-                <span class="font-medium text-gray-900">{{ r.name }}</span>
-                <span v-if="r.company" class="text-gray-400 ml-2">{{ r.company }}</span>
-              </div>
-              <div class="flex items-center gap-4">
-                <span class="text-gray-900">{{ formatCents(r.chargeAmount) }}</span>
-                <span class="text-gray-500 text-xs">{{ fmtDate(r.renewalDate) }}</span>
-              </div>
-            </div>
-          </div>
-        </div>
-
         <!-- Search -->
-        <div class="relative">
-          <i data-lucide="search" class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400"></i>
-          <input v-model="search" type="text" placeholder="Search expenses..." class="w-full pl-10 pr-4 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+        <div class="flex items-center gap-4">
+          <div class="relative flex-1">
+            <i data-lucide="search" class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400"></i>
+            <input v-model="search" type="text" placeholder="Search expenses..." class="w-full pl-10 pr-4 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+          </div>
+          <button v-if="hiddenCount || showAll" @click="showAll = !showAll" class="text-sm text-indigo-600 hover:text-indigo-800 whitespace-nowrap"
+            title="Expenses not current during the viewed period and with no spend in it">
+            {{ showAll ? 'Hide ' + hiddenCount + ' not current' : 'Show ' + hiddenCount + ' not current' }}
+          </button>
         </div>
 
         <!-- Table -->
@@ -357,12 +376,14 @@ export default {
           <table class="w-full text-sm">
             <thead>
               <tr class="bg-gray-50 border-b border-gray-200">
-                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Expense</th>
-                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Category</th>
-                <th class="px-4 py-3 text-right text-xs font-medium text-gray-500 uppercase">Budget</th>
-                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Renewal</th>
-                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Recurrence</th>
-                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Period</th>
+                <th v-for="col in columns" :key="col.key"
+                  :aria-sort="sortCol === col.key ? (sortAsc ? 'ascending' : 'descending') : 'none'"
+                  :class="['px-4 py-3 text-xs font-medium uppercase', col.align === 'right' ? 'text-right' : 'text-left']">
+                  <button @click="toggleSort(col.key)" class="inline-flex items-center gap-1 uppercase select-none hover:text-gray-700"
+                    :class="sortCol === col.key ? 'text-gray-900' : 'text-gray-500'">
+                    {{ col.label }}<span class="w-3 text-[10px]">{{ sortCol === col.key ? (sortAsc ? '\u25B2' : '\u25BC') : '' }}</span>
+                  </button>
+                </th>
                 <th class="px-4 py-3 text-right text-xs font-medium text-gray-500 uppercase">Actions</th>
               </tr>
             </thead>
