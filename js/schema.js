@@ -18,6 +18,7 @@ const DDL = [
     assistant_relay_url TEXT DEFAULT 'https://assistant.vintana.onetake.ai',
     assistant_model   TEXT DEFAULT 'claude-opus-5-5',
     company_context   TEXT,
+    payroll_pay_day   INTEGER,
     created_at        TEXT DEFAULT (datetime('now')),
     updated_at        TEXT DEFAULT (datetime('now'))
   )`,
@@ -36,6 +37,14 @@ const DDL = [
     sort_order INTEGER NOT NULL DEFAULT 0
   )`,
 
+  `CREATE TABLE IF NOT EXISTS expense_subcategories (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    category_id INTEGER NOT NULL REFERENCES expense_categories(id),
+    name        TEXT NOT NULL,
+    sort_order  INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(category_id, name)
+  )`,
+
   `CREATE TABLE IF NOT EXISTS expense_items (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     name          TEXT NOT NULL,
@@ -43,6 +52,7 @@ const DDL = [
     company       TEXT,
     charge_label  TEXT,
     category_id   INTEGER NOT NULL REFERENCES expense_categories(id),
+    subcategory_id INTEGER REFERENCES expense_subcategories(id),
     formula       TEXT,
     recurrence    TEXT NOT NULL DEFAULT 'monthly',
     renewal_day   INTEGER,
@@ -167,18 +177,65 @@ export async function runMigrations() {
   await batch(statements);
 }
 
-// Columns added after schema version 1. Databases created earlier get them here, on load.
-const SETTINGS_COLUMNS = {
-  assistant_relay_url: "TEXT DEFAULT 'https://assistant.vintana.onetake.ai'",
-  assistant_model: "TEXT DEFAULT 'claude-opus-5-5'",
-  company_context: 'TEXT',
+// Added after schema version 1. Databases created earlier get them in ensureSchemaUpgrades(), on load.
+// Upgrades only add tables, nullable columns and rows: existing data is never changed.
+const ADDED_COLUMNS = {
+  settings: {
+    assistant_relay_url: "TEXT DEFAULT 'https://assistant.vintana.onetake.ai'",
+    assistant_model: "TEXT DEFAULT 'claude-opus-5-5'",
+    company_context: 'TEXT',
+    payroll_pay_day: 'INTEGER',
+  },
+  expense_items: {
+    subcategory_id: 'INTEGER REFERENCES expense_subcategories(id)',
+  },
 };
 
-export async function ensureSettingsColumns() {
-  const cols = new Set((await query('PRAGMA table_info(settings)')).map(c => c.name));
-  const missing = Object.keys(SETTINGS_COLUMNS).filter(c => !cols.has(c));
-  if (missing.length) {
-    await batch(missing.map(c => `ALTER TABLE settings ADD COLUMN ${c} ${SETTINGS_COLUMNS[c]}`));
+// Default sub-categories: a typical Singapore SaaS chart of accounts, under the five P&L categories.
+// Payroll (salaries, employer CPF) is not here: it comes from the Payroll page.
+export const DEFAULT_SUBCATEGORIES = {
+  'Cost of Goods Sold (COGS)': [
+    'Cloud hosting & infrastructure', 'Third-party APIs & AI services', 'Payment processing fees',
+    'Customer support tools', 'Content & licensing costs',
+  ],
+  'Research & Development': [
+    'Software & development tools', 'R&D contractors & freelancers', 'Research & testing',
+  ],
+  'Sales & Marketing': [
+    'Advertising & paid acquisition', 'Marketing software', 'Events & sponsorships',
+    'Affiliate & referral commissions', 'Sales commissions', 'Travel & entertainment (sales)',
+  ],
+  'General & Administrative': [
+    'Rent & utilities', 'Office supplies & equipment', 'Accounting & audit fees', 'Legal & professional fees',
+    'Corporate secretarial fees', 'Insurance', 'Bank charges', 'Telecommunications & internet',
+    'Business software (SaaS)', 'Staff welfare & training', 'Travel (general)',
+    'Licences, permits & government fees', 'Depreciation',
+  ],
+  'Uncategorized / Other': [
+    'Foreign exchange gains & losses', 'Miscellaneous expenses',
+  ],
+};
+
+export async function ensureSchemaUpgrades() {
+  await execute(DDL.find(d => d.includes('expense_subcategories (')));
+  for (const [table, columns] of Object.entries(ADDED_COLUMNS)) {
+    const have = new Set((await query(`PRAGMA table_info(${table})`)).map(c => c.name));
+    const missing = Object.keys(columns).filter(c => !have.has(c));
+    if (missing.length) await batch(missing.map(c => `ALTER TABLE ${table} ADD COLUMN ${c} ${columns[c]}`));
+  }
+  // Seed the default sub-categories once; after that, deleted ones stay deleted
+  const seeded = await query("SELECT value FROM _meta WHERE key = 'subcategories_seeded'");
+  if (!seeded.length) {
+    const stmts = [];
+    for (const [category, names] of Object.entries(DEFAULT_SUBCATEGORIES)) {
+      names.forEach((name, i) => stmts.push({
+        sql: `INSERT OR IGNORE INTO expense_subcategories (category_id, name, sort_order)
+              SELECT id, ?, ? FROM expense_categories WHERE name = ?`,
+        args: [name, i + 1, category],
+      }));
+    }
+    stmts.push("INSERT OR REPLACE INTO _meta (key, value) VALUES ('subcategories_seeded', '1')");
+    await batch(stmts);
   }
 }
 
@@ -187,10 +244,11 @@ export async function resetAllData() {
     'funding_events', 'cash_actuals', 'scenario_employees',
     'employee_overrides', 'employees', 'revenue_values',
     'revenue_products', 'expense_values', 'expense_items',
-    'expense_categories', 'scenarios', 'settings', '_meta',
+    'expense_subcategories', 'expense_categories', 'scenarios', 'settings', '_meta',
   ];
   await batch(tables.map(t => `DROP TABLE IF EXISTS ${t}`));
   await runMigrations();
+  await ensureSchemaUpgrades();
 }
 
 export async function getSettings() {
@@ -203,7 +261,7 @@ export async function getSettings() {
 
 export async function updateSettings(fields) {
   const allowed = ['company_name', 'currency', 'fiscal_year_start', 'actuals_through', 'dept_mapping',
-    'assistant_relay_url', 'assistant_model', 'company_context'];
+    'assistant_relay_url', 'assistant_model', 'company_context', 'payroll_pay_day'];
   const sets = [];
   const args = [];
   for (const key of allowed) {

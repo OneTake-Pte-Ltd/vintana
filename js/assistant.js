@@ -13,7 +13,9 @@ export const DEFAULT_RELAY_URL = 'https://assistant.vintana.onetake.ai';
 // Large enough for a 24-month P&L; anything beyond is cut and the panel says so
 const MAX_SNAPSHOT_CHARS = 400000;
 
-const SKIP_TAGS = new Set(['BUTTON', 'SCRIPT', 'STYLE', 'CANVAS', 'TEMPLATE', 'NOSCRIPT', 'svg', 'SVG']);
+// Buttons are skipped (actions, not data), except click-to-edit values, which carry data-value
+const skipEl = el => SKIP_TAGS.has(el.tagName) || (el.tagName === 'BUTTON' && !el.hasAttribute('data-value'));
+const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'CANVAS', 'TEMPLATE', 'NOSCRIPT', 'svg', 'SVG']);
 const BLOCK_TAGS = new Set(['DIV', 'P', 'SECTION', 'HEADER', 'FOOTER', 'UL', 'OL', 'LI', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'FORM', 'TABLE', 'MAIN', 'ARTICLE', 'NAV']);
 
 const isHidden = el => el.hidden || el.getAttribute('aria-hidden') === 'true' || el.offsetParent === null
@@ -30,7 +32,7 @@ function cellText(cell) {
   const parts = [];
   const walk = node => {
     if (node.nodeType === Node.TEXT_NODE) { parts.push(node.textContent); return; }
-    if (node.nodeType !== Node.ELEMENT_NODE || SKIP_TAGS.has(node.tagName)) return;
+    if (node.nodeType !== Node.ELEMENT_NODE || skipEl(node)) return;
     if (['INPUT', 'SELECT', 'TEXTAREA'].includes(node.tagName)) { parts.push(' ' + fieldValue(node) + ' '); return; }
     if (BLOCK_TAGS.has(node.tagName)) parts.push(' ');
     node.childNodes.forEach(walk);
@@ -56,7 +58,7 @@ export function snapshotPage(root = document.querySelector('main')) {
   const out = [];
   const walk = node => {
     if (node.nodeType === Node.TEXT_NODE) { out.push(node.textContent.replace(/\s+/g, ' ')); return; }
-    if (node.nodeType !== Node.ELEMENT_NODE || SKIP_TAGS.has(node.tagName) || isHidden(node)) return;
+    if (node.nodeType !== Node.ELEMENT_NODE || skipEl(node) || isHidden(node)) return;
     if (node.tagName === 'TABLE') { out.push('\n' + tableText(node) + '\n'); return; }
     if (['INPUT', 'SELECT', 'TEXTAREA'].includes(node.tagName)) { out.push(' ' + fieldValue(node) + ' '); return; }
     const block = BLOCK_TAGS.has(node.tagName);

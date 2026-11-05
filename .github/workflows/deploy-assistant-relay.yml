@@ -1,7 +1,11 @@
 name: Deploy Assistant Relay Edge Script
 
 # Bunny script 101199 (https://assistant.vintana.onetake.ai).
-# Secrets live in the Bunny dashboard, not here: see the header of edge-scripts/assistant-relay.ts.
+# Authenticates with the script's deploy key (Bunny dashboard > Edge Scripting > the script > Deployments),
+# stored in this repository as the Actions secret BUNNY_ASSISTANT_DEPLOY_KEY. The key ties the deploy to the
+# script, not to a repository, so the script's linked GitHub repo doesn't matter.
+# The relay's own secrets (API key, token fingerprints) live in the Bunny dashboard: see the header of
+# edge-scripts/assistant-relay.ts.
 
 on:
   push:
@@ -12,7 +16,6 @@ on:
   workflow_dispatch:
 
 permissions:
-  id-token: write
   contents: read
 
 jobs:
@@ -20,24 +23,20 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v3
-        with:
-          node-version: '22'
-
-      - uses: denoland/setup-deno@v1
-        with:
-          deno-version: v1.x
-
-      - name: Install
-        run: ""
-
-      - name: Build
-        run: ""
+      - name: Check the deploy key is set
+        env:
+          DEPLOY_KEY: ${{ secrets.BUNNY_ASSISTANT_DEPLOY_KEY }}
+        run: |
+          if [ -z "$DEPLOY_KEY" ]; then
+            echo "::error::Add the script's Bunny deploy key as the repository secret BUNNY_ASSISTANT_DEPLOY_KEY"
+            exit 1
+          fi
 
       - name: Publish the script to Bunny
         uses: "BunnyWay/actions/deploy-script@main"
         with:
           script_id: 101199
+          deploy_key: ${{ secrets.BUNNY_ASSISTANT_DEPLOY_KEY }}
           file: "edge-scripts/assistant-relay.ts"

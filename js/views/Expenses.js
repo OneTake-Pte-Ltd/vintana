@@ -1,13 +1,15 @@
 import { query, execute } from '../db.js';
+import { formatCents, monthLabel, generateMonthRange, currentMonth, ordinalDay } from '../utils.js';
 import {
-  formatCents, monthLabel, generateMonthRange, currentMonth, ordinalDay,
-  chargeFromMonthly, expenseMonthlyValues, forecastEnd,
-} from '../utils.js';
+  loadCategoryLookups, categoryOptions, subcategoryOptions, RECURRENCE_OPTIONS, recurrenceLabel, updateExpenseField,
+} from '../expenses.js';
+import ExpenseModal from '../../components/ExpenseModal.js';
 import { loadScenarioEmployees, employeeCost, isEmployedIn, payrollCategory } from '../payroll.js';
 import { donutConfig, trendConfig } from '../miniCharts.js';
 
 export default {
   name: 'ExpensesView',
+  components: { ExpenseModal },
   setup() {
     const { ref, computed, onMounted, watch, inject, nextTick } = Vue;
     const scenarioId = inject('scenarioId');
@@ -17,12 +19,14 @@ export default {
 
     const items = ref([]);
     const categories = ref([]);
+    const subcategories = ref([]);
     const loading = ref(true);
     const search = ref('');
-    const showModal = ref(false);
-    const editingItem = ref(null);
+    const categoryFilter = ref('');
+    // Expense form: closed, or open on an expense id (null = new expense)
+    const modalOpen = ref(false);
+    const modalItemId = ref(null);
     const deleteTarget = ref(null);
-    const saving = ref(false);
     const includePayroll = ref(true);
     const employees = ref([]);
     const monthlyExpenses = ref({});
@@ -36,22 +40,16 @@ export default {
       return generateMonthRange(dateRange.value.start, dateRange.value.end);
     });
 
-    const blankForm = () => ({
-      name: '', alias: '', company: '', charge_label: '',
-      category_id: null, formula: '', entryMode: 'manual', amount: '',
-      recurrence: 'monthly', renewal_day: null,
-      start_month: dateRange.value?.start || '', end_month: '', notes: '',
-    });
-    const form = ref(blankForm());
-    const editValues = ref({});
-
     // --- Data loading ---
     const loadCategories = async () => {
-      categories.value = await query('SELECT * FROM expense_categories ORDER BY sort_order');
+      const lookups = await loadCategoryLookups();
+      categories.value = lookups.categories;
+      subcategories.value = lookups.subcategories;
     };
 
     const loadItems = async () => {
-      loading.value = true;
+      // Only the first load shows the spinner; reloads after an edit keep the table in place
+      if (!items.value.length) loading.value = true;
       try {
         const sid = scenarioId.value;
         const baseRows = await query('SELECT id FROM scenarios WHERE is_base = 1 LIMIT 1');
@@ -125,9 +123,11 @@ export default {
     const isRelevant = (r) => isCurrent(r) || spentInRange.value.has(r.id);
     const hiddenCount = computed(() => items.value.filter(r => !isRelevant(r)).length);
 
+    const subName = r => subcategories.value.find(sc => sc.id === r.subcategory_id)?.name || '';
     const sortValue = {
       name: r => (r.name || '').toLowerCase(),
       category: r => (r.category_name || '').toLowerCase(),
+      subcategory: r => subName(r).toLowerCase(),
       budget: r => r.cur_amount || 0,
       renewal: r => r.renewal_day,
       recurrence: r => ({ monthly: 1, quarterly: 2, annual: 3, one_time: 4 }[r.recurrence] || 9),
@@ -140,6 +140,9 @@ export default {
 
     const filtered = computed(() => {
       let list = showAll.value ? items.value : items.value.filter(isRelevant);
+      const [kind, fid] = categoryFilter.value.split(':');
+      if (kind === 'c') list = list.filter(r => r.category_id === Number(fid));
+      if (kind === 's') list = list.filter(r => r.subcategory_id === Number(fid));
       if (search.value) {
         const q = search.value.toLowerCase();
         list = list.filter(r =>
@@ -164,6 +167,7 @@ export default {
     const columns = [
       { key: 'name', label: 'Expense', align: 'left' },
       { key: 'category', label: 'Category', align: 'left' },
+      { key: 'subcategory', label: 'Sub-category', align: 'left' },
       { key: 'budget', label: 'Budget', align: 'right' },
       { key: 'renewal', label: 'Renewal', align: 'left' },
       { key: 'recurrence', label: 'Recurrence', align: 'left' },
@@ -212,91 +216,33 @@ export default {
       'Total Expenses',
     ));
 
-    // --- Modal ---
-    const openAdd = () => {
-      editingItem.value = null;
-      form.value = blankForm();
-      if (categories.value.length) form.value.category_id = categories.value[0].id;
-      showModal.value = true;
-    };
+    // --- Expense form and inline edits ---
+    const openAdd = () => { modalItemId.value = null; modalOpen.value = true; };
+    const openEdit = (item) => { modalItemId.value = item.id; modalOpen.value = true; };
 
-    const openEdit = async (item) => {
-      editingItem.value = item;
-      form.value = {
-        name: item.name, alias: item.alias || '', company: item.company || '',
-        charge_label: item.charge_label || '', category_id: item.category_id,
-        formula: item.formula || '', entryMode: item.formula ? 'formula' : 'manual',
-        amount: item.cur_amount ? (chargeFromMonthly(item.cur_amount, item.recurrence) / 100).toFixed(2) : '',
-        recurrence: item.recurrence, renewal_day: item.renewal_day,
-        start_month: item.start_month || '', end_month: item.end_month || '',
-        notes: item.notes || '',
-      };
-      // Load monthly values for the spreadsheet
-      const sid = scenarioId.value;
-      const baseRows = await query('SELECT id FROM scenarios WHERE is_base = 1 LIMIT 1');
-      const baseId = baseRows[0]?.id || 1;
-      const vals = await query(`
-        SELECT m.month, COALESCE(sv.amount, bv.amount) AS amount
-        FROM (${months.value.map(m => `SELECT '${m}' AS month`).join(' UNION ALL ')}) m
-        LEFT JOIN expense_values sv ON sv.expense_item_id = ? AND sv.scenario_id = ? AND sv.month = m.month
-        LEFT JOIN expense_values bv ON bv.expense_item_id = ? AND bv.scenario_id = ? AND bv.month = m.month AND sv.id IS NULL
-      `, [item.id, sid, item.id, baseId]);
-      const map = {};
-      vals.forEach(v => { map[v.month] = v.amount != null ? (v.amount / 100).toFixed(2) : ''; });
-      editValues.value = map;
-      showModal.value = true;
-    };
+    const catOptions = computed(() => categoryOptions(categories.value));
+    const subOptionsFor = row => subcategoryOptions(subcategories.value, row.category_id);
+    const hasSubcategories = computed(() => subcategories.value.length > 0);
 
-    const autoAlias = () => {
-      if (!editingItem.value) {
-        form.value.alias = form.value.name.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
-      }
-    };
-
-    const saveExpense = async () => {
-      if (!form.value.name || !form.value.category_id) { toast('Name and category are required', 'error'); return; }
-      saving.value = true;
+    // Saves one cell and updates the row in place, so the table doesn't reload or jump
+    const saveField = async (row, field, value) => {
       try {
-        const f = form.value;
-        const formulaVal = f.entryMode === 'formula' ? f.formula : null;
-        if (editingItem.value) {
-          await execute(`UPDATE expense_items SET name=?, alias=?, company=?, charge_label=?, category_id=?,
-            formula=?, recurrence=?, renewal_day=?, start_month=?, end_month=?, notes=? WHERE id=?`,
-            [f.name, f.alias, f.company || null, f.charge_label || null, f.category_id,
-             formulaVal, f.recurrence, f.renewal_day || null, f.start_month || null, f.end_month || null, f.notes || null, editingItem.value.id]);
+        await updateExpenseField(row, field, value, subcategories.value);
+        if (field === 'category_id') {
+          const cat = categories.value.find(c => c.id === Number(value));
+          const sub = subcategories.value.find(sc => sc.id === row.subcategory_id);
+          row.category_id = Number(value);
+          row.category_name = cat?.name || row.category_name;
+          if (sub && sub.category_id !== row.category_id) row.subcategory_id = null;
+        } else if (field === 'subcategory_id') {
+          row.subcategory_id = value === null || value === '' ? null : Number(value);
         } else {
-          const res = await execute(`INSERT INTO expense_items (name, alias, company, charge_label, category_id,
-            formula, recurrence, renewal_day, start_month, end_month, notes) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
-            [f.name, f.alias, f.company || null, f.charge_label || null, f.category_id,
-             formulaVal, f.recurrence, f.renewal_day || null, f.start_month || null, f.end_month || null, f.notes || null]);
-          // For manual entry, seed values across date range
-          if (f.entryMode === 'manual' && f.amount) {
-            const cents = Math.round(parseFloat(f.amount) * 100);
-            const itemId = res.lastInsertRowid;
-            if (itemId) {
-              const start = f.start_month || dateRange.value.start;
-              const end = f.end_month || forecastEnd(dateRange.value.end);
-              for (const v of expenseMonthlyValues(cents, f.recurrence, start, end)) {
-                await execute('INSERT OR REPLACE INTO expense_values (expense_item_id, scenario_id, month, amount, is_actual) VALUES (?,?,?,?,0)',
-                  [itemId, scenarioId.value, v.month, v.amount]);
-              }
-            }
-          }
+          row[field] = value;
         }
-        showModal.value = false;
-        toast(editingItem.value ? 'Expense updated' : 'Expense created', 'success');
-        await load();
+        toast('Saved', 'success');
       } catch (e) {
         toast('Save failed: ' + e.message, 'error');
-      } finally {
-        saving.value = false;
       }
-    };
-
-    const saveCellValue = async (itemId, month, val) => {
-      const cents = Math.round(parseFloat(val || 0) * 100);
-      await execute('INSERT OR REPLACE INTO expense_values (expense_item_id, scenario_id, month, amount, is_actual) VALUES (?,?,?,?,0)',
-        [itemId, scenarioId.value, month, cents]);
     };
 
     const confirmDelete = async () => {
@@ -312,12 +258,12 @@ export default {
     };
 
     return {
-      items, categories, loading, search, filtered, showModal, editingItem,
-      form, editValues, saving, months, deleteTarget,
+      items, categories, subcategories, loading, search, categoryFilter, filtered,
+      modalOpen, modalItemId, months, deleteTarget, load,
       includePayroll, currentPayroll, monthlyTotal, categoryDonut, expensesTrend,
       showAll, hiddenCount, columns, sortCol, sortAsc, toggleSort,
-      openAdd, openEdit, autoAlias, saveExpense, saveCellValue, confirmDelete,
-      formatCents, monthLabel, ordinalDay,
+      openAdd, openEdit, confirmDelete, saveField, catOptions, subOptionsFor, subName, hasSubcategories,
+      RECURRENCE_OPTIONS, recurrenceLabel, formatCents, monthLabel, ordinalDay,
     };
   },
   template: `
@@ -365,6 +311,13 @@ export default {
             <i data-lucide="search" class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400"></i>
             <input v-model="search" type="text" placeholder="Search expenses..." class="w-full pl-10 pr-4 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
           </div>
+          <select v-model="categoryFilter" aria-label="Filter by category" class="text-sm border border-gray-200 rounded-lg px-3 py-2 bg-white focus:outline-none focus:ring-2 focus:ring-indigo-500 max-w-[16rem]">
+            <option value="">All categories</option>
+            <template v-for="c in categories" :key="c.id">
+              <option :value="'c:' + c.id">{{ c.name }}</option>
+              <option v-for="sc in subcategories.filter(x => x.category_id === c.id)" :key="sc.id" :value="'s:' + sc.id">&nbsp;&nbsp;&nbsp;{{ sc.name }}</option>
+            </template>
+          </select>
           <button v-if="hiddenCount || showAll" @click="showAll = !showAll" class="text-sm text-indigo-600 hover:text-indigo-800 whitespace-nowrap"
             title="Expenses not current during the viewed period and with no spend in it">
             {{ showAll ? 'Hide ' + hiddenCount + ' not current' : 'Show ' + hiddenCount + ' not current' }}
@@ -389,12 +342,23 @@ export default {
             </thead>
             <tbody class="divide-y divide-gray-100">
               <tr v-for="row in filtered" :key="row.id" class="hover:bg-gray-50">
-                <td class="px-4 py-3">
-                  <div class="font-medium text-gray-900">{{ row.name }}</div>
-                  <div v-if="row.company" class="text-xs text-gray-400">{{ row.company }}</div>
-                  <div v-if="row.charge_label" class="text-xs text-gray-400 italic">{{ row.charge_label }}</div>
+                <td class="px-4 py-3 min-w-[15rem]">
+                  <div class="flex items-center gap-2 flex-wrap">
+                    <inline-edit :value="row.name" @save="v => saveField(row, 'name', v)">
+                      <span class="font-medium text-gray-900" :title="row.charge_label ? 'Charge label: ' + row.charge_label : ''">{{ row.name }}</span>
+                    </inline-edit>
+                    <span v-if="row.company" class="inline-flex items-center px-2 py-0.5 rounded-full bg-gray-100 text-gray-600 text-xs whitespace-nowrap">{{ row.company }}</span>
+                  </div>
+                  <div v-if="row.charge_label" class="text-xs text-gray-400 mt-0.5 truncate max-w-[18rem]" :title="row.charge_label">{{ row.charge_label }}</div>
                 </td>
-                <td class="px-4 py-3 text-gray-600">{{ row.category_name }}</td>
+                <td class="px-4 py-3 text-gray-600 whitespace-nowrap">
+                  <inline-edit :value="row.category_id" :options="catOptions" :display="row.category_name" @save="v => saveField(row, 'category_id', v)"/>
+                </td>
+                <td class="px-4 py-3 text-gray-600 whitespace-nowrap">
+                  <inline-edit :value="row.subcategory_id" :options="subOptionsFor(row)" :display="subName(row)" placeholder="None"
+                    :disabled="!hasSubcategories" disabled-title="Sub-categories are not set up on this database yet"
+                    @save="v => saveField(row, 'subcategory_id', v)"/>
+                </td>
                 <td class="px-4 py-3 text-right text-gray-900">
                   <span class="inline-flex items-center gap-1">
                     <i v-if="row.is_formula" data-lucide="function-square" class="w-3 h-3 text-indigo-400"></i>
@@ -402,7 +366,9 @@ export default {
                   </span>
                 </td>
                 <td class="px-4 py-3 text-gray-600">{{ ordinalDay(row.renewal_day) }}</td>
-                <td class="px-4 py-3 text-gray-600 capitalize">{{ (row.recurrence || '').replace('_', ' ') }}</td>
+                <td class="px-4 py-3 text-gray-600 whitespace-nowrap">
+                  <inline-edit :value="row.recurrence" :options="RECURRENCE_OPTIONS" :display="recurrenceLabel(row.recurrence)" @save="v => saveField(row, 'recurrence', v)"/>
+                </td>
                 <td class="px-4 py-3 text-gray-500 text-xs">
                   {{ row.start_month ? monthLabel(row.start_month) : '' }}
                   <template v-if="row.start_month"> – </template>
@@ -414,116 +380,15 @@ export default {
                 </td>
               </tr>
               <tr v-if="!filtered.length">
-                <td colspan="7" class="px-4 py-8 text-center text-gray-400">No expenses found</td>
+                <td colspan="8" class="px-4 py-8 text-center text-gray-400">No expenses found</td>
               </tr>
             </tbody>
           </table>
         </div>
       </template>
 
-      <!-- Add / Edit Modal -->
-      <div v-if="showModal" class="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" @click.self="showModal = false">
-        <div class="bg-white rounded-xl w-full max-w-2xl max-h-[90vh] overflow-y-auto p-6">
-          <h2 class="text-lg font-semibold text-gray-900 mb-4">{{ editingItem ? 'Edit' : 'Add' }} Expense</h2>
-          <div class="grid grid-cols-2 gap-4">
-            <div>
-              <label class="block text-xs font-medium text-gray-500 mb-1">Name *</label>
-              <input v-model="form.name" @input="autoAlias" class="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
-            </div>
-            <div>
-              <label class="block text-xs font-medium text-gray-500 mb-1">Alias</label>
-              <input v-model="form.alias" class="w-full px-3 py-2 text-sm font-mono border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
-            </div>
-            <div>
-              <label class="block text-xs font-medium text-gray-500 mb-1">Company</label>
-              <input v-model="form.company" class="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
-            </div>
-            <div>
-              <label class="block text-xs font-medium text-gray-500 mb-1">Charge Label</label>
-              <input v-model="form.charge_label" class="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
-            </div>
-            <div>
-              <label class="block text-xs font-medium text-gray-500 mb-1">Category *</label>
-              <select v-model.number="form.category_id" class="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500">
-                <option v-for="c in categories" :key="c.id" :value="c.id">{{ c.name }}</option>
-              </select>
-            </div>
-            <div>
-              <label class="block text-xs font-medium text-gray-500 mb-1">Recurrence</label>
-              <select v-model="form.recurrence" class="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500">
-                <option value="monthly">Monthly</option>
-                <option value="quarterly">Quarterly</option>
-                <option value="annual">Annual</option>
-                <option value="one_time">One-time</option>
-              </select>
-            </div>
-            <div>
-              <label class="block text-xs font-medium text-gray-500 mb-1">Entry Mode</label>
-              <div class="flex gap-2 mt-1">
-                <button @click="form.entryMode = 'manual'" :class="['px-3 py-1.5 text-xs rounded-lg border', form.entryMode === 'manual' ? 'bg-indigo-50 border-indigo-300 text-indigo-700' : 'border-gray-200 text-gray-500']">Manual</button>
-                <button @click="form.entryMode = 'formula'" :class="['px-3 py-1.5 text-xs rounded-lg border', form.entryMode === 'formula' ? 'bg-indigo-50 border-indigo-300 text-indigo-700' : 'border-gray-200 text-gray-500']">Formula</button>
-              </div>
-            </div>
-            <div>
-              <label class="block text-xs font-medium text-gray-500 mb-1">Renewal Day</label>
-              <input v-model.number="form.renewal_day" type="number" min="1" max="31" class="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
-            </div>
-            <div v-if="form.entryMode === 'manual'" class="col-span-2">
-              <label class="block text-xs font-medium text-gray-500 mb-1">Amount per charge (EUR)</label>
-              <input v-model="form.amount" type="number" step="0.01" placeholder="0.00" class="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
-            </div>
-            <div v-if="form.entryMode === 'formula'" class="col-span-2">
-              <label class="block text-xs font-medium text-gray-500 mb-1">Formula</label>
-              <input v-model="form.formula" placeholder="e.g. customers.total * 5" class="w-full px-3 py-2 text-sm font-mono border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
-            </div>
-            <div>
-              <label class="block text-xs font-medium text-gray-500 mb-1">Start Month</label>
-              <input v-model="form.start_month" type="month" class="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
-            </div>
-            <div>
-              <label class="block text-xs font-medium text-gray-500 mb-1">End Month</label>
-              <input v-model="form.end_month" type="month" class="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
-            </div>
-            <div class="col-span-2">
-              <label class="block text-xs font-medium text-gray-500 mb-1">Notes</label>
-              <textarea v-model="form.notes" rows="2" class="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"></textarea>
-            </div>
-          </div>
-
-          <!-- Monthly values spreadsheet (edit mode only) -->
-          <div v-if="editingItem && form.entryMode === 'manual'" class="mt-4">
-            <label class="block text-xs font-medium text-gray-500 mb-2">Monthly Values</label>
-            <div class="overflow-x-auto border border-gray-200 rounded-lg">
-              <table class="text-xs">
-                <thead>
-                  <tr class="bg-gray-50">
-                    <th v-for="m in months" :key="m" class="px-2 py-1.5 text-center font-medium text-gray-500 whitespace-nowrap">{{ monthLabel(m) }}</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr>
-                    <td v-for="m in months" :key="m" class="px-1 py-1">
-                      <input
-                        :value="editValues[m] || ''"
-                        @blur="e => { editValues[m] = e.target.value; saveCellValue(editingItem.id, m, e.target.value); }"
-                        type="number" step="0.01"
-                        class="w-20 px-1.5 py-1 text-xs text-right border border-gray-200 rounded focus:outline-none focus:ring-1 focus:ring-indigo-400"
-                      />
-                    </td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          </div>
-
-          <div class="flex justify-end gap-3 mt-6">
-            <button @click="showModal = false" class="px-4 py-2 text-sm border border-gray-200 rounded-lg hover:bg-gray-50">Cancel</button>
-            <button @click="saveExpense" :disabled="saving" class="px-4 py-2 text-sm bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-50">
-              {{ saving ? 'Saving...' : (editingItem ? 'Update' : 'Create') }}
-            </button>
-          </div>
-        </div>
-      </div>
+      <expense-modal v-if="modalOpen" :item-id="modalItemId" :categories="categories" :subcategories="subcategories"
+        @close="modalOpen = false" @saved="load"/>
 
       <!-- Delete Confirmation -->
       <div v-if="deleteTarget" class="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
