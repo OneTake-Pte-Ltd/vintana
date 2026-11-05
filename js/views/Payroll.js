@@ -1,6 +1,6 @@
 import { execute } from '../db.js';
 import { formatCents, currentMonth, generateMonthRange, monthLabel } from '../utils.js';
-import { loadScenarioEmployees, employeeCost, isEmployedIn } from '../payroll.js';
+import { loadScenarioEmployees, employeeCost, isEmployedIn, DEFAULT_DEPT_MAPPING } from '../payroll.js';
 
 const COLORS = ['#6366f1','#10b981','#f59e0b','#ef4444','#8b5cf6','#06b6d4','#ec4899','#84cc16','#f97316','#14b8a6'];
 const INPUT = 'w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500';
@@ -22,6 +22,8 @@ export default {
     const showModal = ref(false);
     const editingEmployee = ref(null);
     const confirmDelete = ref(null);
+    const route = VueRouter.useRoute();
+    const router = VueRouter.useRouter();
     const scenarioIsBase = ref(true);
     const donutCanvas = ref(null);
     const lineCanvas = ref(null);
@@ -70,6 +72,36 @@ export default {
         return (typeof va === 'number' ? va - vb : String(va).localeCompare(String(vb))) * asc;
       });
     });
+    // --- Inline edits: name, role and department. These describe the person, not a scenario assumption,
+    // so they are saved on the employee record (or the scenario-only employee) whatever the scenario.
+    const NEW_DEPT = '__new__';
+    const deptOptions = computed(() => {
+      const known = new Set([...departments.value, ...Object.keys(settings.value?.dept_mapping || {}), ...Object.keys(DEFAULT_DEPT_MAPPING)]);
+      return [{ value: null, label: 'None' }, ...[...known].sort().map(d => ({ value: d, label: d })), { value: NEW_DEPT, label: 'New department...' }];
+    });
+    async function saveField(emp, field, value) {
+      if (field === 'department' && value === NEW_DEPT) {
+        value = (window.prompt('Name of the new department') || '').trim();
+        if (!value) return;
+      }
+      try {
+        if (emp._source === 'scenario') await execute(`UPDATE scenario_employees SET ${field}=? WHERE id=?`, [value, emp._scenarioEmployeeId]);
+        else await execute(`UPDATE employees SET ${field}=? WHERE id=?`, [value, emp.id]);
+        emp[field] = value;
+        toast('Saved', 'success');
+        if (field === 'department') { await nextTick(); renderCharts(); }
+      } catch (e) { toast('Save failed: ' + e.message, 'error'); }
+    }
+
+    // Opened from another page with ?edit=<id> (or s<id> for an employee added in a scenario)
+    async function openFromQuery() {
+      const key = route.query.edit;
+      if (!key) return;
+      const emp = employees.value.find(e => key.startsWith('s') ? e._source === 'scenario' && String(e._scenarioEmployeeId) === key.slice(1) : e._source !== 'scenario' && String(e.id) === key);
+      router.replace({ path: '/payroll' });
+      if (emp) openEdit(emp); else toast('This employee is not in the selected scenario', 'error');
+    }
+
     function toggleSort(c) { if (sortCol.value === c) sortAsc.value = !sortAsc.value; else { sortCol.value = c; sortAsc.value = true; } }
     function openAdd() { editingEmployee.value = null; form.value = blankForm(); showModal.value = true; }
     function openEdit(emp) {
@@ -146,11 +178,11 @@ export default {
             plugins:{ legend:{display:false}, tooltip:{ callbacks:{ label:c=>`€${c.parsed.y.toLocaleString(undefined,{minimumFractionDigits:2})}` } } } } });
       }
     }
-    onMounted(async () => { await loadEmployees(); await nextTick(); renderCharts(); });
+    onMounted(async () => { await loadEmployees(); await nextTick(); renderCharts(); openFromQuery(); });
     onBeforeUnmount(() => { if (donutChart) donutChart.destroy(); if (lineChart) lineChart.destroy(); });
     watch([scenarioId, dateRange], async () => { await loadEmployees(); await nextTick(); renderCharts(); }, { deep:true });
 
-    return { loading, filteredEmployees, showAll, hiddenCount, departments, deptFilter, sortCol, sortAsc, toggleSort,
+    return { loading, filteredEmployees, showAll, hiddenCount, departments, deptOptions, saveField, deptFilter, sortCol, sortAsc, toggleSort,
       totalCost, headcount, showModal, editingEmployee, form, openAdd, openEdit, saveEmployee,
       confirmDelete, deleteEmployee, empCost, donutCanvas, lineCanvas, formatCents, scenarioIsBase, INPUT };
   },
@@ -203,9 +235,9 @@ export default {
           </tr></thead>
           <tbody class="divide-y divide-gray-100">
             <tr v-for="emp in filteredEmployees" :key="emp.id||emp._scenarioEmployeeId" class="hover:bg-gray-50 transition-colors">
-              <td class="px-4 py-3 font-medium text-gray-900">{{ emp.name }}</td>
-              <td class="px-4 py-3 text-gray-600">{{ emp.role||'\\u2014' }}</td>
-              <td class="px-4 py-3 text-gray-600">{{ emp.department||'\\u2014' }}</td>
+              <td class="px-4 py-3 font-medium text-gray-900"><inline-edit :value="emp.name" @save="v => saveField(emp, 'name', v)"/></td>
+              <td class="px-4 py-3 text-gray-600"><inline-edit :value="emp.role" placeholder="Add role" @save="v => saveField(emp, 'role', v)"/></td>
+              <td class="px-4 py-3 text-gray-600"><inline-edit :value="emp.department" :options="deptOptions" placeholder="None" @save="v => saveField(emp, 'department', v)"/></td>
               <td class="px-4 py-3 text-gray-900">{{ formatCents(emp.salary_monthly) }}</td>
               <td class="px-4 py-3 text-gray-600">{{ emp.tax_pct }}%</td>
               <td class="px-4 py-3 text-gray-900 font-medium">{{ formatCents(empCost(emp)) }}</td>

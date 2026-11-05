@@ -7,7 +7,7 @@ import { getBaseScenarioId } from './schema.js';
 import { parseCsv, toCsv, parseAmountToCents, parseMonth } from './csv.js';
 import { currentMonth, chargeFromMonthly, expenseMonthlyValues, forecastEnd } from './utils.js';
 
-export const EXPENSE_COLUMNS = ['name', 'company', 'category', 'amount', 'recurrence', 'renewal_day', 'start_month', 'end_month', 'notes'];
+export const EXPENSE_COLUMNS = ['name', 'company', 'category', 'subcategory', 'amount', 'recurrence', 'renewal_day', 'start_month', 'end_month', 'notes'];
 export const PAYROLL_COLUMNS = ['name', 'role', 'department', 'monthly_salary', 'employer_tax_pct', 'start_month', 'end_month', 'notes'];
 
 const DEFAULT_CATEGORY = 'Uncategorized / Other';
@@ -59,6 +59,10 @@ export async function exportExpensesCsv() {
     'SELECT expense_item_id, month, amount FROM expense_values WHERE scenario_id = ? ORDER BY month', [baseId]);
   const byItem = {};
   values.forEach(v => { (byItem[v.expense_item_id] ||= []).push(v); });
+  let subNames = {};
+  try {
+    subNames = Object.fromEntries((await query('SELECT id, name FROM expense_subcategories')).map(sc => [sc.id, sc.name]));
+  } catch { /* sub-categories not set up on this database yet */ }
 
   const now = currentMonth();
   const rows = items.map(item => {
@@ -74,7 +78,8 @@ export async function exportExpensesCsv() {
       }
     }
     return {
-      name: item.name, company: item.company, category: item.category, amount,
+      name: item.name, company: item.company, category: item.category,
+      subcategory: subNames[item.subcategory_id] || '', amount,
       recurrence: item.recurrence, renewal_day: item.renewal_day,
       start_month: item.start_month, end_month: item.end_month, notes: item.notes,
     };
@@ -126,6 +131,8 @@ export async function importExpensesCsv(text, dateRange) {
     rowErrors.forEach(e => errors.push(`Row ${line}: ${e}`));
     return {
       line, name, company: r.company || null, category: r.category || DEFAULT_CATEGORY,
+      // undefined: the file has no subcategory column, so the expense keeps its sub-category
+      subcategory: r.subcategory === undefined ? undefined : (r.subcategory || '').trim(),
       amount, recurrence, renewalDay, startMonth, endMonth, notes: r.notes || null,
     };
   });
@@ -145,6 +152,27 @@ export async function importExpensesCsv(text, dateRange) {
     categories = await query('SELECT id, name FROM expense_categories');
   }
   const catId = new Map(categories.map(c => [key(c.name), c.id]));
+
+  // Sub-categories: matched by name inside the row's category, created when missing
+  let subId = null;
+  if (parsed.some(p => p.subcategory !== undefined)) {
+    const subKey = (cat, name) => `${cat}|${key(name)}`;
+    const loadSubs = async () => new Map((await query('SELECT id, category_id, name FROM expense_subcategories'))
+      .map(sc => [subKey(sc.category_id, sc.name), sc.id]));
+    subId = await loadSubs();
+    const missingSubs = new Map();
+    parsed.filter(p => p.subcategory).forEach(p => {
+      const c = catId.get(key(p.category));
+      if (!subId.has(subKey(c, p.subcategory))) missingSubs.set(subKey(c, p.subcategory), [c, p.subcategory]);
+    });
+    if (missingSubs.size) {
+      await batch([...missingSubs.values()].map(([c, name]) => ({
+        sql: 'INSERT INTO expense_subcategories (category_id, name, sort_order) VALUES (?, ?, 99)', args: [c, name],
+      })));
+      subId = await loadSubs();
+    }
+    subId.lookup = p => (p.subcategory ? subId.get(subKey(catId.get(key(p.category)), p.subcategory)) : null);
+  }
 
   const usedAliases = new Set(existing.map(e => e.alias).filter(Boolean));
   const uniqueAlias = (name) => {
@@ -175,6 +203,9 @@ export async function importExpensesCsv(text, dateRange) {
         start_month, end_month, notes, alias) VALUES (?,?,?,?,?,?,?,?,?)`, [...fields, uniqueAlias(p.name)]);
       itemId = res.lastInsertRowid;
       created++;
+    }
+    if (subId && p.subcategory !== undefined) {
+      await execute('UPDATE expense_items SET subcategory_id = ? WHERE id = ?', [subId.lookup(p), itemId]);
     }
 
     // A blank amount on an existing expense keeps its current monthly values

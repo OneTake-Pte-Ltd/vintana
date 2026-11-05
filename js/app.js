@@ -1,5 +1,5 @@
 import { hasCredentials, query } from './db.js';
-import { checkSchema, getSettings, ensureSettingsColumns } from './schema.js';
+import { checkSchema, getSettings, ensureSchemaUpgrades } from './schema.js';
 import { currentMonth, addMonths } from './utils.js';
 
 import Sidebar from '../components/Sidebar.js';
@@ -20,6 +20,7 @@ import CashFlowView from './views/CashFlow.js';
 import ScenariosView from './views/Scenarios.js';
 import UpcomingChargesView from './views/UpcomingCharges.js';
 import AssistantPanel from '../components/AssistantPanel.js';
+import InlineEdit from '../components/InlineEdit.js';
 import SettingsView from './views/Settings.js';
 
 const routes = [
@@ -131,8 +132,8 @@ const app = Vue.createApp({
       try {
         const ok = await checkSchema();
         if (ok) {
-          // Read-only tokens can't add columns; the app works without them
-          await ensureSettingsColumns().catch(() => {});
+          // Read-only tokens can't upgrade the schema; the app works without the additions
+          await ensureSchemaUpgrades().catch(() => {});
           await Promise.all([loadScenarios(), loadSettings()]);
         }
       } catch {
@@ -176,6 +177,7 @@ app.component('scenario-selector', ScenarioSelector);
 app.component('chart-wrapper', ChartWrapper);
 app.component('formula-input', FormulaInput);
 app.component('assistant-panel', AssistantPanel);
+app.component('inline-edit', InlineEdit);
 
 app.use(router);
 app.mount('#app');

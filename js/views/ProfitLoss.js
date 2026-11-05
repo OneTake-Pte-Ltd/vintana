@@ -1,5 +1,7 @@
 import { query } from '../db.js';
 import { formatCents, monthLabel, generateMonthRange } from '../utils.js';
+import { loadCategoryLookups } from '../expenses.js';
+import { payrollCategory } from '../payroll.js';
 
 export default {
   name: 'ProfitLossView',
@@ -23,11 +25,19 @@ export default {
       const cmp = sortMode.value === 'amount'
         ? (a, b) => rowTotal(b) - rowTotal(a) || a.label.localeCompare(b.label)
         : (a, b) => a.label.localeCompare(b.label, undefined, { sensitivity: 'base' });
+      // Inside a category, sub-category blocks (subtotal line + its expenses) and loose lines sort together;
+      // the expenses inside each block sort the same way
       const out = [];
       let run = [];
-      const flush = () => { out.push(...run.sort(cmp)); run = []; };
+      const flush = () => {
+        run.sort((a, b) => cmp(a.row, b.row));
+        run.forEach(e => { out.push(e.row); out.push(...e.children.sort(cmp)); });
+        run = [];
+      };
       for (const r of rows.value) {
-        if (r.type === 'item') run.push(r);
+        if (r.type === 'subgroup') run.push({ row: r, children: [] });
+        else if (r.type === 'item' && r.level === 2) run[run.length - 1].children.push(r);
+        else if (r.type === 'item') run.push({ row: r, children: [] });
         else { flush(); out.push(r); }
       }
       flush();
@@ -91,8 +101,9 @@ export default {
         }
 
         // --- Expenses ---
+        const { subcategories } = await loadCategoryLookups();
         const expItems = await query(`
-          SELECT ei.id, ei.name, ec.name as category_name, ec.sort_order
+          SELECT ei.*, ec.name as category_name, ec.sort_order
           FROM expense_items ei
           JOIN expense_categories ec ON ec.id = ei.category_id
           WHERE ei.visible = 1 ORDER BY ec.sort_order, ei.id`);
@@ -120,7 +131,7 @@ export default {
           for (const emp of employees) {
             if (emp.start_date.slice(0, 7) > m) continue;
             if (emp.end_date && emp.end_date.slice(0, 7) < m) continue;
-            const cat = deptMap[emp.department] || 'Uncategorized / Other';
+            const cat = payrollCategory(emp.department, deptMap);
             if (!payrollByCat[cat]) payrollByCat[cat] = {};
             payrollByCat[cat][m] = (payrollByCat[cat][m] || 0)
               + Math.round(emp.salary_monthly * (1 + (emp.tax_pct || 0) / 100));
@@ -129,6 +140,28 @@ export default {
 
         // --- Build rows ---
         const R = [];
+
+        // Expense lines of one category: under a sub-category subtotal line when they have one, loose otherwise
+        const pushCategoryExpenses = (categoryName, catTot) => {
+          const inCat = expItems.filter(i => i.category_name === categoryName);
+          const lineValues = it => {
+            const v = emptyMonths();
+            for (const m of ml) { v[m] = (expMap[it.id] || {})[m] || 0; catTot[m] += v[m]; }
+            return v;
+          };
+          for (const sub of subcategories.filter(sc => sc.category_name === categoryName)) {
+            const members = inCat.filter(i => i.subcategory_id === sub.id);
+            if (!members.length) continue;
+            const subRow = { label: sub.name, type: 'subgroup', values: emptyMonths(), indent: true };
+            const children = members.map(it => ({ label: it.name, type: 'item', level: 2, values: lineValues(it) }));
+            children.forEach(c => { for (const m of ml) subRow.values[m] += c.values[m]; });
+            R.push(subRow, ...children);
+          }
+          const grouped = new Set(subcategories.filter(sc => sc.category_name === categoryName).map(sc => sc.id));
+          for (const it of inCat.filter(i => !grouped.has(i.subcategory_id))) {
+            R.push({ label: it.name, type: 'item', values: lineValues(it), indent: true });
+          }
+        };
 
         // Revenue
         R.push({ label: 'Revenue', type: 'header' });
@@ -143,11 +176,7 @@ export default {
         // COGS
         R.push({ label: 'Cost of Goods Sold (COGS)', type: 'header' });
         const totalCOGS = emptyMonths();
-        for (const it of expItems.filter(i => i.category_name === 'Cost of Goods Sold (COGS)')) {
-          const v = emptyMonths();
-          for (const m of ml) { v[m] = (expMap[it.id] || {})[m] || 0; totalCOGS[m] += v[m]; }
-          R.push({ label: it.name, type: 'item', values: v, indent: true });
-        }
+        pushCategoryExpenses('Cost of Goods Sold (COGS)', totalCOGS);
         R.push({ label: 'Total COGS', type: 'subtotal', values: totalCOGS });
 
         // Gross Profit
@@ -176,11 +205,7 @@ export default {
           }
 
           // Expense items in this category
-          for (const it of expItems.filter(i => i.category_name === cat.name)) {
-            const v = emptyMonths();
-            for (const m of ml) { v[m] = (expMap[it.id] || {})[m] || 0; catTot[m] += v[m]; }
-            R.push({ label: it.name, type: 'item', values: v, indent: true });
-          }
+          pushCategoryExpenses(cat.name, catTot);
 
           for (const m of ml) totalOpEx[m] += catTot[m];
           R.push({ label: `Total ${cat.short}`, type: 'subtotal', values: catTot });
@@ -260,7 +285,8 @@ export default {
                     row.type === 'total' ? 'text-gray-900' : '',
                     row.type === 'subtotal' ? 'text-gray-700' : '',
                     row.type === 'item' ? 'text-gray-600' : '',
-                    row.indent ? 'pl-8' : 'pl-4',
+                    row.type === 'subgroup' ? 'font-medium text-gray-800' : '',
+                    row.level === 2 ? 'pl-12' : row.indent ? 'pl-8' : 'pl-4',
                   ]">
                 {{ row.label }}
               </td>
@@ -269,6 +295,7 @@ export default {
                     cellBg(row, m),
                     row.type === 'header' ? 'pt-4' : '',
                     row.type === 'subtotal' || row.type === 'total' ? 'font-semibold' : '',
+                    row.type === 'subgroup' ? 'font-medium' : '',
                     row.type === 'total' ? 'border-t border-gray-300' : '',
                   ]"
                   class="px-4 py-1.5 text-right whitespace-nowrap tabular-nums">

@@ -1,4 +1,5 @@
-import { clearCredentials, getCredentials } from '../db.js';
+import { clearCredentials, getCredentials, query, execute } from '../db.js';
+import { loadCategoryLookups, categoryOptions } from '../expenses.js';
 import { ASSISTANT_MODELS, DEFAULT_MODEL, DEFAULT_RELAY_URL, sha256Hex } from '../assistant.js';
 import { getSettings, updateSettings, resetAllData } from '../schema.js';
 import { DEFAULT_DEPT_MAPPING } from '../payroll.js';
@@ -11,7 +12,7 @@ import { downloadCsv } from '../csv.js';
 export default {
   name: 'SettingsView',
   setup() {
-    const { ref, onMounted, inject } = Vue;
+    const { ref, computed, onMounted, inject } = Vue;
     const router = VueRouter.useRouter();
     const toast = inject('toast');
     const dateRange = inject('dateRange');
@@ -45,7 +46,9 @@ export default {
           settings.value.assistant_relay_url ||= DEFAULT_RELAY_URL;
           settings.value.assistant_model ||= DEFAULT_MODEL;
           settings.value.company_context ||= '';
+          settings.value.payroll_pay_day ??= null;
         }
+        await loadSubcategories();
         const mapping = settings.value?.dept_mapping || {};
         const entries = Object.keys(mapping).length > 0
           ? Object.entries(mapping)
@@ -72,6 +75,7 @@ export default {
           assistant_relay_url: (settings.value.assistant_relay_url || '').trim() || DEFAULT_RELAY_URL,
           assistant_model: settings.value.assistant_model || DEFAULT_MODEL,
           company_context: settings.value.company_context || null,
+          payroll_pay_day: settings.value.payroll_pay_day || null,
         });
         await reloadAppSettings();
         toast('Settings saved', 'success');
@@ -93,7 +97,7 @@ export default {
     const exportData = async () => {
       try {
         const { query } = await import('../db.js');
-        const tables = ['settings', 'scenarios', 'expense_categories', 'expense_items',
+        const tables = ['settings', 'scenarios', 'expense_categories', 'expense_subcategories', 'expense_items',
           'expense_values', 'revenue_products', 'revenue_values', 'employees',
           'employee_overrides', 'scenario_employees', 'cash_actuals', 'funding_events'];
         const dump = {};
@@ -127,7 +131,7 @@ export default {
           const { runMigrations } = await import('../schema.js');
           const tables = ['funding_events', 'cash_actuals', 'scenario_employees',
             'employee_overrides', 'employees', 'revenue_values', 'revenue_products',
-            'expense_values', 'expense_items', 'expense_categories', 'scenarios', 'settings'];
+            'expense_values', 'expense_items', 'expense_subcategories', 'expense_categories', 'scenarios', 'settings'];
           await batch(tables.map(t => `DELETE FROM ${t}`));
           for (const [table, rows] of Object.entries(dump)) {
             if (!rows || rows.length === 0) continue;
@@ -206,6 +210,62 @@ export default {
       }
     };
 
+    // --- Expense sub-categories: saved as soon as they change ---
+    const expCategories = ref([]);
+    const subcategories = ref([]);
+    const subUsage = ref({});
+    const newSub = ref({ name: '', category_id: null });
+    const loadSubcategories = async () => {
+      try {
+        const l = await loadCategoryLookups();
+        expCategories.value = l.categories;
+        subcategories.value = l.subcategories;
+        newSub.value.category_id ??= l.categories[0]?.id ?? null;
+        const usage = await query('SELECT subcategory_id AS id, COUNT(*) AS n FROM expense_items WHERE subcategory_id IS NOT NULL GROUP BY subcategory_id');
+        subUsage.value = Object.fromEntries(usage.map(u => [u.id, u.n]));
+      } catch { /* sub-categories not set up on this database yet */ }
+    };
+    const expCategoryOptions = computed(() => categoryOptions(expCategories.value));
+    const subsOf = catId => subcategories.value.filter(sc => sc.category_id === catId);
+    const addSubcategory = async () => {
+      const name = newSub.value.name.trim();
+      if (!name || !newSub.value.category_id) return;
+      try {
+        const max = Math.max(0, ...subsOf(newSub.value.category_id).map(sc => sc.sort_order || 0));
+        await execute('INSERT INTO expense_subcategories (category_id, name, sort_order) VALUES (?, ?, ?)', [newSub.value.category_id, name, max + 1]);
+        newSub.value.name = '';
+        await loadSubcategories();
+        toast('Sub-category added', 'success');
+      } catch (e) {
+        toast(/UNIQUE/.test(e.message) ? 'That sub-category already exists in this category' : 'Add failed: ' + e.message, 'error');
+      }
+    };
+    const updateSubcategory = async (sc, field, value) => {
+      try {
+        if (field === 'category_id') {
+          // Expenses using it move along, so they never point to a sub-category of another category
+          await execute('UPDATE expense_subcategories SET category_id = ? WHERE id = ?', [Number(value), sc.id]);
+          await execute('UPDATE expense_items SET category_id = ? WHERE subcategory_id = ?', [Number(value), sc.id]);
+        } else {
+          await execute('UPDATE expense_subcategories SET name = ? WHERE id = ?', [value, sc.id]);
+        }
+        await loadSubcategories();
+        toast('Saved', 'success');
+      } catch (e) {
+        toast(/UNIQUE/.test(e.message) ? 'That sub-category already exists in this category' : 'Save failed: ' + e.message, 'error');
+      }
+    };
+    const deleteSubcategory = async (sc) => {
+      const n = subUsage.value[sc.id] || 0;
+      if (!window.confirm(`Delete "${sc.name}"?` + (n ? ` ${n} expense${n > 1 ? 's' : ''} will keep their category and have no sub-category.` : ''))) return;
+      try {
+        await execute('UPDATE expense_items SET subcategory_id = NULL WHERE subcategory_id = ?', [sc.id]);
+        await execute('DELETE FROM expense_subcategories WHERE id = ?', [sc.id]);
+        await loadSubcategories();
+        toast('Sub-category deleted', 'success');
+      } catch (e) { toast('Delete failed: ' + e.message, 'error'); }
+    };
+
     // Fingerprint of this browser's database token, for the relay secrets. Only computed when asked for.
     const tokenHash = ref('');
     const showTokenHash = async () => {
@@ -229,6 +289,8 @@ export default {
       csvKinds, csvBusy, csvErrors, exportCsv, importCsv,
       showResetConfirm, doReset, disconnect,
       ASSISTANT_MODELS, tokenHash, showTokenHash, copyTokenHash,
+      expCategories, subcategories, subUsage, newSub, expCategoryOptions, subsOf,
+      addSubcategory, updateSubcategory, deleteSubcategory,
     };
   },
   template: `
@@ -255,6 +317,14 @@ export default {
               <label class="block text-sm font-medium text-gray-700 mb-1">Actuals Through</label>
               <input v-model="settings.actuals_through" type="month" class="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
             </div>
+            <div>
+              <label for="pay-day" class="block text-sm font-medium text-gray-700 mb-1">Payroll Pay Day</label>
+              <select id="pay-day" v-model="settings.payroll_pay_day" class="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                <option :value="null">Last day of the month</option>
+                <option v-for="d in 28" :key="d" :value="d">Day {{ d }} of the month</option>
+              </select>
+              <p class="text-xs text-gray-400 mt-1">Used to date salaries on the Upcoming Charges page.</p>
+            </div>
           </div>
         </section>
 
@@ -273,6 +343,32 @@ export default {
               <button @click="removeDeptEntry(idx)" class="text-gray-400 hover:text-red-500"><i data-lucide="x" class="w-4 h-4"></i></button>
             </div>
           </div>
+        </section>
+
+        <section v-if="expCategories.length && (subcategories.length || newSub.category_id)" class="bg-white rounded-xl border border-gray-200 p-6">
+          <h2 class="text-lg font-semibold text-gray-900 mb-1">Expense Sub-categories</h2>
+          <p class="text-sm text-gray-500 mb-4">Group expenses inside each P&L category. Changes here are saved immediately. Click a name or a category to change it.</p>
+          <div class="space-y-5">
+            <div v-for="c in expCategories" :key="c.id">
+              <div class="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">{{ c.name }}</div>
+              <div class="divide-y divide-gray-100 border border-gray-100 rounded-lg">
+                <div v-for="sc in subsOf(c.id)" :key="sc.id" class="flex items-center gap-3 px-3 py-1.5 text-sm">
+                  <div class="flex-1 min-w-0"><inline-edit :value="sc.name" @save="v => updateSubcategory(sc, 'name', v)"/></div>
+                  <span class="text-xs text-gray-400 whitespace-nowrap">{{ subUsage[sc.id] || 0 }} expense{{ (subUsage[sc.id] || 0) !== 1 ? 's' : '' }}</span>
+                  <inline-edit :value="sc.category_id" :options="expCategoryOptions" display="Move" @save="v => updateSubcategory(sc, 'category_id', v)"/>
+                  <button @click="deleteSubcategory(sc)" class="text-gray-400 hover:text-red-500" :aria-label="'Delete ' + sc.name" title="Delete"><svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
+                </div>
+                <div v-if="!subsOf(c.id).length" class="px-3 py-1.5 text-sm text-gray-400">None yet</div>
+              </div>
+            </div>
+          </div>
+          <form @submit.prevent="addSubcategory" class="flex items-center gap-3 mt-5">
+            <input v-model="newSub.name" placeholder="New sub-category" aria-label="New sub-category name" class="flex-1 px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+            <select v-model.number="newSub.category_id" aria-label="Category" class="flex-1 px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500">
+              <option v-for="c in expCategories" :key="c.id" :value="c.id">{{ c.name }}</option>
+            </select>
+            <button type="submit" :disabled="!newSub.name.trim()" class="px-4 py-2 text-sm bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-40">Add</button>
+          </form>
         </section>
 
         <section class="bg-white rounded-xl border border-gray-200 p-6">
