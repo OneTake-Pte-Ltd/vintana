@@ -12,6 +12,7 @@ export default {
     const items = [
       { icon: 'layout-dashboard', label: 'Dashboard', path: '/' },
       { icon: 'receipt', label: 'Expenses', path: '/expenses' },
+      { icon: 'calendar-clock', label: 'Upcoming Charges', path: '/upcoming' },
       { icon: 'trending-up', label: 'Revenue', path: '/revenue' },
       { icon: 'users', label: 'Payroll', path: '/payroll' },
       { icon: 'file-spreadsheet', label: 'P&L', path: '/pnl' },

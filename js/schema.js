@@ -15,6 +15,9 @@ const DDL = [
     fiscal_year_start INTEGER NOT NULL DEFAULT 1,
     actuals_through   TEXT,
     dept_mapping      TEXT DEFAULT '{}',
+    assistant_relay_url TEXT DEFAULT 'https://assistant.vintana.onetake.ai',
+    assistant_model   TEXT DEFAULT 'claude-opus-5-5',
+    company_context   TEXT,
     created_at        TEXT DEFAULT (datetime('now')),
     updated_at        TEXT DEFAULT (datetime('now'))
   )`,
@@ -164,6 +167,21 @@ export async function runMigrations() {
   await batch(statements);
 }
 
+// Columns added after schema version 1. Databases created earlier get them here, on load.
+const SETTINGS_COLUMNS = {
+  assistant_relay_url: "TEXT DEFAULT 'https://assistant.vintana.onetake.ai'",
+  assistant_model: "TEXT DEFAULT 'claude-opus-5-5'",
+  company_context: 'TEXT',
+};
+
+export async function ensureSettingsColumns() {
+  const cols = new Set((await query('PRAGMA table_info(settings)')).map(c => c.name));
+  const missing = Object.keys(SETTINGS_COLUMNS).filter(c => !cols.has(c));
+  if (missing.length) {
+    await batch(missing.map(c => `ALTER TABLE settings ADD COLUMN ${c} ${SETTINGS_COLUMNS[c]}`));
+  }
+}
+
 export async function resetAllData() {
   const tables = [
     'funding_events', 'cash_actuals', 'scenario_employees',
@@ -184,7 +202,8 @@ export async function getSettings() {
 }
 
 export async function updateSettings(fields) {
-  const allowed = ['company_name', 'currency', 'fiscal_year_start', 'actuals_through', 'dept_mapping'];
+  const allowed = ['company_name', 'currency', 'fiscal_year_start', 'actuals_through', 'dept_mapping',
+    'assistant_relay_url', 'assistant_model', 'company_context'];
   const sets = [];
   const args = [];
   for (const key of allowed) {

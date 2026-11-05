@@ -1,0 +1,43 @@
+name: Deploy Assistant Relay Edge Script
+
+# Bunny script 101199 (https://assistant.vintana.onetake.ai).
+# Secrets live in the Bunny dashboard, not here: see the header of edge-scripts/assistant-relay.ts.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'edge-scripts/assistant-relay.ts'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  update-script:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - uses: actions/setup-node@v3
+        with:
+          node-version: '22'
+
+      - uses: denoland/setup-deno@v1
+        with:
+          deno-version: v1.x
+
+      - name: Install
+        run: ""
+
+      - name: Build
+        run: ""
+
+      - name: Publish the script to Bunny
+        uses: "BunnyWay/actions/deploy-script@main"
+        with:
+          script_id: 101199
+          file: "edge-scripts/assistant-relay.ts"

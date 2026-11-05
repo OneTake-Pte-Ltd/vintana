@@ -1,4 +1,5 @@
-import { clearCredentials } from '../db.js';
+import { clearCredentials, getCredentials } from '../db.js';
+import { ASSISTANT_MODELS, DEFAULT_MODEL, DEFAULT_RELAY_URL, sha256Hex } from '../assistant.js';
 import { getSettings, updateSettings, resetAllData } from '../schema.js';
 import { DEFAULT_DEPT_MAPPING } from '../payroll.js';
 import {
@@ -14,6 +15,7 @@ export default {
     const router = VueRouter.useRouter();
     const toast = inject('toast');
     const dateRange = inject('dateRange');
+    const reloadAppSettings = inject('loadSettings');
 
     const settings = ref(null);
     const loading = ref(true);
@@ -39,6 +41,11 @@ export default {
     onMounted(async () => {
       try {
         settings.value = await getSettings();
+        if (settings.value) {
+          settings.value.assistant_relay_url ||= DEFAULT_RELAY_URL;
+          settings.value.assistant_model ||= DEFAULT_MODEL;
+          settings.value.company_context ||= '';
+        }
         const mapping = settings.value?.dept_mapping || {};
         const entries = Object.keys(mapping).length > 0
           ? Object.entries(mapping)
@@ -62,7 +69,11 @@ export default {
           fiscal_year_start: settings.value.fiscal_year_start,
           actuals_through: settings.value.actuals_through,
           dept_mapping: mapping,
+          assistant_relay_url: (settings.value.assistant_relay_url || '').trim() || DEFAULT_RELAY_URL,
+          assistant_model: settings.value.assistant_model || DEFAULT_MODEL,
+          company_context: settings.value.company_context || null,
         });
+        await reloadAppSettings();
         toast('Settings saved', 'success');
       } catch (e) {
         toast('Failed to save: ' + e.message, 'error');
@@ -195,6 +206,17 @@ export default {
       }
     };
 
+    // Fingerprint of this browser's database token, for the relay secrets. Only computed when asked for.
+    const tokenHash = ref('');
+    const showTokenHash = async () => {
+      try { tokenHash.value = await sha256Hex(getCredentials().token); }
+      catch (e) { toast('Could not compute the fingerprint: ' + e.message, 'error'); }
+    };
+    const copyTokenHash = async () => {
+      try { await navigator.clipboard.writeText(tokenHash.value); toast('Fingerprint copied', 'success'); }
+      catch { toast('Copy failed; select the text and copy it by hand', 'error'); }
+    };
+
     const disconnect = () => {
       clearCredentials();
       router.push('/login');
@@ -206,6 +228,7 @@ export default {
       exportData, importData,
       csvKinds, csvBusy, csvErrors, exportCsv, importCsv,
       showResetConfirm, doReset, disconnect,
+      ASSISTANT_MODELS, tokenHash, showTokenHash, copyTokenHash,
     };
   },
   template: `
@@ -248,6 +271,44 @@ export default {
                 <option v-for="c in categories" :value="c">{{ c }}</option>
               </select>
               <button @click="removeDeptEntry(idx)" class="text-gray-400 hover:text-red-500"><i data-lucide="x" class="w-4 h-4"></i></button>
+            </div>
+          </div>
+        </section>
+
+        <section class="bg-white rounded-xl border border-gray-200 p-6">
+          <h2 class="text-lg font-semibold text-gray-900 mb-1">Assistant</h2>
+          <p class="text-sm text-gray-500 mb-4">The Ask button on every page sends what the page shows, the description below and this month's cash, burn and revenue to Claude through the relay.</p>
+          <div class="space-y-4">
+            <div>
+              <label for="company-context" class="block text-sm font-medium text-gray-700 mb-1">About the company</label>
+              <textarea id="company-context" v-model="settings.company_context" rows="6"
+                placeholder="What the company sells, to whom, stage and funding, team, goals for this year, anything the assistant should keep in mind..."
+                class="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"></textarea>
+            </div>
+            <div class="grid grid-cols-2 gap-4">
+              <div>
+                <label for="assistant-model" class="block text-sm font-medium text-gray-700 mb-1">Model</label>
+                <select id="assistant-model" v-model="settings.assistant_model" class="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                  <option v-for="m in ASSISTANT_MODELS" :key="m.id" :value="m.id">{{ m.label }}</option>
+                </select>
+              </div>
+              <div>
+                <label for="relay-url" class="block text-sm font-medium text-gray-700 mb-1">Relay address</label>
+                <input id="relay-url" v-model="settings.assistant_relay_url" type="url" class="w-full px-3 py-2 text-sm font-mono border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+              </div>
+            </div>
+            <div class="pt-2 border-t border-gray-100">
+              <div class="text-sm font-medium text-gray-700 mb-1">Relay access</div>
+              <p class="text-sm text-gray-500 mb-2">
+                The relay accepts this browser if the fingerprint (SHA-256) of its database token is in the relay secrets:
+                <code class="text-xs">DB_TOKEN_RW_SHA256</code> for the read-write token, <code class="text-xs">DB_TOKEN_RO_SHA256</code> for the read-only one.
+              </p>
+              <button v-if="!tokenHash" @click="showTokenHash" class="px-4 py-2 text-sm border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors">Show my token's fingerprint</button>
+              <div v-else class="flex items-center gap-2">
+                <code class="flex-1 min-w-0 break-all text-xs bg-gray-50 border border-gray-200 rounded-lg px-3 py-2 select-all">{{ tokenHash }}</code>
+                <button @click="copyTokenHash" class="px-3 py-2 text-sm border border-gray-200 rounded-lg hover:bg-gray-50">Copy</button>
+                <button @click="tokenHash = ''" class="px-3 py-2 text-sm text-gray-500 hover:text-gray-800">Hide</button>
+              </div>
             </div>
           </div>
         </section>
