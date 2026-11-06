@@ -1,4 +1,5 @@
 import { query } from './db.js';
+import { getBaseScenarioId } from './schema.js';
 import { employeeCost, isEmployedIn, payrollCategory } from './payroll.js';
 import { chargeFromMonthly, generateMonthRange, isChargeMonth } from './utils.js';
 
@@ -8,8 +9,7 @@ const daysIn = (y, m) => new Date(y, m, 0).getDate();
 
 // Expense values for the given months, a scenario value replacing the base value: { "itemId:month": cents }
 export async function loadExpenseValues(scenarioId, startMonth, endMonth) {
-  const baseRows = await query('SELECT id FROM scenarios WHERE is_base = 1 LIMIT 1');
-  const baseId = baseRows[0]?.id || 1;
+  const baseId = await getBaseScenarioId();
   const rows = await query(`
     SELECT expense_item_id, month, amount, scenario_id FROM expense_values
     WHERE scenario_id IN (?, ?) AND month >= ? AND month <= ?

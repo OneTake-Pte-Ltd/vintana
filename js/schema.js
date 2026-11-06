@@ -1,4 +1,4 @@
-import { batch, execute, query } from './db.js';
+import { batch, execute, query, getCredentials } from './db.js';
 
 const SCHEMA_VERSION = '1';
 
@@ -218,16 +218,15 @@ const SEED = [
   `INSERT OR IGNORE INTO expense_categories (name, sort_order) VALUES ('Uncategorized / Other', 5)`,
 ];
 
+// Reads the schema markers in one request. ok: the database has the schema; upgraded: the upgrades below
+// were already applied, so loading the app can skip them.
 export async function checkSchema() {
   try {
-    const result = await query(
-      "SELECT name FROM sqlite_master WHERE type='table' AND name='_meta'"
-    );
-    if (result.length === 0) return false;
-    const meta = await query("SELECT value FROM _meta WHERE key='schema_version'");
-    return meta.length > 0 && meta[0].value === SCHEMA_VERSION;
+    const rows = await query("SELECT key, value FROM _meta WHERE key IN ('schema_version', 'upgrades')");
+    const meta = Object.fromEntries(rows.map(r => [r.key, r.value]));
+    return { ok: meta.schema_version === SCHEMA_VERSION, upgraded: meta.upgrades === UPGRADES_SIGNATURE };
   } catch {
-    return false;
+    return { ok: false, upgraded: false }; // no _meta table: not set up yet
   }
 }
 
@@ -259,6 +258,9 @@ const ADDED_COLUMNS = {
 
 const ADDED_TABLES = ['expense_subcategories', 'bank_accounts', 'bank_balances', 'statement_imports', 'bank_transactions', 'fx_rates'];
 
+// Changes whenever the lists above change, so new upgrades run once on every database, then never again
+const UPGRADES_SIGNATURE = JSON.stringify([ADDED_TABLES, Object.entries(ADDED_COLUMNS).map(([t, c]) => [t, Object.keys(c)])]);
+
 // Default sub-categories: a typical Singapore SaaS chart of accounts, under the five P&L categories.
 // Payroll (salaries, employer CPF) is not here: it comes from the Payroll page.
 export const DEFAULT_SUBCATEGORIES = {
@@ -286,11 +288,15 @@ export const DEFAULT_SUBCATEGORIES = {
 
 export async function ensureSchemaUpgrades() {
   await batch(ADDED_TABLES.map(t => DDL.find(d => d.includes(`EXISTS ${t} (`))));
-  for (const [table, columns] of Object.entries(ADDED_COLUMNS)) {
-    const have = new Set((await query(`PRAGMA table_info(${table})`)).map(c => c.name));
-    const missing = Object.keys(columns).filter(c => !have.has(c));
-    if (missing.length) await batch(missing.map(c => `ALTER TABLE ${table} ADD COLUMN ${c} ${columns[c]}`));
-  }
+  const tables = Object.entries(ADDED_COLUMNS);
+  const infos = await batch(tables.map(([table]) => `PRAGMA table_info(${table})`));
+  const alters = [];
+  tables.forEach(([table, columns], i) => {
+    const nameCol = infos[i].cols.indexOf('name');
+    const have = new Set(infos[i].rows.map(r => r[nameCol]));
+    Object.keys(columns).filter(c => !have.has(c)).forEach(c => alters.push(`ALTER TABLE ${table} ADD COLUMN ${c} ${columns[c]}`));
+  });
+  if (alters.length) await batch(alters);
   // Seed the default sub-categories once; after that, deleted ones stay deleted
   const seeded = await query("SELECT value FROM _meta WHERE key = 'subcategories_seeded'");
   if (!seeded.length) {
@@ -321,6 +327,7 @@ export async function ensureSchemaUpgrades() {
       "INSERT OR REPLACE INTO _meta (key, value) VALUES ('cash_actuals_moved', '1')",
     ]);
   }
+  await execute("INSERT OR REPLACE INTO _meta (key, value) VALUES ('upgrades', ?)", [UPGRADES_SIGNATURE]);
 }
 
 export async function resetAllData() {
@@ -360,7 +367,14 @@ export async function updateSettings(fields) {
   await execute(`UPDATE settings SET ${sets.join(', ')} WHERE id = 1`, args);
 }
 
-export async function getBaseScenarioId() {
-  const rows = await query('SELECT id FROM scenarios WHERE is_base = 1 LIMIT 1');
-  return rows.length > 0 ? rows[0].id : 1;
+// The base scenario can't be deleted, so its id is looked up once per database and page load
+const baseIds = new Map();
+export function getBaseScenarioId() {
+  const db = getCredentials().url;
+  if (!baseIds.has(db)) {
+    baseIds.set(db, query('SELECT id FROM scenarios WHERE is_base = 1 LIMIT 1')
+      .then(rows => rows[0]?.id || 1)
+      .catch(e => { baseIds.delete(db); throw e; }));
+  }
+  return baseIds.get(db);
 }

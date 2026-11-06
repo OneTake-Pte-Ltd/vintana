@@ -1,4 +1,5 @@
 import { query, execute } from '../db.js';
+import { getBaseScenarioId } from '../schema.js';
 import { formatCents, monthLabel, generateMonthRange, currentMonth } from '../utils.js';
 import { getReportingCurrency } from '../utils.js';
 import { donutConfig, trendConfig } from '../miniCharts.js';
@@ -36,8 +37,7 @@ export default {
     };
 
     async function loadBaseScenarioId() {
-      const rows = await query('SELECT id FROM scenarios WHERE is_base = 1 LIMIT 1');
-      baseScenarioId.value = rows.length ? rows[0].id : 1;
+      baseScenarioId.value = await getBaseScenarioId();
     }
 
     async function loadProducts() {
@@ -82,8 +82,7 @@ export default {
     }
 
     async function reload() {
-      await loadBaseScenarioId();
-      await loadProducts();
+      await Promise.all([loadBaseScenarioId(), loadProducts()]);
       await loadValues();
     }
 

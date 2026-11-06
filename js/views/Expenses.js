@@ -1,4 +1,5 @@
 import { query, execute } from '../db.js';
+import { getBaseScenarioId } from '../schema.js';
 import { formatCents, monthLabel, generateMonthRange, currentMonth, ordinalDay } from '../utils.js';
 import {
   loadCategoryLookups, categoryOptions, subcategoryOptions, RECURRENCE_OPTIONS, recurrenceLabel, updateExpenseField,
@@ -52,8 +53,7 @@ export default {
       if (!items.value.length) loading.value = true;
       try {
         const sid = scenarioId.value;
-        const baseRows = await query('SELECT id FROM scenarios WHERE is_base = 1 LIMIT 1');
-        const baseId = baseRows[0]?.id || 1;
+        const baseId = await getBaseScenarioId();
         const rows = await query(`
           SELECT ei.*, ec.name AS category_name,
             COALESCE(sv.amount, bv.amount, 0) AS cur_amount,
@@ -82,8 +82,7 @@ export default {
     const loadMonthly = async () => {
       if (!months.value.length) return;
       const sid = scenarioId.value;
-      const baseRows = await query('SELECT id FROM scenarios WHERE is_base = 1 LIMIT 1');
-      const baseId = baseRows[0]?.id || 1;
+      const baseId = await getBaseScenarioId();
       const rows = await query(`
         SELECT ev.expense_item_id, ev.month, ev.amount, ev.scenario_id
         FROM expense_values ev
@@ -106,8 +105,7 @@ export default {
     };
 
     const load = async () => {
-      await loadCategories();
-      await Promise.all([loadItems(), loadEmployees(), loadMonthly()]);
+      await Promise.all([loadCategories(), loadItems(), loadEmployees(), loadMonthly()]);
     };
     onMounted(load);
     watch([scenarioId, dateRange], load, { deep: true });

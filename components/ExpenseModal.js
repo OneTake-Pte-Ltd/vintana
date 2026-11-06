@@ -1,4 +1,5 @@
 import { query, execute } from '../js/db.js';
+import { getBaseScenarioId } from '../js/schema.js';
 import {
   monthLabel, generateMonthRange, currentMonth, chargeFromMonthly, expenseMonthlyValues, forecastEnd,
 } from '../js/utils.js';
@@ -39,7 +40,7 @@ export default {
     const subOptions = computed(() => subcategoryOptions(props.subcategories, form.value.category_id));
     const hasSubcategories = computed(() => props.subcategories.length > 0);
 
-    const baseScenarioId = async () => (await query('SELECT id FROM scenarios WHERE is_base = 1 LIMIT 1'))[0]?.id || 1;
+    const baseScenarioId = getBaseScenarioId;
 
     onMounted(async () => {
       try {

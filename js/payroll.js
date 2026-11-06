@@ -15,12 +15,16 @@ export const DEFAULT_DEPT_MAPPING = {
 
 // Base employees with the scenario's overrides applied, plus employees added only in that scenario
 export async function loadScenarioEmployees(scenarioId) {
-  const scRows = await query('SELECT is_base FROM scenarios WHERE id = ?', [scenarioId]);
+  // One round of requests: for the base scenario the overrides and extras simply come back empty
+  const [scRows, base, overrides, extras] = await Promise.all([
+    query('SELECT is_base FROM scenarios WHERE id = ?', [scenarioId]),
+    query('SELECT * FROM employees ORDER BY name'),
+    query('SELECT * FROM employee_overrides WHERE scenario_id = ?', [scenarioId]),
+    query('SELECT * FROM scenario_employees WHERE scenario_id = ? ORDER BY name', [scenarioId]),
+  ]);
   const isBase = scRows.length > 0 ? !!scRows[0].is_base : true;
-  const base = await query('SELECT * FROM employees ORDER BY name');
   if (isBase) return { isBase, employees: base.map(e => ({ ...e, _source: 'base' })) };
 
-  const overrides = await query('SELECT * FROM employee_overrides WHERE scenario_id = ?', [scenarioId]);
   const overMap = {};
   overrides.forEach(o => { overMap[o.employee_id] = o; });
   const merged = base.map(e => {
@@ -28,7 +32,6 @@ export async function loadScenarioEmployees(scenarioId) {
     return { ...e, salary_monthly: o?.salary_monthly ?? e.salary_monthly, tax_pct: o?.tax_pct ?? e.tax_pct,
       start_date: o?.start_date ?? e.start_date, end_date: o?.end_date ?? e.end_date, _source: o ? 'override' : 'base' };
   });
-  const extras = await query('SELECT * FROM scenario_employees WHERE scenario_id = ? ORDER BY name', [scenarioId]);
   extras.forEach(e => merged.push({ ...e, _source: 'scenario', _scenarioEmployeeId: e.id }));
   return { isBase, employees: merged };
 }

@@ -1,7 +1,7 @@
 // Bank accounts, month-end balances and exchange rates.
 // Total cash is always the sum of the accounts' balances, converted into the reporting currency at the
 // month-end rate.
-import { query, execute } from './db.js';
+import { query, batch } from './db.js';
 import { getReportingCurrency } from './utils.js';
 
 const FX_URL = 'https://api.frankfurter.dev/v1/';
@@ -29,15 +29,34 @@ export class FxError extends Error {}
 // is fetched once; the current month uses the latest published rate and is fetched again next time.
 // The European Central Bank publishes on working days; for a weekend or holiday, Frankfurter returns the last
 // rate before it.
+// Each rate is looked up once per page load. The first lookup into a currency reads every saved rate into it in
+// a single request; only rates missing from the database go to Frankfurter, and those requests run in parallel.
 const memo = new Map();
-export async function getRate(month, base, quote = getReportingCurrency()) {
-  if (!base || !quote || base === quote) return 1;
+const saved = new Map(); // quote currency -> Promise of { "month:base": rate }
+
+function savedRates(quote) {
+  if (!saved.has(quote)) {
+    saved.set(quote, query('SELECT month, base, rate FROM fx_rates WHERE quote = ?', [quote])
+      .then(rows => Object.fromEntries(rows.map(r => [`${r.month}:${r.base}`, r.rate])))
+      .catch(() => ({}))); // table missing: fetch without caching
+  }
+  return saved.get(quote);
+}
+
+export function getRate(month, base, quote = getReportingCurrency()) {
+  if (!base || !quote || base === quote) return Promise.resolve(1);
   const key = `${month}:${base}:${quote}`;
-  if (memo.has(key)) return memo.get(key);
-  try {
-    const rows = await query('SELECT rate FROM fx_rates WHERE month = ? AND base = ? AND quote = ?', [month, base, quote]);
-    if (rows.length) { memo.set(key, rows[0].rate); return rows[0].rate; }
-  } catch { /* table missing: fetch without caching */ }
+  if (!memo.has(key)) {
+    const p = lookupRate(month, base, quote);
+    memo.set(key, p);
+    p.catch(() => memo.delete(key)); // a failed lookup is tried again next time
+  }
+  return memo.get(key);
+}
+
+async function lookupRate(month, base, quote) {
+  const known = (await savedRates(quote))[`${month}:${base}`];
+  if (typeof known === 'number') return known;
 
   const end = monthEnd(month);
   const finished = end < todayIso();
@@ -53,14 +72,22 @@ export async function getRate(month, base, quote = getReportingCurrency()) {
   if (typeof rate !== 'number') {
     throw new FxError(`No ${base} to ${quote} exchange rate is published for ${month}. The European Central Bank does not cover every currency.`);
   }
-  memo.set(key, rate);
-  if (finished) {
-    try {
-      await execute('INSERT OR REPLACE INTO fx_rates (month, base, quote, rate, rate_date) VALUES (?, ?, ?, ?, ?)',
-        [month, base, quote, rate, data.date || end]);
-    } catch { /* read-only token: keep it for this session only */ }
-  }
+  if (finished) saveRate([month, base, quote, rate, data.date || end]);
   return rate;
+}
+
+// New rates are saved together in one request, in the background
+const unsaved = [];
+let saveTimer = null;
+function saveRate(args) {
+  unsaved.push(args);
+  saveTimer ||= setTimeout(async () => {
+    saveTimer = null;
+    const rows = unsaved.splice(0);
+    try {
+      await batch(rows.map(r => ({ sql: 'INSERT OR REPLACE INTO fx_rates (month, base, quote, rate, rate_date) VALUES (?, ?, ?, ?, ?)', args: r })));
+    } catch { /* read-only token: keep them for this session only */ }
+  }, 50);
 }
 
 export const convert = (cents, rate) => Math.round(cents * rate);
@@ -80,37 +107,37 @@ export async function loadBalances() {
 // Total cash for each month that has at least one balance, in the reporting currency.
 // complete: every account has a balance for that month. Unconvertible balances are skipped and reported.
 export async function cashTotals(accounts, balances) {
+  const entries = Object.entries(balances);
+  const results = await Promise.all(entries.map(([month, byAccount]) => Promise.all(accounts.map(a =>
+    a.id in byAccount
+      ? getRate(month, a.currency).then(rate => ({ cents: convert(byAccount[a.id], rate) }), e => ({ error: e.message }))
+      : { missing: true }))));
   const totals = {};
-  for (const [month, byAccount] of Object.entries(balances)) {
-    let total = 0, missing = 0;
-    const errors = [];
-    for (const a of accounts) {
-      if (!(a.id in byAccount)) { missing++; continue; }
-      try { total += convert(byAccount[a.id], await getRate(month, a.currency)); }
-      catch (e) { errors.push(e.message); missing++; }
-    }
-    totals[month] = { total, complete: missing === 0, errors };
-  }
+  entries.forEach(([month], i) => {
+    const list = results[i];
+    totals[month] = {
+      total: list.reduce((s, r) => s + (r.cents || 0), 0),
+      complete: list.every(r => 'cents' in r),
+      errors: list.filter(r => r.error).map(r => r.error),
+    };
+  });
   return totals;
 }
 
 // Current cash position: each account's latest balance, converted at that balance's month-end rate.
 export async function cashPosition() {
-  const accounts = await loadAccounts();
-  const balances = await loadBalances();
-  const months = Object.keys(balances).sort();
+  const [accounts, balances] = await Promise.all([loadAccounts(), loadBalances()]);
+  const months = Object.keys(balances).sort().reverse();
   if (!accounts.length || !months.length) return null;
-  let total = 0, latestMonth = null;
-  const perAccount = [];
-  for (const a of accounts) {
-    const month = [...months].reverse().find(m => a.id in balances[m]);
-    if (!month) { perAccount.push({ account: a, month: null, balance: null }); continue; }
+  const perAccount = await Promise.all(accounts.map(async a => {
+    const month = months.find(m => a.id in balances[m]);
+    if (!month) return { account: a, month: null, balance: null };
     const rate = await getRate(month, a.currency).catch(() => null);
     const converted = rate === null ? null : convert(balances[month][a.id], rate);
-    if (converted !== null) total += converted;
-    if (!latestMonth || month > latestMonth) latestMonth = month;
-    perAccount.push({ account: a, month, balance: balances[month][a.id], converted });
-  }
+    return { account: a, month, balance: balances[month][a.id], converted };
+  }));
+  const total = perAccount.reduce((s, p) => s + (p.converted || 0), 0);
+  const latestMonth = perAccount.reduce((m, p) => (p.month && (!m || p.month > m) ? p.month : m), null);
   return {
     total, month: latestMonth, perAccount,
     complete: perAccount.every(p => p.month === latestMonth && p.converted !== null),

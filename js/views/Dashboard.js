@@ -44,7 +44,12 @@ export default {
       return Object.entries(m).sort((a, b) => b[1] - a[1]);
     });
 
+    // Only the latest load may show its results: an earlier one can finish after it
+    let loadSeq = 0;
     async function loadData() {
+      const run = ++loadSeq;
+      // On a fresh page load the scenario arrives a moment later, and loads the page then
+      if (!scenarioId.value) return;
       loading.value = true;
       const sid = scenarioId.value, month = currentMonth(), prev = prevMonth(month);
       const range = dateRange.value;
@@ -61,6 +66,7 @@ export default {
             query(`SELECT name, department FROM employees WHERE start_date <= ? AND (end_date IS NULL OR end_date >= ?)`, [month + '-31', month + '-01']),
             query(`SELECT ei.name, ei.company, ev.amount, ei.renewal_day, ei.recurrence, ei.start_month FROM expense_items ei JOIN expense_values ev ON ev.expense_item_id = ei.id WHERE ev.scenario_id = ? AND ev.month = ? AND ei.renewal_day IS NOT NULL ORDER BY ei.renewal_day ASC`, [sid, month]),
           ]);
+        if (run !== loadSeq) return;
 
         revenueNow.value = revNow[0]?.v || 0;
         revenuePrev.value = revPrev[0]?.v || 0;
@@ -83,7 +89,7 @@ export default {
           return (d - now) / 864e5 <= 30 && isChargeMonth(r.recurrence, r.start_month, renewalMonth);
         }).map(r => ({ ...r, amount: chargeFromMonthly(r.amount, r.recurrence) }));
       } catch (e) { console.error('Dashboard load error:', e); }
-      finally { loading.value = false; await nextTick(); renderCharts(); }
+      finally { if (run === loadSeq) { loading.value = false; await nextTick(); renderCharts(); } }
     }
 
     function destroyCharts() { charts.forEach(c => c.destroy()); charts = []; }

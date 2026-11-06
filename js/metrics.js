@@ -1,4 +1,5 @@
 import { query } from './db.js';
+import { getBaseScenarioId } from './schema.js';
 import { currentMonth } from './utils.js';
 import { loadScenarioEmployees, employeeCost, isEmployedIn } from './payroll.js';
 import { cashPosition } from './bank.js';
@@ -6,8 +7,7 @@ import { cashPosition } from './bank.js';
 // Headline numbers for the current month in a scenario (scenario values replace base values). Amounts in cents.
 export async function loadHeadlineMetrics(scenarioId) {
   const month = currentMonth();
-  const baseRows = await query('SELECT id FROM scenarios WHERE is_base = 1 LIMIT 1');
-  const baseId = baseRows[0]?.id || 1;
+  const baseId = await getBaseScenarioId();
 
   const [revRows, expRows, cash, { employees }] = await Promise.all([
     query(`SELECT product_id, scenario_id, customers * arpu AS v FROM revenue_values

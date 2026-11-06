@@ -46,7 +46,12 @@ export default {
       return currentCash.value / burnRate.value;
     });
 
+    // Only the latest load may show its results: an earlier one can finish after it
+    let loadSeq = 0;
     async function loadData() {
+      const run = ++loadSeq;
+      // On a fresh page load the scenario arrives a moment later, and loads the page then
+      if (!scenarioId.value) return;
       loading.value = true;
       try {
         const range = dateRange.value;
@@ -73,9 +78,11 @@ export default {
           loadBalances(),
           query('SELECT account_id, period_start, period_end FROM statement_imports').catch(() => []),
         ]);
+        if (run !== loadSeq) return;
         accounts.value = acc;
         balances.value = bal;
         const totals = await cashTotals(acc, bal);
+        if (run !== loadSeq) return;
         totalsByMonth.value = totals;
         fxErrors.value = [...new Set(Object.values(totals).flatMap(t => t.errors))];
 
@@ -89,6 +96,7 @@ export default {
             LEFT JOIN expense_categories ec ON ec.id = ei.category_id
             LEFT JOIN employees e ON e.id = bt.employee_id
             WHERE bt.month IN (${[...bankSet].map(() => '?').join(',')}) AND bt.kind NOT IN ('transfer', 'ignore')`, [...bankSet]) : [];
+        if (run !== loadSeq) return;
 
         const revMap = {};
         revRows.forEach(r => { revMap[r.month] = r.total; });
@@ -165,11 +173,13 @@ export default {
           burnRate.value = totalExp - latest.revenue;
         }
       } catch (e) {
-        toast('Failed to load cash flow: ' + e.message, 'error');
+        if (run === loadSeq) toast('Failed to load cash flow: ' + e.message, 'error');
       } finally {
-        loading.value = false;
-        await nextTick();
-        renderChart();
+        if (run === loadSeq) {
+          loading.value = false;
+          await nextTick();
+          renderChart();
+        }
       }
     }
 
