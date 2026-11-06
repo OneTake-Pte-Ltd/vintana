@@ -90,7 +90,7 @@ const RELAY_ERRORS = {
   NOT_CONFIGURED: 'The relay is missing its secrets (Anthropic API key or token fingerprints).',
   MODEL_NOT_ALLOWED: 'The relay does not allow this model. Pick another one in Settings > Assistant.',
   BAD_REQUEST: 'The relay refused the request.',
-  TOO_LARGE: 'This page has too much data to send. Narrow the date range and try again.',
+  TOO_LARGE: 'Too much data to send in one request. For a page, narrow the date range; for a statement, the PDF is too large.',
   ORIGIN_NOT_ALLOWED: 'The relay does not accept requests from this address.',
 };
 
@@ -100,13 +100,14 @@ export class AssistantError extends Error {
 
 // Sends the conversation and streams the answer. Returns the complete assistant content blocks (thinking blocks
 // included, unchanged, so they can be sent back on the next turn) plus the stop reason.
-export async function streamChat({ relayUrl, token, model, system, messages, onText, signal }) {
+// `path` and `body` let other relay routes (bank statements) reuse the same streaming.
+export async function streamChat({ relayUrl, token, model, system, messages, onText, signal, path = '/v1/chat', body = null }) {
   let resp;
   try {
-    resp = await fetch(relayUrl.replace(/\/+$/, '') + '/v1/chat', {
+    resp = await fetch(relayUrl.replace(/\/+$/, '') + path, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ model, system, messages }),
+      body: JSON.stringify(body || { model, system, messages }),
       signal,
     });
   } catch (e) {

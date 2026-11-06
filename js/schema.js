@@ -141,7 +141,70 @@ const DDL = [
     month       TEXT NOT NULL,
     amount      INTEGER NOT NULL,
     scenario_id INTEGER NOT NULL REFERENCES scenarios(id) ON DELETE CASCADE,
-    notes       TEXT
+    notes       TEXT,
+    is_actual   INTEGER NOT NULL DEFAULT 0
+  )`,
+
+  // One account per bank. Balances are month-end, in the account's own currency.
+  `CREATE TABLE IF NOT EXISTS bank_accounts (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    bank_name  TEXT NOT NULL,
+    label      TEXT,
+    currency   TEXT NOT NULL DEFAULT 'EUR',
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT DEFAULT (datetime('now'))
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS bank_balances (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER NOT NULL REFERENCES bank_accounts(id),
+    month      TEXT NOT NULL,
+    balance    INTEGER NOT NULL,
+    source     TEXT NOT NULL DEFAULT 'manual',
+    import_id  INTEGER,
+    UNIQUE(account_id, month)
+  )`,
+
+  // One row per statement read. The PDF itself is never stored.
+  `CREATE TABLE IF NOT EXISTS statement_imports (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id        INTEGER NOT NULL REFERENCES bank_accounts(id),
+    file_name         TEXT,
+    period_start      TEXT NOT NULL,
+    period_end        TEXT NOT NULL,
+    currency          TEXT,
+    opening_balance   INTEGER,
+    closing_balance   INTEGER,
+    transaction_count INTEGER NOT NULL DEFAULT 0,
+    discrepancies     TEXT DEFAULT '[]',
+    created_at        TEXT DEFAULT (datetime('now'))
+  )`,
+
+  // Statement lines. amount: account currency, signed (money in > 0); amount_reporting: converted at the month-end rate.
+  `CREATE TABLE IF NOT EXISTS bank_transactions (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    import_id        INTEGER NOT NULL REFERENCES statement_imports(id),
+    account_id       INTEGER NOT NULL REFERENCES bank_accounts(id),
+    date             TEXT NOT NULL,
+    month            TEXT NOT NULL,
+    description      TEXT,
+    counterparty     TEXT,
+    amount           INTEGER NOT NULL,
+    amount_reporting INTEGER NOT NULL,
+    kind             TEXT NOT NULL,
+    expense_item_id  INTEGER,
+    employee_id      INTEGER,
+    funding_event_id INTEGER
+  )`,
+
+  // Month-end exchange rates (European Central Bank, via Frankfurter): 1 base = rate quote
+  `CREATE TABLE IF NOT EXISTS fx_rates (
+    month     TEXT NOT NULL,
+    base      TEXT NOT NULL,
+    quote     TEXT NOT NULL,
+    rate      REAL NOT NULL,
+    rate_date TEXT,
+    PRIMARY KEY (month, base, quote)
   )`,
 ];
 
@@ -189,7 +252,12 @@ const ADDED_COLUMNS = {
   expense_items: {
     subcategory_id: 'INTEGER REFERENCES expense_subcategories(id)',
   },
+  funding_events: {
+    is_actual: 'INTEGER NOT NULL DEFAULT 0',
+  },
 };
+
+const ADDED_TABLES = ['expense_subcategories', 'bank_accounts', 'bank_balances', 'statement_imports', 'bank_transactions', 'fx_rates'];
 
 // Default sub-categories: a typical Singapore SaaS chart of accounts, under the five P&L categories.
 // Payroll (salaries, employer CPF) is not here: it comes from the Payroll page.
@@ -217,7 +285,7 @@ export const DEFAULT_SUBCATEGORIES = {
 };
 
 export async function ensureSchemaUpgrades() {
-  await execute(DDL.find(d => d.includes('expense_subcategories (')));
+  await batch(ADDED_TABLES.map(t => DDL.find(d => d.includes(`EXISTS ${t} (`))));
   for (const [table, columns] of Object.entries(ADDED_COLUMNS)) {
     const have = new Set((await query(`PRAGMA table_info(${table})`)).map(c => c.name));
     const missing = Object.keys(columns).filter(c => !have.has(c));
@@ -237,10 +305,27 @@ export async function ensureSchemaUpgrades() {
     stmts.push("INSERT OR REPLACE INTO _meta (key, value) VALUES ('subcategories_seeded', '1')");
     await batch(stmts);
   }
+  // There is always at least one bank account. The first one takes over the balances recorded before
+  // accounts existed (they were in the reporting currency, so it starts in that currency).
+  const accounts = await query('SELECT id FROM bank_accounts ORDER BY sort_order, id LIMIT 1');
+  let firstId = accounts[0]?.id;
+  if (!firstId) {
+    const cur = (await query('SELECT currency FROM settings WHERE id = 1'))[0]?.currency || 'EUR';
+    firstId = (await execute("INSERT INTO bank_accounts (bank_name, label, currency, sort_order) VALUES ('Main bank', 'Main account', ?, 1)", [cur])).lastInsertRowid;
+  }
+  const moved = await query("SELECT value FROM _meta WHERE key = 'cash_actuals_moved'");
+  if (!moved.length && firstId) {
+    await batch([
+      { sql: `INSERT OR IGNORE INTO bank_balances (account_id, month, balance, source)
+              SELECT ?, month, balance, 'manual' FROM cash_actuals`, args: [firstId] },
+      "INSERT OR REPLACE INTO _meta (key, value) VALUES ('cash_actuals_moved', '1')",
+    ]);
+  }
 }
 
 export async function resetAllData() {
   const tables = [
+    'bank_transactions', 'statement_imports', 'bank_balances', 'bank_accounts', 'fx_rates',
     'funding_events', 'cash_actuals', 'scenario_employees',
     'employee_overrides', 'employees', 'revenue_values',
     'revenue_products', 'expense_values', 'expense_items',

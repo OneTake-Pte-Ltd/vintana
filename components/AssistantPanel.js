@@ -67,7 +67,7 @@ export default {
         const m = await loadHeadlineMetrics(scenarioId.value);
         numbers = [
           `Headline numbers for ${monthLabelFull(m.month)}, scenario "${scenarioName.value}":`,
-          `- Cash position: ${m.cash === null ? 'no bank balance recorded yet' : `${money(m.cash)} (latest recorded balance, end of ${monthLabelFull(m.cashMonth)})`}`,
+          `- Cash position: ${m.cash === null ? 'no bank balance recorded yet' : `${money(m.cash)} (sum of the bank accounts' latest balances, end of ${monthLabelFull(m.cashMonth)}${m.cashComplete ? '' : '; some accounts have older or missing balances'})`}`,
           `- Revenue this month: ${money(m.revenue)}`,
           `- Burn this month: ${money(m.burn)} (expenses ${money(m.expenses)} + payroll ${money(m.payroll)} - revenue; a negative burn means the company is cash positive)`,
         ].join('\n');
@@ -87,7 +87,7 @@ export default {
         '',
         numbers,
         '',
-        'Each question may come with the page data inside <page> tags: a text copy of what the screen shows, with tables as one row per line and cells separated by "|". Amounts in brackets, like (€ 1,200.00), are negative.',
+        'Each question may come with the page data inside <page> tags: a text copy of what the screen shows, with tables as one row per line and cells separated by "|". Amounts in brackets, like (1,200.00), are negative.',
         '',
         'How to answer:',
         '- Base your answer on the page data and the numbers above. When something you need is not there, say what is missing rather than guessing.',

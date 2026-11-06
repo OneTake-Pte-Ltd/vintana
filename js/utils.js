@@ -1,11 +1,23 @@
-export function formatCents(cents, currency = 'EUR') {
+// Currencies the exchange-rate source (European Central Bank, via Frankfurter) publishes
+export const CURRENCIES = ['AUD', 'BGN', 'BRL', 'CAD', 'CHF', 'CNY', 'CZK', 'DKK', 'EUR', 'GBP', 'HKD', 'HUF', 'IDR',
+  'ILS', 'INR', 'ISK', 'JPY', 'KRW', 'MXN', 'MYR', 'NOK', 'NZD', 'PHP', 'PLN', 'RON', 'SEK', 'SGD', 'THB', 'TRY',
+  'USD', 'ZAR'];
+const SYMBOLS = { EUR: '€', USD: '$', GBP: '£', SGD: 'S$', AUD: 'A$', CAD: 'C$', HKD: 'HK$', NZD: 'NZ$', JPY: '¥', CNY: 'CN¥', INR: '₹' };
+export const currencySymbol = code => SYMBOLS[code] || code;
+
+// The reporting currency (Settings). Reactive, so amounts re-render when it changes.
+const reportingCurrency = Vue.ref('EUR');
+export const setReportingCurrency = code => { reportingCurrency.value = code || 'EUR'; };
+export const getReportingCurrency = () => reportingCurrency.value;
+
+export function formatCents(cents, currency = reportingCurrency.value) {
   if (cents === null || cents === undefined) cents = 0;
   const sign = cents < 0 ? -1 : 1;
   const abs = Math.abs(cents);
   const euros = (abs / 100).toFixed(2);
   const parts = euros.split('.');
   parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-  const symbol = currency === 'EUR' ? '€' : currency;
+  const symbol = currencySymbol(currency);
   const formatted = `${symbol} ${parts.join('.')}`;
   if (sign < 0) return `(${formatted})`;
   return formatted;

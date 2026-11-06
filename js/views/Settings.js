@@ -1,4 +1,5 @@
 import { clearCredentials, getCredentials, query, execute } from '../db.js';
+import { CURRENCIES } from '../utils.js';
 import { loadCategoryLookups, categoryOptions } from '../expenses.js';
 import { ASSISTANT_MODELS, DEFAULT_MODEL, DEFAULT_RELAY_URL, sha256Hex } from '../assistant.js';
 import { getSettings, updateSettings, resetAllData } from '../schema.js';
@@ -48,7 +49,7 @@ export default {
           settings.value.company_context ||= '';
           settings.value.payroll_pay_day ??= null;
         }
-        await loadSubcategories();
+        await Promise.all([loadSubcategories(), loadBankAccounts()]);
         const mapping = settings.value?.dept_mapping || {};
         const entries = Object.keys(mapping).length > 0
           ? Object.entries(mapping)
@@ -99,7 +100,8 @@ export default {
         const { query } = await import('../db.js');
         const tables = ['settings', 'scenarios', 'expense_categories', 'expense_subcategories', 'expense_items',
           'expense_values', 'revenue_products', 'revenue_values', 'employees',
-          'employee_overrides', 'scenario_employees', 'cash_actuals', 'funding_events'];
+          'employee_overrides', 'scenario_employees', 'cash_actuals', 'funding_events',
+          'bank_accounts', 'bank_balances', 'statement_imports', 'bank_transactions', 'fx_rates'];
         const dump = {};
         for (const t of tables) {
           try { dump[t] = await query(`SELECT * FROM ${t}`); } catch { dump[t] = []; }
@@ -129,7 +131,8 @@ export default {
           const dump = JSON.parse(text);
           const { batch, execute } = await import('../db.js');
           const { runMigrations } = await import('../schema.js');
-          const tables = ['funding_events', 'cash_actuals', 'scenario_employees',
+          const tables = ['bank_transactions', 'statement_imports', 'bank_balances', 'bank_accounts', 'fx_rates',
+            'funding_events', 'cash_actuals', 'scenario_employees',
             'employee_overrides', 'employees', 'revenue_values', 'revenue_products',
             'expense_values', 'expense_items', 'expense_subcategories', 'expense_categories', 'scenarios', 'settings'];
           await batch(tables.map(t => `DELETE FROM ${t}`));
@@ -210,6 +213,47 @@ export default {
       }
     };
 
+    // --- Bank accounts: one per bank, at least one. Saved as soon as they change ---
+    const bankAccounts = ref([]);
+    const accountUsage = ref({});
+    const newAccount = ref({ bank_name: '', label: '', currency: 'EUR' });
+    const loadBankAccounts = async () => {
+      try {
+        bankAccounts.value = await query('SELECT * FROM bank_accounts ORDER BY sort_order, id');
+        const used = await query(`SELECT account_id AS id, COUNT(*) AS n FROM (
+          SELECT account_id FROM bank_balances UNION ALL SELECT account_id FROM statement_imports) GROUP BY account_id`);
+        accountUsage.value = Object.fromEntries(used.map(u => [u.id, u.n]));
+        newAccount.value.currency = settings.value?.currency || 'EUR';
+      } catch { bankAccounts.value = []; }
+    };
+    const currencyOptions = CURRENCIES.map(c => ({ value: c, label: c }));
+    const addAccount = async () => {
+      const a = newAccount.value;
+      if (!a.bank_name.trim()) return;
+      try {
+        const order = Math.max(0, ...bankAccounts.value.map(x => x.sort_order || 0)) + 1;
+        await execute('INSERT INTO bank_accounts (bank_name, label, currency, sort_order) VALUES (?,?,?,?)', [a.bank_name.trim(), a.label.trim() || null, a.currency, order]);
+        newAccount.value = { bank_name: '', label: '', currency: settings.value?.currency || 'EUR' };
+        await loadBankAccounts();
+        toast('Account added', 'success');
+      } catch (e) { toast('Add failed: ' + e.message, 'error'); }
+    };
+    const updateAccount = async (acc, field, value) => {
+      try {
+        await execute(`UPDATE bank_accounts SET ${field} = ? WHERE id = ?`, [value || null, acc.id]);
+        await loadBankAccounts();
+        toast('Saved', 'success');
+      } catch (e) { toast('Save failed: ' + e.message, 'error'); }
+    };
+    const deleteAccount = async (acc) => {
+      if (bankAccounts.value.length <= 1) return;
+      try {
+        await execute('DELETE FROM bank_accounts WHERE id = ?', [acc.id]);
+        await loadBankAccounts();
+        toast('Account removed', 'success');
+      } catch (e) { toast('Delete failed: ' + e.message, 'error'); }
+    };
+
     // --- Expense sub-categories: saved as soon as they change ---
     const expCategories = ref([]);
     const subcategories = ref([]);
@@ -288,7 +332,8 @@ export default {
       exportData, importData,
       csvKinds, csvBusy, csvErrors, exportCsv, importCsv,
       showResetConfirm, doReset, disconnect,
-      ASSISTANT_MODELS, tokenHash, showTokenHash, copyTokenHash,
+      CURRENCIES, ASSISTANT_MODELS, tokenHash,
+      bankAccounts, accountUsage, newAccount, currencyOptions, addAccount, updateAccount, deleteAccount, showTokenHash, copyTokenHash,
       expCategories, subcategories, subUsage, newSub, expCategoryOptions, subsOf,
       addSubcategory, updateSubcategory, deleteSubcategory,
     };
@@ -312,6 +357,13 @@ export default {
               <select v-model.number="settings.fiscal_year_start" class="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500">
                 <option v-for="(m, i) in months" :value="i + 1">{{ m }}</option>
               </select>
+            </div>
+            <div>
+              <label for="reporting-currency" class="block text-sm font-medium text-gray-700 mb-1">Reporting Currency</label>
+              <select id="reporting-currency" v-model="settings.currency" class="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                <option v-for="c in CURRENCIES" :key="c" :value="c">{{ c }}</option>
+              </select>
+              <p class="text-xs text-gray-400 mt-1">Bank accounts in other currencies are converted into it. Changing it relabels existing amounts; it does not convert them.</p>
             </div>
             <div>
               <label class="block text-sm font-medium text-gray-700 mb-1">Actuals Through</label>
@@ -343,6 +395,33 @@ export default {
               <button @click="removeDeptEntry(idx)" class="text-gray-400 hover:text-red-500"><i data-lucide="x" class="w-4 h-4"></i></button>
             </div>
           </div>
+        </section>
+
+        <section v-if="bankAccounts.length" class="bg-white rounded-xl border border-gray-200 p-6">
+          <h2 class="text-lg font-semibold text-gray-900 mb-1">Bank Accounts</h2>
+          <p class="text-sm text-gray-500 mb-4">One account per bank. Total cash is the sum of their month-end balances, converted into the reporting currency. Changes here are saved immediately.</p>
+          <div class="divide-y divide-gray-100 border border-gray-100 rounded-lg">
+            <div v-for="a in bankAccounts" :key="a.id" class="flex items-center gap-3 px-3 py-2 text-sm flex-wrap">
+              <div class="flex-1 min-w-[10rem]">
+                <inline-edit :value="a.bank_name" @save="v => updateAccount(a, 'bank_name', v)"><span class="font-medium text-gray-900">{{ a.bank_name }}</span></inline-edit>
+                <div class="text-xs text-gray-500"><inline-edit :value="a.label" placeholder="Add a label" @save="v => updateAccount(a, 'label', v)"/></div>
+              </div>
+              <inline-edit :value="a.currency" :options="currencyOptions" @save="v => updateAccount(a, 'currency', v)"
+                :disabled="!!accountUsage[a.id]" disabled-title="This account already has balances or statements in this currency"/>
+              <span class="text-xs text-gray-400 whitespace-nowrap">{{ accountUsage[a.id] ? accountUsage[a.id] + ' balance' + (accountUsage[a.id] > 1 ? 's' : '') + ' or statements' : 'No data yet' }}</span>
+              <button v-if="bankAccounts.length > 1 && !accountUsage[a.id]" @click="deleteAccount(a)" class="text-gray-400 hover:text-red-500" :aria-label="'Remove ' + a.bank_name" title="Remove">
+                <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6L6 18M6 6l12 12"/></svg>
+              </button>
+            </div>
+          </div>
+          <form @submit.prevent="addAccount" class="flex items-center gap-3 mt-4 flex-wrap">
+            <input v-model="newAccount.bank_name" placeholder="Bank (e.g. DBS)" aria-label="Bank name" class="flex-1 min-w-[8rem] px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+            <input v-model="newAccount.label" placeholder="Label (optional)" aria-label="Account label" class="flex-1 min-w-[8rem] px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+            <select v-model="newAccount.currency" aria-label="Account currency" class="px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500">
+              <option v-for="c in CURRENCIES" :key="c" :value="c">{{ c }}</option>
+            </select>
+            <button type="submit" :disabled="!newAccount.bank_name.trim()" class="px-4 py-2 text-sm bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-40">Add account</button>
+          </form>
         </section>
 
         <section v-if="expCategories.length && (subcategories.length || newSub.category_id)" class="bg-white rounded-xl border border-gray-200 p-6">

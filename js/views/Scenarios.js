@@ -88,7 +88,7 @@ export default {
              SELECT ?, name, role, department, salary_monthly, tax_pct, start_date, end_date, notes FROM scenario_employees WHERE scenario_id = ?`, [newId, src]);
           await execute(
             `INSERT INTO funding_events (name, month, amount, scenario_id, notes)
-             SELECT name, month, amount, ?, notes FROM funding_events WHERE scenario_id = ?`, [newId, src]);
+             SELECT name, month, amount, ?, notes FROM funding_events WHERE scenario_id = ? AND is_actual = 0`, [newId, src]);
         }
         showCreate.value = false;
         await loadScenarios();

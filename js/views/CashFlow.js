@@ -1,5 +1,7 @@
 import { query, execute } from '../db.js';
-import { formatCents, monthLabel, generateMonthRange, currentMonth, prevMonth } from '../utils.js';
+import { formatCents, monthLabel, generateMonthRange, currentMonth, prevMonth, getReportingCurrency } from '../utils.js';
+import { payrollCategory } from '../payroll.js';
+import { loadAccounts, loadBalances, cashTotals, accountLabel, monthEnd } from '../bank.js';
 
 const CAT_ROWS = [
   { db: 'Cost of Goods Sold (COGS)', key: 'cogs', label: 'Total COGS' },
@@ -22,7 +24,11 @@ export default {
     const loading = ref(true);
     const waterfall = ref([]);
     const fundingEvents = ref([]);
-    const cashActualsMap = ref({});
+    const accounts = ref([]);
+    const balances = ref({});
+    const totalsByMonth = ref({});
+    const bankMonths = ref(new Set());
+    const fxErrors = ref([]);
     const months = ref([]);
 
     const currentCash = ref(0);
@@ -49,7 +55,7 @@ export default {
         const ms = generateMonthRange(range.start, range.end);
         months.value = ms;
 
-        const [revRows, expRows, empRows, fundRows, cashRows] = await Promise.all([
+        const [revRows, expRows, empRows, fundRows, acc, bal, imports] = await Promise.all([
           query(`SELECT month, COALESCE(SUM(customers * arpu), 0) AS total
                  FROM revenue_values WHERE scenario_id = ? AND month >= ? AND month <= ?
                  GROUP BY month`, [sid, ms[0], ms[ms.length - 1]]),
@@ -59,10 +65,30 @@ export default {
                  JOIN expense_categories ec ON ei.category_id = ec.id
                  WHERE ev.scenario_id = ? AND ev.month >= ? AND ev.month <= ?
                  GROUP BY ev.month, ec.name`, [sid, ms[0], ms[ms.length - 1]]),
-          query(`SELECT department, salary_monthly, tax_pct, start_date, end_date FROM employees`),
-          query(`SELECT * FROM funding_events WHERE scenario_id = ? ORDER BY month`, [sid]),
-          query(`SELECT month, balance FROM cash_actuals`),
+          query(`SELECT id, department, salary_monthly, tax_pct, start_date, end_date FROM employees`),
+          // A scenario's own events, plus received funding (recorded once, in the base scenario, for every scenario)
+          query(`SELECT * FROM funding_events WHERE scenario_id = ? OR is_actual = 1 ORDER BY month`, [sid]).catch(() =>
+            query(`SELECT * FROM funding_events WHERE scenario_id = ? ORDER BY month`, [sid])),
+          loadAccounts(),
+          loadBalances(),
+          query('SELECT account_id, period_start, period_end FROM statement_imports').catch(() => []),
         ]);
+        accounts.value = acc;
+        balances.value = bal;
+        const totals = await cashTotals(acc, bal);
+        totalsByMonth.value = totals;
+        fxErrors.value = [...new Set(Object.values(totals).flatMap(t => t.errors))];
+
+        // Bank months: every account has a statement covering the whole month. Their flows come from the bank.
+        const covers = (i, m) => i.period_start <= `${m}-01` && i.period_end >= monthEnd(m);
+        const bankSet = new Set(ms.filter(m => acc.length && acc.every(a => imports.some(i => i.account_id === a.id && covers(i, m)))));
+        bankMonths.value = bankSet;
+        const bankLines = bankSet.size ? await query(`SELECT bt.month, bt.kind, bt.amount_reporting AS amount, ec.name AS category, e.department
+            FROM bank_transactions bt
+            LEFT JOIN expense_items ei ON ei.id = bt.expense_item_id
+            LEFT JOIN expense_categories ec ON ec.id = ei.category_id
+            LEFT JOIN employees e ON e.id = bt.employee_id
+            WHERE bt.month IN (${[...bankSet].map(() => '?').join(',')}) AND bt.kind NOT IN ('transfer', 'ignore')`, [...bankSet]) : [];
 
         const revMap = {};
         revRows.forEach(r => { revMap[r.month] = r.total; });
@@ -81,7 +107,7 @@ export default {
             if (emp.start_date > m + '-31') continue;
             if (emp.end_date && emp.end_date < m + '-01') continue;
             const cost = Math.round(emp.salary_monthly * (1 + (emp.tax_pct || 0) / 100));
-            const catName = deptMapping[emp.department || 'Other'] || 'General & Administrative';
+            const catName = payrollCategory(emp.department, deptMapping);
             payrollMap[m][catName] = (payrollMap[m][catName] || 0) + cost;
           }
         }
@@ -90,27 +116,43 @@ export default {
         fundRows.forEach(r => { fundMap[r.month] = (fundMap[r.month] || 0) + r.amount; });
         fundingEvents.value = fundRows;
 
-        const caMap = {};
-        cashRows.forEach(r => { caMap[r.month] = r.balance; });
-        cashActualsMap.value = caMap;
+        const bankFlows = {};
+        for (const l of bankLines) {
+          const f = bankFlows[l.month] ||= { revenue: 0, funding: 0, otherIn: 0, cats: {} };
+          if (l.kind === 'revenue') f.revenue += l.amount;
+          else if (l.kind === 'funding') f.funding += l.amount;
+          else if (['interest', 'tax_refund', 'other_income'].includes(l.kind)) f.otherIn += l.amount;
+          else {
+            const cat = l.kind === 'salary' ? payrollCategory(l.department, deptMapping) : (l.category || 'Uncategorized / Other');
+            f.cats[cat] = (f.cats[cat] || 0) - l.amount; // money out is negative on the statement
+          }
+        }
 
+        // A month-end total anchors the waterfall only when every account has a balance for that month
+        const known = m => totals[m]?.complete ? totals[m].total : undefined;
         const rows = [];
-        let prevEnd = caMap[prevMonth(ms[0])] ?? 0;
+        let prevEnd = known(prevMonth(ms[0])) ?? 0;
 
         for (const m of ms) {
-          const startCash = (caMap[prevMonth(m)] !== undefined) ? caMap[prevMonth(m)] : prevEnd;
-          const revenue = revMap[m] || 0;
-          const funding = fundMap[m] || 0;
+          const startCash = known(prevMonth(m)) !== undefined ? known(prevMonth(m)) : prevEnd;
+          const isBank = bankSet.has(m);
+          const bf = bankFlows[m] || { revenue: 0, funding: 0, otherIn: 0, cats: {} };
+          const revenue = isBank ? bf.revenue : (revMap[m] || 0);
+          const funding = isBank ? bf.funding : (fundMap[m] || 0);
+          const otherIn = isBank ? bf.otherIn : 0;
           const cats = {};
           let totalOut = 0;
           for (const c of CAT_ROWS) {
-            const amt = ((expMap[m] || {})[c.db] || 0) + ((payrollMap[m] || {})[c.db] || 0);
+            const amt = isBank ? (bf.cats[c.db] || 0) : ((expMap[m] || {})[c.db] || 0) + ((payrollMap[m] || {})[c.db] || 0);
             cats[c.key] = amt;
             totalOut += amt;
           }
-          const net = revenue + funding - totalOut;
-          const endCash = startCash + net;
-          rows.push({ month: m, startCash, revenue, funding, ...cats, net, endCash });
+          const net = revenue + funding + otherIn - totalOut;
+          // In bank months the recorded month-end total is the truth; any gap is exchange-rate movement or missing lines
+          const actualEnd = isBank && totals[m]?.complete ? totals[m].total : undefined;
+          const endCash = actualEnd !== undefined ? actualEnd : startCash + net;
+          const unexplained = actualEnd !== undefined ? actualEnd - (startCash + net) : 0;
+          rows.push({ month: m, isBank, startCash, revenue, funding, otherIn, ...cats, unexplained, net: net + unexplained, endCash });
           prevEnd = endCash;
         }
         waterfall.value = rows;
@@ -226,10 +268,19 @@ export default {
       } catch (e) { toast('Delete failed: ' + e.message, 'error'); }
     }
 
-    async function saveCashActual(month, val) {
-      const cents = Math.round(parseFloat(val || 0) * 100);
+    // Month-end balance typed by hand, in the account's currency. Clearing the box removes it.
+    async function saveBalance(accountId, month, val) {
+      const current = balances.value[month]?.[accountId];
       try {
-        await execute(`INSERT OR REPLACE INTO cash_actuals (month, balance) VALUES (?, ?)`, [month, cents]);
+        if (val === '' || val === null) {
+          if (current === undefined) return;
+          await execute('DELETE FROM bank_balances WHERE account_id = ? AND month = ?', [accountId, month]);
+        } else {
+          const cents = Math.round(parseFloat(val) * 100);
+          if (Number.isNaN(cents) || cents === current) return;
+          await execute(`INSERT INTO bank_balances (account_id, month, balance, source) VALUES (?, ?, ?, 'manual')
+            ON CONFLICT(account_id, month) DO UPDATE SET balance = excluded.balance, source = 'manual', import_id = NULL`, [accountId, month, cents]);
+        }
         await loadData();
       } catch (e) { toast('Save failed: ' + e.message, 'error'); }
     }
@@ -241,11 +292,12 @@ export default {
     watch(() => [scenarioId.value, dateRange.value], () => loadData(), { deep: true });
 
     return {
-      loading, waterfall, months, fundingEvents, cashActualsMap,
+      loading, waterfall, months, fundingEvents, accounts, balances, totalsByMonth, fxErrors, accountLabel,
+      currency: computed(() => getReportingCurrency()),
       currentCash, burnRate, runwayMonths,
       showModal, editingId, form, chartRef,
       openAdd, openEdit, saveFunding, deleteFunding,
-      saveCashActual, centsToInput,
+      saveBalance, centsToInput,
       formatCents, monthLabel, CAT_ROWS,
     };
   },
@@ -283,7 +335,10 @@ export default {
           <thead>
             <tr class="border-b border-gray-200 text-gray-500 uppercase tracking-wider">
               <th class="text-left py-2 px-4 font-medium sticky left-0 bg-white z-10 min-w-[200px]"></th>
-              <th v-for="r in waterfall" :key="r.month" class="text-right py-2 px-3 font-medium min-w-[100px]">{{ monthLabel(r.month) }}</th>
+              <th v-for="r in waterfall" :key="r.month" class="text-right py-2 px-3 font-medium min-w-[100px]">
+                <div>{{ monthLabel(r.month) }}</div>
+                <div :class="['text-[10px] normal-case tracking-normal font-normal', r.isBank ? 'text-emerald-600' : 'text-gray-400']" :title="r.isBank ? 'From bank statements' : 'From the plan'">{{ r.isBank ? 'Bank' : 'Plan' }}</div>
+              </th>
             </tr>
           </thead>
           <tbody class="text-sm">
@@ -292,16 +347,24 @@ export default {
               <td v-for="r in waterfall" :key="r.month" class="text-right py-2 px-3 text-gray-900">{{ formatCents(r.startCash) }}</td>
             </tr>
             <tr class="border-b border-gray-100 bg-emerald-50/50">
-              <td class="py-2 px-4 text-emerald-700 sticky left-0 bg-emerald-50/50 z-10">+ Total Revenue</td>
+              <td class="py-2 px-4 text-emerald-700 sticky left-0 bg-emerald-50/50 z-10" title="Plan months: MRR from Revenue. Bank months: money received from customers.">+ Revenue (received in bank months)</td>
               <td v-for="r in waterfall" :key="r.month" class="text-right py-2 px-3 text-emerald-700">{{ formatCents(r.revenue) }}</td>
             </tr>
             <tr class="border-b border-gray-100 bg-emerald-50/50">
               <td class="py-2 px-4 text-emerald-700 sticky left-0 bg-emerald-50/50 z-10">+ Funding / Cash Injections</td>
               <td v-for="r in waterfall" :key="r.month" class="text-right py-2 px-3 text-emerald-700">{{ formatCents(r.funding) }}</td>
             </tr>
+            <tr v-if="waterfall.some(r => r.otherIn)" class="border-b border-gray-100 bg-emerald-50/50">
+              <td class="py-2 px-4 text-emerald-700 sticky left-0 bg-emerald-50/50 z-10">+ Interest, tax refunds, other</td>
+              <td v-for="r in waterfall" :key="r.month" class="text-right py-2 px-3 text-emerald-700">{{ formatCents(r.otherIn) }}</td>
+            </tr>
             <tr v-for="cat in CAT_ROWS" :key="cat.key" class="border-b border-gray-100">
               <td class="py-2 px-4 text-red-700 sticky left-0 bg-white z-10">- {{ cat.label }}</td>
               <td v-for="r in waterfall" :key="r.month" class="text-right py-2 px-3 text-red-700">{{ formatCents(r[cat.key]) }}</td>
+            </tr>
+            <tr v-if="waterfall.some(r => r.unexplained)" class="border-b border-gray-100">
+              <td class="py-2 px-4 text-gray-500 sticky left-0 bg-white z-10" title="Difference between the bank balances and the flows above: exchange-rate movements between months, or lines not linked">± Exchange rates and unlinked lines</td>
+              <td v-for="r in waterfall" :key="r.month" class="text-right py-2 px-3 text-gray-500">{{ r.unexplained ? formatCents(r.unexplained) : '' }}</td>
             </tr>
             <tr class="border-b border-gray-200 bg-gray-50 font-semibold">
               <td class="py-2.5 px-4 text-gray-900 sticky left-0 bg-gray-50 z-10">Net Cash Flow</td>
@@ -341,7 +404,7 @@ export default {
         </thead>
         <tbody>
           <tr v-for="ev in fundingEvents" :key="ev.id" class="border-b border-gray-50">
-            <td class="py-2.5 text-gray-900">{{ ev.name }}</td>
+            <td class="py-2.5 text-gray-900">{{ ev.name }} <span v-if="ev.is_actual" class="ml-1 inline-flex px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 text-xs">Received</span></td>
             <td class="py-2.5 text-gray-500">{{ monthLabel(ev.month) }}</td>
             <td class="py-2.5 text-right text-gray-900">{{ formatCents(ev.amount) }}</td>
             <td class="py-2.5 text-gray-500 max-w-[200px] truncate">{{ ev.notes || '—' }}</td>
@@ -355,28 +418,37 @@ export default {
       <p v-else class="text-sm text-gray-400 text-center py-4">No funding events for this scenario</p>
     </div>
 
-    <!-- Cash Actuals -->
+    <!-- Month-end balances, per bank account -->
     <div class="bg-white rounded-xl border border-gray-200 p-5">
-      <h2 class="text-sm font-semibold text-gray-700 mb-4">Actual Bank Balances</h2>
-      <p class="text-xs text-gray-400 mb-3">Record end-of-month bank balances. These anchor the waterfall starting cash.</p>
+      <div class="flex items-center justify-between mb-1 flex-wrap gap-2">
+        <h2 class="text-sm font-semibold text-gray-700">Month-end Bank Balances</h2>
+        <router-link to="/statements" class="text-sm text-indigo-600 hover:text-indigo-700">Import bank statements</router-link>
+      </div>
+      <p class="text-xs text-gray-400 mb-3">Each account in its own currency. Statements fill these in; you can also type a balance. Total cash is the sum, converted into {{ currency }} at each month-end rate.</p>
+      <p v-for="e in fxErrors" :key="e" class="text-xs text-red-600 mb-2">{{ e }}</p>
       <div class="overflow-x-auto">
         <table class="text-sm">
           <thead>
             <tr class="text-left text-xs text-gray-500 uppercase tracking-wider border-b border-gray-100">
               <th class="pb-2 pr-4 font-medium">Month</th>
-              <th class="pb-2 font-medium">Balance (EUR)</th>
+              <th v-for="a in accounts" :key="a.id" class="pb-2 pr-3 font-medium whitespace-nowrap">{{ accountLabel(a) }} ({{ a.currency }})</th>
+              <th class="pb-2 font-medium text-right whitespace-nowrap">Total ({{ currency }})</th>
             </tr>
           </thead>
           <tbody>
             <tr v-for="m in months" :key="m" class="border-b border-gray-50">
               <td class="py-2 pr-4 text-gray-700 whitespace-nowrap">{{ monthLabel(m) }}</td>
-              <td class="py-2">
+              <td v-for="a in accounts" :key="a.id" class="py-2 pr-3">
                 <input type="number" step="0.01"
-                  :value="centsToInput(cashActualsMap[m])"
-                  @blur="saveCashActual(m, $event.target.value)"
-                  class="w-40 px-2 py-1 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
-                  placeholder="—"
-                />
+                  :value="centsToInput(balances[m] && balances[m][a.id])"
+                  @blur="saveBalance(a.id, m, $event.target.value)"
+                  :aria-label="accountLabel(a) + ' balance at the end of ' + monthLabel(m)"
+                  class="w-36 px-2 py-1 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                  placeholder="—"/>
+              </td>
+              <td class="py-2 text-right tabular-nums whitespace-nowrap" :class="totalsByMonth[m] && !totalsByMonth[m].complete ? 'text-gray-400' : 'text-gray-900'"
+                :title="totalsByMonth[m] && !totalsByMonth[m].complete ? 'Some accounts have no balance for this month' : ''">
+                {{ totalsByMonth[m] ? formatCents(totalsByMonth[m].total) : '' }}<span v-if="totalsByMonth[m] && !totalsByMonth[m].complete"> (partial)</span>
               </td>
             </tr>
           </tbody>
@@ -400,7 +472,7 @@ export default {
           <input v-model="form.month" type="month" class="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
         </div>
         <div>
-          <label class="block text-sm font-medium text-gray-700 mb-1">Amount (EUR)</label>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Amount ({{ currency }})</label>
           <input v-model="form.amount" type="number" step="0.01" min="0" class="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500" placeholder="0.00"/>
         </div>
         <div>

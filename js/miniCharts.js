@@ -25,7 +25,7 @@ export function trendConfig(labels, values, label = 'Total') {
         backgroundColor: 'rgba(99,102,241,0.08)', fill: true, tension: 0.3, pointRadius: 2, borderWidth: 2 }],
     },
     options: {
-      scales: { y: { beginAtZero: true, ticks: { callback: v => '€' + v.toLocaleString() }, grid: { color: '#f3f4f6' } }, x: { grid: { display: false } } },
+      scales: { y: { beginAtZero: true, ticks: { callback: v => formatCents(Math.round(v * 100)).replace(/\.00$/, '') }, grid: { color: '#f3f4f6' } }, x: { grid: { display: false } } },
       plugins: { legend: { display: false }, tooltip: { callbacks: { label: c => formatCents(Math.round(c.parsed.y * 100)) } } },
     },
   };

@@ -1,4 +1,5 @@
 import { query } from '../db.js';
+import { cashPosition } from '../bank.js';
 import {
   formatCents, formatPct, formatDelta, monthLabel,
   generateMonthRange, currentMonth, prevMonth, ordinalDay,
@@ -52,7 +53,7 @@ export default {
           await Promise.all([
             query(`SELECT COALESCE(SUM(customers * arpu), 0) AS v FROM revenue_values WHERE scenario_id = ? AND month = ?`, [sid, month]),
             query(`SELECT COALESCE(SUM(customers * arpu), 0) AS v FROM revenue_values WHERE scenario_id = ? AND month = ?`, [sid, prev]),
-            query(`SELECT balance FROM cash_actuals ORDER BY month DESC LIMIT 1`),
+            cashPosition().catch(() => null),
             query(`SELECT COALESCE(SUM(amount), 0) AS v FROM expense_values WHERE scenario_id = ? AND month = ?`, [sid, month]),
             query(`SELECT salary_monthly, tax_pct FROM employees WHERE start_date <= ? AND (end_date IS NULL OR end_date >= ?)`, [month + '-31', month + '-01']),
             query(`SELECT month, COALESCE(SUM(customers * arpu), 0) AS mrr FROM revenue_values WHERE scenario_id = ? AND month >= ? AND month <= ? GROUP BY month ORDER BY month`, [sid, range?.start || month, range?.end || month]),
@@ -63,7 +64,7 @@ export default {
 
         revenueNow.value = revNow[0]?.v || 0;
         revenuePrev.value = revPrev[0]?.v || 0;
-        cashBalance.value = cash.length ? cash[0].balance : null;
+        cashBalance.value = cash ? cash.total : null;
         totalExpenses.value = expenses[0]?.v || 0;
         totalPayroll.value = payroll.reduce((s, e) => s + Math.round(e.salary_monthly * (1 + (e.tax_pct || 0) / 100)), 0);
 
