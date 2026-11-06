@@ -1,4 +1,5 @@
 import { query } from '../db.js';
+import { getBaseScenarioId } from '../schema.js';
 import { formatCents, monthLabel, generateMonthRange } from '../utils.js';
 import { loadCategoryLookups } from '../expenses.js';
 import { payrollCategory } from '../payroll.js';
@@ -78,22 +79,30 @@ export default {
         const ml = months.value;
         if (!sid || !ml.length) { rows.value = []; return; }
 
-        const baseRows = await query('SELECT id FROM scenarios WHERE is_base = 1 LIMIT 1');
-        const baseId = baseRows.length ? baseRows[0].id : 1;
+        const baseId = await getBaseScenarioId();
         const isBase = sid === baseId;
+        const first = ml[0], last = ml[ml.length - 1];
+        const valuesOf = (table, scenario) =>
+          query(`SELECT * FROM ${table} WHERE scenario_id = ? AND month >= ? AND month <= ?`, [scenario, first, last]);
+
+        // Everything at once; a scenario's values replace the base values
+        const [products, revBase, revScen, { subcategories }, expItems, expBase, expScen, employees] = await Promise.all([
+          query('SELECT * FROM revenue_products ORDER BY id'),
+          valuesOf('revenue_values', baseId),
+          isBase ? [] : valuesOf('revenue_values', sid),
+          loadCategoryLookups(),
+          query(`
+            SELECT ei.*, ec.name as category_name, ec.sort_order
+            FROM expense_items ei
+            JOIN expense_categories ec ON ec.id = ei.category_id
+            WHERE ei.visible = 1 ORDER BY ec.sort_order, ei.id`),
+          valuesOf('expense_values', baseId),
+          isBase ? [] : valuesOf('expense_values', sid),
+          query('SELECT * FROM employees'),
+        ]);
 
         // --- Revenue ---
-        const products = await query('SELECT * FROM revenue_products ORDER BY id');
-        let revRaw;
-        if (isBase) {
-          revRaw = await query('SELECT * FROM revenue_values WHERE scenario_id = ?', [sid]);
-        } else {
-          const [bv, sv] = await Promise.all([
-            query('SELECT * FROM revenue_values WHERE scenario_id = ?', [baseId]),
-            query('SELECT * FROM revenue_values WHERE scenario_id = ?', [sid]),
-          ]);
-          revRaw = overlayValues(bv, sv, v => `${v.product_id}:${v.month}`);
-        }
+        const revRaw = isBase ? revBase : overlayValues(revBase, revScen, v => `${v.product_id}:${v.month}`);
         const revMap = {};
         for (const v of revRaw) {
           if (!revMap[v.product_id]) revMap[v.product_id] = {};
@@ -101,22 +110,7 @@ export default {
         }
 
         // --- Expenses ---
-        const { subcategories } = await loadCategoryLookups();
-        const expItems = await query(`
-          SELECT ei.*, ec.name as category_name, ec.sort_order
-          FROM expense_items ei
-          JOIN expense_categories ec ON ec.id = ei.category_id
-          WHERE ei.visible = 1 ORDER BY ec.sort_order, ei.id`);
-        let expRaw;
-        if (isBase) {
-          expRaw = await query('SELECT * FROM expense_values WHERE scenario_id = ?', [sid]);
-        } else {
-          const [bv, sv] = await Promise.all([
-            query('SELECT * FROM expense_values WHERE scenario_id = ?', [baseId]),
-            query('SELECT * FROM expense_values WHERE scenario_id = ?', [sid]),
-          ]);
-          expRaw = overlayValues(bv, sv, v => `${v.expense_item_id}:${v.month}`);
-        }
+        const expRaw = isBase ? expBase : overlayValues(expBase, expScen, v => `${v.expense_item_id}:${v.month}`);
         const expMap = {};
         for (const v of expRaw) {
           if (!expMap[v.expense_item_id]) expMap[v.expense_item_id] = {};
@@ -124,7 +118,6 @@ export default {
         }
 
         // --- Payroll ---
-        const employees = await query('SELECT * FROM employees');
         const deptMap = settings.value?.dept_mapping || {};
         const payrollByCat = {};
         for (const m of ml) {

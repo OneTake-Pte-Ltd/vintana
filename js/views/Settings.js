@@ -1,5 +1,5 @@
-import { clearCredentials, getCredentials, query, execute } from '../db.js';
-import { CURRENCIES } from '../utils.js';
+import { clearCredentials, getCredentials, query, execute, batch } from '../db.js';
+import { CURRENCIES, monthLabelFull } from '../utils.js';
 import { loadCategoryLookups, categoryOptions } from '../expenses.js';
 import { ASSISTANT_MODELS, DEFAULT_MODEL, DEFAULT_RELAY_URL, sha256Hex } from '../assistant.js';
 import { getSettings, updateSettings, resetAllData } from '../schema.js';
@@ -10,10 +10,61 @@ import {
 } from '../csvTransfer.js';
 import { downloadCsv } from '../csv.js';
 
+// One collapsible block of the Settings page. The header shows a summary while it is closed.
+const SettingsSection = {
+  name: 'SettingsSection',
+  props: {
+    id: { type: String, required: true },
+    title: { type: String, required: true },
+    summary: { type: String, default: '' },
+    open: { type: Boolean, default: false },
+    dirty: { type: Boolean, default: false },
+    saved: { type: Boolean, default: false },
+    danger: { type: Boolean, default: false },
+  },
+  emits: ['toggle'],
+  template: `
+    <section :id="'settings-' + id" :class="['rounded-xl border scroll-mt-20', danger ? 'bg-red-50 border-red-200' : 'bg-white border-gray-200']">
+      <button type="button" @click="$emit('toggle')" :aria-expanded="open" :aria-controls="'settings-body-' + id"
+        :class="['w-full flex items-center gap-3 px-6 py-4 text-left rounded-xl focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500', danger ? 'hover:bg-red-100/50' : 'hover:bg-gray-50']">
+        <div class="flex-1 min-w-0">
+          <div class="flex items-center gap-2 flex-wrap">
+            <h2 :class="['text-base font-semibold', danger ? 'text-red-900' : 'text-gray-900']">{{ title }}</h2>
+            <span v-if="dirty" class="text-xs font-medium px-2 py-0.5 rounded-full bg-amber-100 text-amber-800">Unsaved changes</span>
+            <span v-else-if="saved" class="text-xs font-medium px-2 py-0.5 rounded-full bg-green-100 text-green-800">Saved</span>
+          </div>
+          <p v-if="!open && summary" class="text-sm text-gray-500 truncate mt-0.5">{{ summary }}</p>
+        </div>
+        <svg :class="['w-5 h-5 flex-shrink-0 transition-transform', danger ? 'text-red-400' : 'text-gray-400', open ? 'rotate-180' : '']"
+          viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
+      </button>
+      <div v-show="open" :id="'settings-body-' + id" class="px-6 pb-6">
+        <slot></slot>
+      </div>
+    </section>
+  `,
+};
+
+// Save and Discard buttons at the bottom of a section whose changes wait for Save
+const SaveBar = {
+  name: 'SaveBar',
+  props: { dirty: Boolean, saving: Boolean },
+  emits: ['save', 'discard'],
+  template: `
+    <div class="flex items-center justify-end gap-3 mt-6 pt-4 border-t border-gray-100">
+      <button v-if="dirty" type="button" @click="$emit('discard')" :disabled="saving" class="px-4 py-2 text-sm text-gray-600 hover:text-gray-900 disabled:opacity-50">Discard changes</button>
+      <button type="button" @click="$emit('save')" :disabled="!dirty || saving" class="px-5 py-2 bg-indigo-600 text-white text-sm font-medium rounded-lg hover:bg-indigo-700 disabled:opacity-40 transition-colors">
+        {{ saving ? 'Saving...' : 'Save Settings' }}
+      </button>
+    </div>
+  `,
+};
+
 export default {
   name: 'SettingsView',
+  components: { SettingsSection, SaveBar },
   setup() {
-    const { ref, computed, onMounted, inject } = Vue;
+    const { ref, computed, onMounted, onBeforeUnmount, inject, nextTick } = Vue;
     const router = VueRouter.useRouter();
     const toast = inject('toast');
     const dateRange = inject('dateRange');
@@ -21,7 +72,7 @@ export default {
 
     const settings = ref(null);
     const loading = ref(true);
-    const saving = ref(false);
+    const saving = ref(''); // id of the section being saved
     const showResetConfirm = ref(false);
 
     const months = [
@@ -55,6 +106,7 @@ export default {
           ? Object.entries(mapping)
           : Object.entries(DEFAULT_DEPT_MAPPING);
         deptEntries.value = entries.map(([dept, cat]) => ({ dept, cat }));
+        if (settings.value) Object.keys(SNAPSHOTS).forEach(markSaved);
       } catch (e) {
         toast('Failed to load settings: ' + e.message, 'error');
       } finally {
@@ -62,30 +114,131 @@ export default {
       }
     });
 
-    const save = async () => {
-      saving.value = true;
+    // --- Sections whose changes wait for Save: Company, Department mapping, Assistant ---
+    const SECTION_TITLES = { company: 'Company', mapping: 'Department mapping', assistant: 'Assistant' };
+    const COMPANY_FIELDS = ['company_name', 'currency', 'fiscal_year_start', 'actuals_through', 'payroll_pay_day'];
+    const ASSISTANT_FIELDS = ['company_context', 'assistant_model', 'assistant_relay_url'];
+    const pick = (obj, keys) => Object.fromEntries(keys.map(k => [k, obj?.[k] ?? null]));
+    const SNAPSHOTS = {
+      company: () => JSON.stringify(pick(settings.value, COMPANY_FIELDS)),
+      mapping: () => JSON.stringify(deptEntries.value.map(e => ({ dept: e.dept, cat: e.cat }))),
+      assistant: () => JSON.stringify(pick(settings.value, ASSISTANT_FIELDS)),
+    };
+    const savedState = ref({}); // section id -> snapshot of what is in the database
+    const markSaved = id => { savedState.value = { ...savedState.value, [id]: SNAPSHOTS[id]() }; };
+    const isDirty = id => !!settings.value && id in savedState.value && savedState.value[id] !== SNAPSHOTS[id]();
+    const dirtySection = computed(() => Object.keys(SNAPSHOTS).find(isDirty) || null);
+    const savedValues = id => JSON.parse(savedState.value[id] || 'null');
+
+    const discard = (id) => {
+      const before = savedValues(id);
+      if (!before) return;
+      if (id === 'mapping') deptEntries.value = before;
+      else Object.assign(settings.value, before);
+    };
+
+    // Saves one section. Returns false if it failed, so the caller can keep the page open.
+    const saveSection = async (id) => {
+      saving.value = id;
       try {
-        const mapping = {};
-        deptEntries.value.forEach(e => { if (e.dept) mapping[e.dept] = e.cat; });
-        await updateSettings({
-          company_name: settings.value.company_name,
-          currency: settings.value.currency,
-          fiscal_year_start: settings.value.fiscal_year_start,
-          actuals_through: settings.value.actuals_through,
-          dept_mapping: mapping,
-          assistant_relay_url: (settings.value.assistant_relay_url || '').trim() || DEFAULT_RELAY_URL,
-          assistant_model: settings.value.assistant_model || DEFAULT_MODEL,
-          company_context: settings.value.company_context || null,
-          payroll_pay_day: settings.value.payroll_pay_day || null,
-        });
+        if (id === 'company') {
+          const fields = pick(settings.value, COMPANY_FIELDS);
+          fields.actuals_through ||= null;
+          fields.payroll_pay_day ||= null;
+          await updateSettings(fields);
+          Object.assign(settings.value, fields);
+        } else if (id === 'mapping') {
+          const mapping = {};
+          deptEntries.value.forEach(e => { if (e.dept.trim()) mapping[e.dept.trim()] = e.cat; });
+          await updateSettings({ dept_mapping: mapping });
+          deptEntries.value = Object.entries(mapping).map(([dept, cat]) => ({ dept, cat }));
+        } else if (id === 'assistant') {
+          const fields = {
+            assistant_relay_url: (settings.value.assistant_relay_url || '').trim() || DEFAULT_RELAY_URL,
+            assistant_model: settings.value.assistant_model || DEFAULT_MODEL,
+            company_context: settings.value.company_context || null,
+          };
+          await updateSettings(fields);
+          Object.assign(settings.value, { ...fields, company_context: fields.company_context || '' });
+        }
+        markSaved(id);
         await reloadAppSettings();
-        toast('Settings saved', 'success');
+        toast(`${SECTION_TITLES[id]} settings saved`, 'success');
+        return true;
       } catch (e) {
         toast('Failed to save: ' + e.message, 'error');
+        return false;
       } finally {
-        saving.value = false;
+        saving.value = '';
       }
     };
+
+    // Leaving a section with unsaved changes (closing it, opening another, or leaving the page) asks first
+    const leaveDialog = ref(null); // { section, resolve }
+    const confirmLeave = () => {
+      const id = dirtySection.value;
+      if (!id) return Promise.resolve(true);
+      return new Promise(resolve => { leaveDialog.value = { section: id, title: SECTION_TITLES[id], resolve }; });
+    };
+    const answerLeave = async (choice) => {
+      const d = leaveDialog.value;
+      if (!d) return;
+      let leave = choice !== 'stay';
+      if (choice === 'save') leave = await saveSection(d.section);
+      if (choice === 'discard') discard(d.section);
+      leaveDialog.value = null;
+      d.resolve(leave);
+    };
+    VueRouter.onBeforeRouteLeave(() => confirmLeave());
+
+    const onBeforeUnload = (e) => {
+      if (!dirtySection.value) return;
+      e.preventDefault();
+      e.returnValue = ''; // the browser shows its own "Leave site?" message
+    };
+    window.addEventListener('beforeunload', onBeforeUnload);
+    onBeforeUnmount(() => window.removeEventListener('beforeunload', onBeforeUnload));
+
+    // --- Accordion: every section starts closed and one is open at a time ---
+    const openSection = ref(null);
+    const toggleSection = async (id) => {
+      if (!(await confirmLeave())) return;
+      openSection.value = openSection.value === id ? null : id;
+      await nextTick();
+      if (window.lucide) lucide.createIcons();
+      if (openSection.value) document.getElementById('settings-' + id)?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    };
+
+    // Sections that save each change at once show "Saved" in their header for a moment
+    const justSaved = ref('');
+    let savedTimer = null;
+    const flashSaved = (id) => {
+      justSaved.value = id;
+      clearTimeout(savedTimer);
+      savedTimer = setTimeout(() => { justSaved.value = ''; }, 2500);
+    };
+    onBeforeUnmount(() => clearTimeout(savedTimer));
+
+    // One-line summaries for closed sections, from what is saved
+    const summaries = computed(() => {
+      const company = savedValues('company') || {};
+      const mapping = savedValues('mapping') || [];
+      const assistant = savedValues('assistant') || {};
+      const model = ASSISTANT_MODELS.find(m => m.id === assistant.assistant_model)?.label || assistant.assistant_model;
+      const nSubs = subcategories.value.length;
+      return {
+        company: [company.company_name, company.currency,
+          `Fiscal year starts in ${months[(company.fiscal_year_start || 1) - 1]}`,
+          `Actuals through ${company.actuals_through ? monthLabelFull(company.actuals_through) : 'not set'}`].filter(Boolean).join(' · '),
+        bank: bankAccounts.value.map(a => `${a.bank_name} (${a.currency})`).join(', '),
+        subcategories: `${nSubs} sub-categor${nSubs === 1 ? 'y' : 'ies'} across ${expCategories.value.length} categories`,
+        mapping: `${mapping.length} department${mapping.length === 1 ? '' : 's'} mapped to P&L categories`,
+        assistant: [model, assistant.company_context ? 'Company description set' : 'No company description yet'].filter(Boolean).join(' · '),
+        csv: 'Import or export expenses and payroll as CSV files',
+        data: 'Back up or restore all data as a JSON file',
+        danger: 'Reset all data or disconnect this browser',
+      };
+    });
 
     const addDeptEntry = () => {
       deptEntries.value.push({ dept: '', cat: 'General & Administrative' });
@@ -103,9 +256,8 @@ export default {
           'employee_overrides', 'scenario_employees', 'cash_actuals', 'funding_events',
           'bank_accounts', 'bank_balances', 'statement_imports', 'bank_transactions', 'fx_rates'];
         const dump = {};
-        for (const t of tables) {
-          try { dump[t] = await query(`SELECT * FROM ${t}`); } catch { dump[t] = []; }
-        }
+        const rows = await Promise.all(tables.map(t => query(`SELECT * FROM ${t}`).catch(() => [])));
+        tables.forEach((t, i) => { dump[t] = rows[i]; });
         const blob = new Blob([JSON.stringify(dump, null, 2)], { type: 'application/json' });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
@@ -135,7 +287,8 @@ export default {
             'funding_events', 'cash_actuals', 'scenario_employees',
             'employee_overrides', 'employees', 'revenue_values', 'revenue_products',
             'expense_values', 'expense_items', 'expense_subcategories', 'expense_categories', 'scenarios', 'settings'];
-          await batch(tables.map(t => `DELETE FROM ${t}`));
+          // The backup may predate some upgrades: run them again on the next load
+          await batch([...tables.map(t => `DELETE FROM ${t}`), "DELETE FROM _meta WHERE key = 'upgrades'"]);
           for (const [table, rows] of Object.entries(dump)) {
             if (!rows || rows.length === 0) continue;
             for (const row of rows) {
@@ -236,6 +389,7 @@ export default {
         newAccount.value = { bank_name: '', label: '', currency: settings.value?.currency || 'EUR' };
         await loadBankAccounts();
         toast('Account added', 'success');
+        flashSaved('bank');
       } catch (e) { toast('Add failed: ' + e.message, 'error'); }
     };
     const updateAccount = async (acc, field, value) => {
@@ -243,6 +397,7 @@ export default {
         await execute(`UPDATE bank_accounts SET ${field} = ? WHERE id = ?`, [value || null, acc.id]);
         await loadBankAccounts();
         toast('Saved', 'success');
+        flashSaved('bank');
       } catch (e) { toast('Save failed: ' + e.message, 'error'); }
     };
     const deleteAccount = async (acc) => {
@@ -251,6 +406,7 @@ export default {
         await execute('DELETE FROM bank_accounts WHERE id = ?', [acc.id]);
         await loadBankAccounts();
         toast('Account removed', 'success');
+        flashSaved('bank');
       } catch (e) { toast('Delete failed: ' + e.message, 'error'); }
     };
 
@@ -280,6 +436,7 @@ export default {
         newSub.value.name = '';
         await loadSubcategories();
         toast('Sub-category added', 'success');
+        flashSaved('subcategories');
       } catch (e) {
         toast(/UNIQUE/.test(e.message) ? 'That sub-category already exists in this category' : 'Add failed: ' + e.message, 'error');
       }
@@ -288,13 +445,16 @@ export default {
       try {
         if (field === 'category_id') {
           // Expenses using it move along, so they never point to a sub-category of another category
-          await execute('UPDATE expense_subcategories SET category_id = ? WHERE id = ?', [Number(value), sc.id]);
-          await execute('UPDATE expense_items SET category_id = ? WHERE subcategory_id = ?', [Number(value), sc.id]);
+          await batch([
+            { sql: 'UPDATE expense_subcategories SET category_id = ? WHERE id = ?', args: [Number(value), sc.id] },
+            { sql: 'UPDATE expense_items SET category_id = ? WHERE subcategory_id = ?', args: [Number(value), sc.id] },
+          ]);
         } else {
           await execute('UPDATE expense_subcategories SET name = ? WHERE id = ?', [value, sc.id]);
         }
         await loadSubcategories();
         toast('Saved', 'success');
+        flashSaved('subcategories');
       } catch (e) {
         toast(/UNIQUE/.test(e.message) ? 'That sub-category already exists in this category' : 'Save failed: ' + e.message, 'error');
       }
@@ -307,6 +467,7 @@ export default {
         await execute('DELETE FROM expense_subcategories WHERE id = ?', [sc.id]);
         await loadSubcategories();
         toast('Sub-category deleted', 'success');
+        flashSaved('subcategories');
       } catch (e) { toast('Delete failed: ' + e.message, 'error'); }
     };
 
@@ -327,7 +488,9 @@ export default {
     };
 
     return {
-      settings, loading, saving, save, months, categories,
+      settings, loading, saving, months, categories,
+      isDirty, dirtySection, discard, saveSection, leaveDialog, answerLeave,
+      openSection, toggleSection, justSaved, summaries,
       deptEntries, addDeptEntry, removeDeptEntry,
       exportData, importData,
       csvKinds, csvBusy, csvErrors, exportCsv, importCsv,
@@ -344,9 +507,10 @@ export default {
 
       <div v-if="loading" class="text-gray-400 py-12 text-center">Loading...</div>
 
-      <div v-else-if="settings" class="space-y-8">
-        <section class="bg-white rounded-xl border border-gray-200 p-6">
-          <h2 class="text-lg font-semibold text-gray-900 mb-4">Company</h2>
+      <div v-else-if="settings" class="space-y-4">
+        <p class="text-sm text-gray-500">Open a section to see or change its settings.</p>
+
+        <settings-section id="company" title="Company" :summary="summaries.company" :open="openSection === 'company'" :dirty="isDirty('company')" @toggle="toggleSection('company')">
           <div class="grid grid-cols-2 gap-4">
             <div>
               <label class="block text-sm font-medium text-gray-700 mb-1">Company Name</label>
@@ -366,8 +530,9 @@ export default {
               <p class="text-xs text-gray-400 mt-1">Bank accounts in other currencies are converted into it. Changing it relabels existing amounts; it does not convert them.</p>
             </div>
             <div>
-              <label class="block text-sm font-medium text-gray-700 mb-1">Actuals Through</label>
+              <label class="block text-sm font-medium text-gray-700 mb-1">Actuals through</label>
               <input v-model="settings.actuals_through" type="month" class="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+              <p class="text-xs text-gray-400 mt-1">The last month with real figures. Revenue and P&L treat the months after it as forecasts.</p>
             </div>
             <div>
               <label for="pay-day" class="block text-sm font-medium text-gray-700 mb-1">Payroll Pay Day</label>
@@ -378,27 +543,10 @@ export default {
               <p class="text-xs text-gray-400 mt-1">Used to date salaries on the Upcoming Charges page.</p>
             </div>
           </div>
-        </section>
+          <save-bar :dirty="isDirty('company')" :saving="saving === 'company'" @save="saveSection('company')" @discard="discard('company')"></save-bar>
+        </settings-section>
 
-        <section class="bg-white rounded-xl border border-gray-200 p-6">
-          <div class="flex items-center justify-between mb-4">
-            <h2 class="text-lg font-semibold text-gray-900">Department → P&L Mapping</h2>
-            <button @click="addDeptEntry" class="text-sm text-indigo-600 hover:text-indigo-700">+ Add</button>
-          </div>
-          <div class="space-y-2">
-            <div v-for="(entry, idx) in deptEntries" :key="idx" class="flex items-center gap-3">
-              <input v-model="entry.dept" placeholder="Department name" class="flex-1 px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
-              <i data-lucide="arrow-right" class="w-4 h-4 text-gray-400 flex-shrink-0"></i>
-              <select v-model="entry.cat" class="flex-1 px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500">
-                <option v-for="c in categories" :value="c">{{ c }}</option>
-              </select>
-              <button @click="removeDeptEntry(idx)" class="text-gray-400 hover:text-red-500"><i data-lucide="x" class="w-4 h-4"></i></button>
-            </div>
-          </div>
-        </section>
-
-        <section v-if="bankAccounts.length" class="bg-white rounded-xl border border-gray-200 p-6">
-          <h2 class="text-lg font-semibold text-gray-900 mb-1">Bank Accounts</h2>
+        <settings-section v-if="bankAccounts.length" id="bank" title="Bank accounts" :summary="summaries.bank" :open="openSection === 'bank'" :saved="justSaved === 'bank'" @toggle="toggleSection('bank')">
           <p class="text-sm text-gray-500 mb-4">One account per bank. Total cash is the sum of their month-end balances, converted into the reporting currency. Changes here are saved immediately.</p>
           <div class="divide-y divide-gray-100 border border-gray-100 rounded-lg">
             <div v-for="a in bankAccounts" :key="a.id" class="flex items-center gap-3 px-3 py-2 text-sm flex-wrap">
@@ -422,10 +570,9 @@ export default {
             </select>
             <button type="submit" :disabled="!newAccount.bank_name.trim()" class="px-4 py-2 text-sm bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-40">Add account</button>
           </form>
-        </section>
+        </settings-section>
 
-        <section v-if="expCategories.length && (subcategories.length || newSub.category_id)" class="bg-white rounded-xl border border-gray-200 p-6">
-          <h2 class="text-lg font-semibold text-gray-900 mb-1">Expense Sub-categories</h2>
+        <settings-section v-if="expCategories.length && (subcategories.length || newSub.category_id)" id="subcategories" title="Expense sub-categories" :summary="summaries.subcategories" :open="openSection === 'subcategories'" :saved="justSaved === 'subcategories'" @toggle="toggleSection('subcategories')">
           <p class="text-sm text-gray-500 mb-4">Group expenses inside each P&L category. Changes here are saved immediately. Click a name or a category to change it.</p>
           <div class="space-y-5">
             <div v-for="c in expCategories" :key="c.id">
@@ -448,10 +595,27 @@ export default {
             </select>
             <button type="submit" :disabled="!newSub.name.trim()" class="px-4 py-2 text-sm bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-40">Add</button>
           </form>
-        </section>
+        </settings-section>
 
-        <section class="bg-white rounded-xl border border-gray-200 p-6">
-          <h2 class="text-lg font-semibold text-gray-900 mb-1">Assistant</h2>
+        <settings-section id="mapping" title="Department → P&L mapping" :summary="summaries.mapping" :open="openSection === 'mapping'" :dirty="isDirty('mapping')" @toggle="toggleSection('mapping')">
+          <div class="flex items-center justify-between gap-4 mb-4">
+            <p class="text-sm text-gray-500">Which P&L category each department's payroll goes into.</p>
+            <button @click="addDeptEntry" class="text-sm text-indigo-600 hover:text-indigo-700 whitespace-nowrap">+ Add</button>
+          </div>
+          <div class="space-y-2">
+            <div v-for="(entry, idx) in deptEntries" :key="idx" class="flex items-center gap-3">
+              <input v-model="entry.dept" placeholder="Department name" class="flex-1 px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+              <i data-lucide="arrow-right" class="w-4 h-4 text-gray-400 flex-shrink-0"></i>
+              <select v-model="entry.cat" class="flex-1 px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                <option v-for="c in categories" :value="c">{{ c }}</option>
+              </select>
+              <button @click="removeDeptEntry(idx)" class="text-gray-400 hover:text-red-500"><i data-lucide="x" class="w-4 h-4"></i></button>
+            </div>
+          </div>
+          <save-bar :dirty="isDirty('mapping')" :saving="saving === 'mapping'" @save="saveSection('mapping')" @discard="discard('mapping')"></save-bar>
+        </settings-section>
+
+        <settings-section id="assistant" title="Assistant" :summary="summaries.assistant" :open="openSection === 'assistant'" :dirty="isDirty('assistant')" @toggle="toggleSection('assistant')">
           <p class="text-sm text-gray-500 mb-4">The Ask button on every page sends what the page shows, the description below and this month's cash, burn and revenue to Claude through the relay.</p>
           <div class="space-y-4">
             <div>
@@ -486,16 +650,10 @@ export default {
               </div>
             </div>
           </div>
-        </section>
+          <save-bar :dirty="isDirty('assistant')" :saving="saving === 'assistant'" @save="saveSection('assistant')" @discard="discard('assistant')"></save-bar>
+        </settings-section>
 
-        <div class="flex justify-end">
-          <button @click="save" :disabled="saving" class="px-6 py-2.5 bg-indigo-600 text-white text-sm font-medium rounded-lg hover:bg-indigo-700 disabled:opacity-50 transition-colors">
-            {{ saving ? 'Saving...' : 'Save Settings' }}
-          </button>
-        </div>
-
-        <section class="bg-white rounded-xl border border-gray-200 p-6">
-          <h2 class="text-lg font-semibold text-gray-900 mb-1">Expenses and Payroll (CSV)</h2>
+        <settings-section id="csv" title="Expenses and payroll (CSV)" :summary="summaries.csv" :open="openSection === 'csv'" @toggle="toggleSection('csv')">
           <p class="text-sm text-gray-500 mb-4">
             Rows are matched by name: existing ones are updated, new ones are added. Months use the format 2025-01.
             Quarterly and annual amounts are spread evenly over their months. Export with no data to get a template.
@@ -523,10 +681,9 @@ export default {
             </ul>
             <div v-if="csvErrors.list.length > 20" class="mt-1">and {{ csvErrors.list.length - 20 }} more</div>
           </div>
-        </section>
+        </settings-section>
 
-        <section class="bg-white rounded-xl border border-gray-200 p-6">
-          <h2 class="text-lg font-semibold text-gray-900 mb-4">Data Management</h2>
+        <settings-section id="data" title="Data management" :summary="summaries.data" :open="openSection === 'data'" @toggle="toggleSection('data')">
           <div class="flex gap-3">
             <button @click="exportData" class="px-4 py-2 text-sm border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors">
               <i data-lucide="download" class="w-4 h-4 inline mr-1"></i> Export JSON
@@ -535,10 +692,9 @@ export default {
               <i data-lucide="upload" class="w-4 h-4 inline mr-1"></i> Import JSON
             </button>
           </div>
-        </section>
+        </settings-section>
 
-        <section class="bg-red-50 rounded-xl border border-red-200 p-6">
-          <h2 class="text-lg font-semibold text-red-900 mb-4">Danger Zone</h2>
+        <settings-section id="danger" title="Danger zone" :summary="summaries.danger" :open="openSection === 'danger'" danger @toggle="toggleSection('danger')">
           <div class="flex gap-3">
             <button @click="showResetConfirm = true" class="px-4 py-2 text-sm text-red-600 border border-red-300 rounded-lg hover:bg-red-100 transition-colors">
               Reset All Data
@@ -547,7 +703,19 @@ export default {
               Disconnect
             </button>
           </div>
-        </section>
+        </settings-section>
+
+        <div v-if="leaveDialog" class="fixed inset-0 bg-black/50 flex items-center justify-center z-50" @click.self="answerLeave('stay')">
+          <div class="bg-white rounded-xl p-6 w-full max-w-lg mx-4" role="dialog" aria-modal="true" aria-labelledby="leave-title">
+            <h3 id="leave-title" class="text-lg font-semibold text-gray-900 mb-2">Save your changes?</h3>
+            <p class="text-sm text-gray-600 mb-6">You changed the {{ leaveDialog.title }} settings without saving them.</p>
+            <div class="flex justify-end gap-3 flex-wrap">
+              <button @click="answerLeave('stay')" class="px-4 py-2 text-sm border border-gray-200 rounded-lg hover:bg-gray-50">Keep editing</button>
+              <button @click="answerLeave('discard')" class="px-4 py-2 text-sm text-red-600 border border-red-200 rounded-lg hover:bg-red-50">Discard changes</button>
+              <button @click="answerLeave('save')" :disabled="!!saving" class="px-4 py-2 text-sm bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-50">{{ saving ? 'Saving...' : 'Save Settings' }}</button>
+            </div>
+          </div>
+        </div>
 
         <div v-if="showResetConfirm" class="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
           <div class="bg-white rounded-xl p-6 max-w-sm mx-4">

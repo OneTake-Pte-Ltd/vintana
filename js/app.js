@@ -133,9 +133,10 @@ const app = Vue.createApp({
 
     const loadAppData = async () => {
       try {
-        const ok = await checkSchema();
-        if (ok) {
-          // Read-only tokens can't upgrade the schema; the app works without the additions
+        // All three go out at once; scenarios and settings tolerate a database that isn't set up
+        const [schema] = await Promise.all([checkSchema(), loadScenarios(), loadSettings()]);
+        if (schema.ok && !schema.upgraded) {
+          // Runs once per database. Read-only tokens can't upgrade the schema; the app works without the additions
           await ensureSchemaUpgrades().catch(() => {});
           await Promise.all([loadScenarios(), loadSettings()]);
         }

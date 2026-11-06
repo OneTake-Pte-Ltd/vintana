@@ -1,4 +1,5 @@
 import { query, execute } from '../db.js';
+import { getBaseScenarioId } from '../schema.js';
 import { formatCents, monthLabelFull } from '../utils.js';
 import { loadAccounts, accountLabel } from '../bank.js';
 import { loadScenarioEmployees } from '../payroll.js';
@@ -38,7 +39,7 @@ export default {
           query(`SELECT ei.id, ei.name, ei.company, ec.name AS category_name, ec.sort_order FROM expense_items ei
                  JOIN expense_categories ec ON ec.id = ei.category_id WHERE ei.visible = 1 ORDER BY ec.sort_order, ei.name`),
           query('SELECT id, name FROM expense_categories ORDER BY sort_order'),
-          query('SELECT id FROM scenarios WHERE is_base = 1 LIMIT 1').then(r => loadScenarioEmployees(r[0]?.id || 1)),
+          getBaseScenarioId().then(loadScenarioEmployees),
           query(`SELECT fe.id, fe.name, fe.month, fe.amount FROM funding_events fe JOIN scenarios s ON s.id = fe.scenario_id AND s.is_base = 1
                  WHERE fe.is_actual = 0 ORDER BY fe.month`).catch(() => []),
         ]);

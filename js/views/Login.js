@@ -22,7 +22,7 @@ export default {
       try {
         setCredentials(dbUrl.value.trim(), dbToken.value.trim());
         await testConnection();
-        const hasSchema = await checkSchema();
+        const { ok: hasSchema } = await checkSchema();
         if (!hasSchema) {
           await runMigrations();
         }

@@ -3,7 +3,28 @@ const DB_TOKEN_KEY = 'bdb_token';
 
 let _url = '';
 let _token = '';
-let _queue = Promise.resolve();
+
+// Reads run in parallel. A write waits for everything sent before it, and anything sent after a write waits for
+// it, so callers always see their own changes in the order they made them.
+let _lastWrite = Promise.resolve();
+const _inFlight = new Set();
+const settle = p => p.then(() => {}, () => {});
+
+const READ_SQL = /^\s*(SELECT|PRAGMA\s+table_info)\b/i;
+const isRead = stmt => READ_SQL.test(typeof stmt === 'string' ? stmt : stmt.sql);
+
+function schedule(read, run) {
+  const after = read ? _lastWrite : Promise.all([_lastWrite, ..._inFlight]);
+  const p = after.then(run);
+  const done = settle(p);
+  if (read) {
+    _inFlight.add(done);
+    done.then(() => _inFlight.delete(done));
+  } else {
+    _lastWrite = done;
+  }
+  return p;
+}
 
 // Browsers can't fetch libsql:// or ws(s):// URLs; the same host serves HTTP on https://
 export function normalizeUrl(url) {
@@ -89,53 +110,34 @@ async function rawPipeline(requests) {
 }
 
 export async function execute(sql, args = []) {
-  return new Promise((resolve, reject) => {
-    _queue = _queue.then(async () => {
-      try {
-        const data = await rawPipeline([
-          {
-            type: 'execute',
-            stmt: {
-              sql,
-              args: args.map(serializeArg),
-            },
-          },
-          { type: 'close' },
-        ]);
-        resolve(parseResponse(data.results[0]));
-      } catch (e) {
-        reject(e);
-      }
-    });
+  return schedule(isRead(sql), async () => {
+    const data = await rawPipeline([
+      { type: 'execute', stmt: { sql, args: args.map(serializeArg) } },
+      { type: 'close' },
+    ]);
+    return parseResponse(data.results[0]);
   });
 }
 
 export async function batch(statements) {
-  return new Promise((resolve, reject) => {
-    _queue = _queue.then(async () => {
-      try {
-        const requests = statements.map(stmt => {
-          if (typeof stmt === 'string') {
-            return { type: 'execute', stmt: { sql: stmt, args: [] } };
-          }
-          return {
-            type: 'execute',
-            stmt: {
-              sql: stmt.sql,
-              args: (stmt.args || []).map(serializeArg),
-            },
-          };
-        });
-        requests.push({ type: 'close' });
-        const data = await rawPipeline(requests);
-        const results = data.results
-          .filter(r => r.response?.type !== 'close')
-          .map(parseResponse);
-        resolve(results);
-      } catch (e) {
-        reject(e);
+  return schedule(statements.every(isRead), async () => {
+    const requests = statements.map(stmt => {
+      if (typeof stmt === 'string') {
+        return { type: 'execute', stmt: { sql: stmt, args: [] } };
       }
+      return {
+        type: 'execute',
+        stmt: {
+          sql: stmt.sql,
+          args: (stmt.args || []).map(serializeArg),
+        },
+      };
     });
+    requests.push({ type: 'close' });
+    const data = await rawPipeline(requests);
+    return data.results
+      .filter(r => r.response?.type !== 'close')
+      .map(parseResponse);
   });
 }
 

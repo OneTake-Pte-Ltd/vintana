@@ -8,6 +8,7 @@
 // The PDF itself is never stored: the browser reads it, sends it once, and drops it.
 
 import { query, execute, batch, getCredentials } from './db.js';
+import { getBaseScenarioId } from './schema.js';
 import {
   getReportingCurrency, addMonths, currentMonth, generateMonthRange, prevMonth, RECURRENCE_MONTHS, formatCents, monthLabelFull, isChargeMonth,
 } from './utils.js';
@@ -32,7 +33,7 @@ export const KIND_OPTIONS = [
 export const kindLabel = k => KIND_OPTIONS.find(o => o.value === k)?.label || k;
 
 const toCents = n => Math.round(Number(n) * 100);
-const baseScenarioId = async () => (await query('SELECT id FROM scenarios WHERE is_base = 1 LIMIT 1'))[0]?.id || 1;
+const baseScenarioId = getBaseScenarioId;
 
 function fileToBase64(file) {
   return new Promise((resolve, reject) => {
@@ -196,7 +197,8 @@ export async function saveReview(review, { replaceImportIds = [] } = {}) {
   const reporting = getReportingCurrency();
   const months = [...new Set([...review.rows.map(r => r.month), ...review.monthEnds.map(b => b.month)])].filter(Boolean);
   const rates = {};
-  for (const m of months) rates[m] = await getRate(m, account.currency, reporting);
+  const found = await Promise.all(months.map(m => getRate(m, account.currency, reporting)));
+  months.forEach((m, i) => { rates[m] = found[i]; });
   const baseId = await baseScenarioId();
 
   for (const id of replaceImportIds) await deleteImport(id);
@@ -417,11 +419,10 @@ export async function findDiscrepancies(importId, settings) {
   // 6. Actuals Through is behind the months every account now covers
   if (fullMonths.length) {
     const latestFull = fullMonths[fullMonths.length - 1];
-    const allCovered = [];
-    for (const a of accounts) {
+    const allCovered = await Promise.all(accounts.map(async a => {
       const imps = await query('SELECT period_start, period_end FROM statement_imports WHERE account_id = ?', [a.id]);
-      allCovered.push(imps.some(i => fullMonthsIn(i.period_start, i.period_end).includes(latestFull)));
-    }
+      return imps.some(i => fullMonthsIn(i.period_start, i.period_end).includes(latestFull));
+    }));
     const at = settings?.actuals_through;
     if (allCovered.every(Boolean) && (!at || at < latestFull) && latestFull < currentMonth()) {
       out.push({ severity: 'info', title: `Every account now has a statement for ${monthLabelFull(latestFull)}`,
