@@ -1,6 +1,7 @@
 import { query } from './db.js';
 import { currentMonth } from './utils.js';
 import { loadScenarioEmployees, employeeCost, isEmployedIn } from './payroll.js';
+import { cashPosition } from './bank.js';
 
 // Headline numbers for the current month in a scenario (scenario values replace base values). Amounts in cents.
 export async function loadHeadlineMetrics(scenarioId) {
@@ -8,13 +9,13 @@ export async function loadHeadlineMetrics(scenarioId) {
   const baseRows = await query('SELECT id FROM scenarios WHERE is_base = 1 LIMIT 1');
   const baseId = baseRows[0]?.id || 1;
 
-  const [revRows, expRows, cashRows, { employees }] = await Promise.all([
+  const [revRows, expRows, cash, { employees }] = await Promise.all([
     query(`SELECT product_id, scenario_id, customers * arpu AS v FROM revenue_values
            WHERE scenario_id IN (?, ?) AND month = ?`, [scenarioId, baseId, month]),
     query(`SELECT ev.expense_item_id, ev.scenario_id, ev.amount AS v FROM expense_values ev
            JOIN expense_items ei ON ei.id = ev.expense_item_id AND ei.visible = 1
            WHERE ev.scenario_id IN (?, ?) AND ev.month = ?`, [scenarioId, baseId, month]),
-    query('SELECT month, balance FROM cash_actuals ORDER BY month DESC LIMIT 1'),
+    cashPosition().catch(() => null),
     loadScenarioEmployees(scenarioId),
   ]);
 
@@ -34,7 +35,8 @@ export async function loadHeadlineMetrics(scenarioId) {
     expenses,
     payroll,
     burn: expenses + payroll - revenue,
-    cash: cashRows.length ? cashRows[0].balance : null,
-    cashMonth: cashRows.length ? cashRows[0].month : null,
+    cash: cash ? cash.total : null,
+    cashMonth: cash ? cash.month : null,
+    cashComplete: cash ? cash.complete : false,
   };
 }

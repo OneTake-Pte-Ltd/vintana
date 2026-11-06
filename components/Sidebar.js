@@ -17,6 +17,7 @@ export default {
       { icon: 'users', label: 'Payroll', path: '/payroll' },
       { icon: 'file-spreadsheet', label: 'P&L', path: '/pnl' },
       { icon: 'wallet', label: 'Cash Flow', path: '/cashflow' },
+      { icon: 'landmark', label: 'Bank Statements', path: '/statements' },
       { icon: 'git-branch', label: 'Scenarios', path: '/scenarios' },
       { icon: 'settings', label: 'Settings', path: '/settings' },
     ];

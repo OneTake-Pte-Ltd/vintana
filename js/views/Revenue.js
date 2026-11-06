@@ -1,5 +1,6 @@
 import { query, execute } from '../db.js';
 import { formatCents, monthLabel, generateMonthRange, currentMonth } from '../utils.js';
+import { getReportingCurrency } from '../utils.js';
 import { donutConfig, trendConfig } from '../miniCharts.js';
 
 const COLORS = ['#6366f1','#f59e0b','#10b981','#ef4444','#8b5cf6','#ec4899','#14b8a6','#f97316'];
@@ -227,7 +228,9 @@ export default {
       }
     }
 
+    const currency = Vue.computed(() => getReportingCurrency());
     return {
+      currency,
       products, months, expandedId, showAddModal, newProduct, deleteTarget,
       totalMrr, totalArr, totalCustomers, chartData, chartOptions, productDonut, revenueTrend,
       curMonth, isForecast, getVal, mrr, formatCents,
@@ -314,7 +317,7 @@ export default {
                   </tr>
                   <!-- ARPU row -->
                   <tr class="border-t border-gray-100">
-                    <td class="sticky left-0 z-10 bg-white px-4 py-2 font-medium text-gray-700">ARPU (EUR)</td>
+                    <td class="sticky left-0 z-10 bg-white px-4 py-2 font-medium text-gray-700">ARPU ({{ currency }})</td>
                     <td v-for="m in months" :key="'a-'+m"
                         :class="['px-1 py-1', isForecast(m) ? 'bg-blue-50/50' : '']">
                       <input type="number" min="0" step="0.01"

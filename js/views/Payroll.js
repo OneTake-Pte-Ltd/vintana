@@ -1,5 +1,7 @@
-import { execute } from '../db.js';
+import { execute, query } from '../db.js';
 import { formatCents, currentMonth, generateMonthRange, monthLabel } from '../utils.js';
+import { getReportingCurrency } from '../utils.js';
+const money = v => formatCents(Math.round(v * 100));
 import { loadScenarioEmployees, employeeCost, isEmployedIn, DEFAULT_DEPT_MAPPING } from '../payroll.js';
 
 const COLORS = ['#6366f1','#10b981','#f59e0b','#ef4444','#8b5cf6','#06b6d4','#ec4899','#84cc16','#f97316','#14b8a6'];
@@ -32,7 +34,22 @@ export default {
     const blankForm = () => ({ name:'', role:'', department:'', salary_eur:'', tax_pct:0, start_date:'', end_date:'', notes:'' });
     const form = ref(blankForm());
 
+    // Salaries actually paid, from bank statements: the latest month for each employee
+    const lastPaid = ref({});
+    async function loadLastPaid() {
+      try {
+        const rows = await query(`SELECT employee_id AS id, month, -SUM(amount_reporting) AS total FROM bank_transactions
+          WHERE kind = 'salary' AND employee_id IS NOT NULL GROUP BY employee_id, month ORDER BY month`);
+        const out = {};
+        rows.forEach(r => { out[r.id] = r; });
+        lastPaid.value = out;
+      } catch { lastPaid.value = {}; }
+    }
+    const paidFor = emp => emp._source === 'scenario' ? null : lastPaid.value[emp.id] || null;
+    const paidDiffers = emp => { const p = paidFor(emp); return p && Math.abs(p.total - empCost(emp)) > Math.max(100, empCost(emp) * 0.01); };
+
     async function loadEmployees() {
+      loadLastPaid();
       loading.value = true;
       try {
         const res = await loadScenarioEmployees(scenarioId.value);
@@ -162,7 +179,7 @@ export default {
           data:{ labels, datasets:[{ data:labels.map(l=>depts[l]/100), backgroundColor:labels.map((_,i)=>COLORS[i%COLORS.length]), borderWidth:0 }] },
           options:{ responsive:true, maintainAspectRatio:false, cutout:'65%',
             plugins:{ legend:{ position:'bottom', labels:{ boxWidth:12, padding:8, font:{size:11} } },
-              tooltip:{ callbacks:{ label:c=>`${c.label}: €${c.parsed.toLocaleString(undefined,{minimumFractionDigits:2})}` } } } } });
+              tooltip:{ callbacks:{ label:c=>`${c.label}: ${money(c.parsed)}` } } } } });
       }
       if (lineCanvas.value && dateRange.value) {
         const months = generateMonthRange(dateRange.value.start, dateRange.value.end);
@@ -174,15 +191,16 @@ export default {
           data:{ labels:months.map(monthLabel), datasets:[{ label:'Total Payroll', data, borderColor:'#6366f1',
             backgroundColor:'rgba(99,102,241,0.08)', fill:true, tension:0.3, pointRadius:2, borderWidth:2 }] },
           options:{ responsive:true, maintainAspectRatio:false,
-            scales:{ y:{ beginAtZero:true, ticks:{ callback:v=>'€'+v.toLocaleString() }, grid:{color:'#f3f4f6'} }, x:{ grid:{display:false} } },
-            plugins:{ legend:{display:false}, tooltip:{ callbacks:{ label:c=>`€${c.parsed.y.toLocaleString(undefined,{minimumFractionDigits:2})}` } } } } });
+            scales:{ y:{ beginAtZero:true, ticks:{ callback:v=>money(v).replace(/\.00$/,'') }, grid:{color:'#f3f4f6'} }, x:{ grid:{display:false} } },
+            plugins:{ legend:{display:false}, tooltip:{ callbacks:{ label:c=>money(c.parsed.y) } } } } });
       }
     }
     onMounted(async () => { await loadEmployees(); await nextTick(); renderCharts(); openFromQuery(); });
     onBeforeUnmount(() => { if (donutChart) donutChart.destroy(); if (lineChart) lineChart.destroy(); });
     watch([scenarioId, dateRange], async () => { await loadEmployees(); await nextTick(); renderCharts(); }, { deep:true });
 
-    return { loading, filteredEmployees, showAll, hiddenCount, departments, deptOptions, saveField, deptFilter, sortCol, sortAsc, toggleSort,
+    const currency = Vue.computed(() => getReportingCurrency());
+    return { loading, filteredEmployees, paidFor, paidDiffers, monthLabel, currency, showAll, hiddenCount, departments, deptOptions, saveField, deptFilter, sortCol, sortAsc, toggleSort,
       totalCost, headcount, showModal, editingEmployee, form, openAdd, openEdit, saveEmployee,
       confirmDelete, deleteEmployee, empCost, donutCanvas, lineCanvas, formatCents, scenarioIsBase, INPUT };
   },
@@ -231,6 +249,7 @@ export default {
               :key="col.key" @click="toggleSort(col.key)" class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:text-gray-700 select-none whitespace-nowrap">
               {{ col.label }}<span v-if="sortCol===col.key" class="ml-1">{{ sortAsc ? '\\u25B2' : '\\u25BC' }}</span>
             </th>
+            <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider whitespace-nowrap" title="From imported bank statements">Last Paid</th>
             <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
           </tr></thead>
           <tbody class="divide-y divide-gray-100">
@@ -243,12 +262,19 @@ export default {
               <td class="px-4 py-3 text-gray-900 font-medium">{{ formatCents(empCost(emp)) }}</td>
               <td class="px-4 py-3 text-gray-600">{{ emp.start_date }}</td>
               <td class="px-4 py-3 text-gray-600">{{ emp.end_date||'Current' }}</td>
+              <td class="px-4 py-3 whitespace-nowrap">
+                <template v-if="paidFor(emp)">
+                  <span :class="paidDiffers(emp) ? 'text-amber-700 font-medium' : 'text-gray-900'" :title="paidDiffers(emp) ? 'Differs from the total cost on this page' : ''">{{ formatCents(paidFor(emp).total) }}</span>
+                  <span class="text-xs text-gray-400 ml-1">{{ monthLabel(paidFor(emp).month) }}</span>
+                </template>
+                <span v-else class="text-gray-300">—</span>
+              </td>
               <td class="px-4 py-3"><div class="flex items-center gap-2">
                 <button @click="openEdit(emp)" class="text-indigo-600 hover:text-indigo-800 text-xs font-medium">Edit</button>
                 <button @click="confirmDelete=emp" class="text-red-500 hover:text-red-700 text-xs font-medium">Delete</button>
               </div></td>
             </tr>
-            <tr v-if="filteredEmployees.length===0"><td colspan="9" class="px-4 py-8 text-center text-gray-400">No employees</td></tr>
+            <tr v-if="filteredEmployees.length===0"><td colspan="10" class="px-4 py-8 text-center text-gray-400">No employees</td></tr>
           </tbody>
         </table>
       </div>
@@ -267,7 +293,7 @@ export default {
           <datalist id="dept-list"><option v-for="d in departments" :key="d" :value="d"/></datalist>
         </div>
         <div class="grid grid-cols-2 gap-4">
-          <div><label class="block text-xs font-medium text-gray-500 mb-1">Monthly Salary (EUR) *</label><input v-model="form.salary_eur" type="number" step="0.01" min="0" :class="INPUT"/></div>
+          <div><label class="block text-xs font-medium text-gray-500 mb-1">Monthly Salary ({{ currency }}) *</label><input v-model="form.salary_eur" type="number" step="0.01" min="0" :class="INPUT"/></div>
           <div><label class="block text-xs font-medium text-gray-500 mb-1">Tax % (employer)</label><input v-model.number="form.tax_pct" type="number" step="0.1" min="0" :class="INPUT"/></div>
         </div>
         <div class="grid grid-cols-2 gap-4">

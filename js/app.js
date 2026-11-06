@@ -1,6 +1,6 @@
 import { hasCredentials, query } from './db.js';
 import { checkSchema, getSettings, ensureSchemaUpgrades } from './schema.js';
-import { currentMonth, addMonths } from './utils.js';
+import { currentMonth, addMonths, setReportingCurrency } from './utils.js';
 
 import Sidebar from '../components/Sidebar.js';
 import KpiCard from '../components/KpiCard.js';
@@ -19,6 +19,7 @@ import ProfitLossView from './views/ProfitLoss.js';
 import CashFlowView from './views/CashFlow.js';
 import ScenariosView from './views/Scenarios.js';
 import UpcomingChargesView from './views/UpcomingCharges.js';
+import BankStatementsView from './views/BankStatements.js';
 import AssistantPanel from '../components/AssistantPanel.js';
 import InlineEdit from '../components/InlineEdit.js';
 import SettingsView from './views/Settings.js';
@@ -32,6 +33,7 @@ const routes = [
   { path: '/payroll', component: PayrollView },
   { path: '/pnl', component: ProfitLossView },
   { path: '/cashflow', component: CashFlowView },
+  { path: '/statements', component: BankStatementsView },
   { path: '/scenarios', component: ScenariosView },
   { path: '/settings', component: SettingsView },
 ];
@@ -115,6 +117,7 @@ const app = Vue.createApp({
     const loadSettings = async () => {
       try {
         settings.value = await getSettings();
+        setReportingCurrency(settings.value?.currency);
       } catch {
         settings.value = null;
       }
