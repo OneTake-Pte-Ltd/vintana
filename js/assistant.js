@@ -1,14 +1,51 @@
-// Assistant: reads what the current page shows and talks to Claude through the Vintana relay
-// (edge-scripts/assistant-relay.ts). The relay holds the Anthropic API key; the browser only proves it
-// has a valid database token.
+// Assistant: reads what the current page shows and talks to a model through the Vintana relay
+// (edge-scripts/assistant-relay.ts): Claude, or any OpenAI-compatible API. The relay holds the API keys; the
+// browser only proves it has a valid database token.
 
-export const ASSISTANT_MODELS = [
-  { id: 'claude-opus-5-5', label: 'Claude Opus 5.5 (default)' },
-  { id: 'claude-sonnet-5-5', label: 'Claude Sonnet 5.5 (faster, cheaper)' },
-  { id: 'claude-haiku-5-5', label: 'Claude Haiku 5.5 (fastest, cheapest)' },
+export const PROVIDERS = [
+  { id: 'claude', label: 'Claude (Anthropic)' },
+  { id: 'openai', label: 'OpenAI-compatible' },
 ];
 export const DEFAULT_MODEL = 'claude-opus-5-5';
 export const DEFAULT_RELAY_URL = 'https://assistant.vintana.onetake.ai';
+
+// Provider and model chosen in Settings. The Claude model and the OpenAI-compatible model are kept apart, so
+// switching provider back and forth keeps both.
+export function assistantChoice(settings) {
+  const provider = settings?.assistant_provider === 'openai' ? 'openai' : 'claude';
+  const model = provider === 'openai' ? (settings?.assistant_openai_model || '') : (settings?.assistant_model || DEFAULT_MODEL);
+  return { provider, model };
+}
+
+const relayBase = url => (url || DEFAULT_RELAY_URL).replace(/\/+$/, '');
+
+async function relayError(resp) {
+  let body = {};
+  try { body = await resp.json(); } catch { /* not JSON */ }
+  const code = body.error || `HTTP_${resp.status}`;
+  // The relay's own message is the more precise one for these (it names the provider, or quotes its error)
+  const serverFirst = ['UPSTREAM', 'NOT_CONFIGURED', 'BAD_REQUEST'].includes(code) && body.message;
+  return new AssistantError(code, serverFirst || RELAY_ERRORS[code] || body.message || `The relay answered with an error (${resp.status}).`);
+}
+
+// Which providers the relay has keys for: { claude: bool, openai: { configured, host } }
+export async function relayHealth(relayUrl) {
+  const resp = await fetch(relayBase(relayUrl) + '/health');
+  if (!resp.ok) throw await relayError(resp);
+  return (await resp.json()).providers || { claude: true, openai: { configured: false, host: null } };
+}
+
+// The provider's own model list, through the relay: [{ id, name }]
+export async function fetchModels({ relayUrl, token, provider }) {
+  let resp;
+  try {
+    resp = await fetch(`${relayBase(relayUrl)}/v1/models?provider=${encodeURIComponent(provider)}`, { headers: { Authorization: `Bearer ${token}` } });
+  } catch {
+    throw new AssistantError('NETWORK', `Could not reach the relay at ${relayBase(relayUrl)}. Check the address and your connection.`);
+  }
+  if (!resp.ok) throw await relayError(resp);
+  return (await resp.json()).models || [];
+}
 
 // Large enough for a 24-month P&L; anything beyond is cut and the panel says so
 const MAX_SNAPSHOT_CHARS = 400000;
@@ -87,8 +124,8 @@ export async function sha256Hex(text) {
 
 const RELAY_ERRORS = {
   UNAUTHORIZED: 'The relay does not recognise this database token. In Settings > Assistant, show the token fingerprint and add it to the relay secrets.',
-  NOT_CONFIGURED: 'The relay is missing its secrets (Anthropic API key or token fingerprints).',
-  MODEL_NOT_ALLOWED: 'The relay does not allow this model. Pick another one in Settings > Assistant.',
+  NOT_CONFIGURED: 'The relay is missing its secrets for this provider (API key, endpoint or token fingerprints).',
+  MODEL_NOT_ALLOWED: 'No model is chosen, or the relay does not accept this one. Pick a model in Settings > Assistant.',
   BAD_REQUEST: 'The relay refused the request.',
   TOO_LARGE: 'Too much data to send in one request. For a page, narrow the date range; for a statement, the PDF is too large.',
   ORIGIN_NOT_ALLOWED: 'The relay does not accept requests from this address.',
@@ -101,28 +138,24 @@ export class AssistantError extends Error {
 // Sends the conversation and streams the answer. Returns the complete assistant content blocks (thinking blocks
 // included, unchanged, so they can be sent back on the next turn) plus the stop reason.
 // `path` and `body` let other relay routes (bank statements) reuse the same streaming.
-export async function streamChat({ relayUrl, token, model, system, messages, onText, signal, path = '/v1/chat', body = null }) {
+// The answer arrives in Anthropic's event format whatever the provider: the relay translates the others.
+export async function streamChat({ relayUrl, token, provider = 'claude', model, system, messages, onText, signal, path = '/v1/chat', body = null }) {
   let resp;
   try {
-    resp = await fetch(relayUrl.replace(/\/+$/, '') + path, {
+    resp = await fetch(relayBase(relayUrl) + path, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-      body: JSON.stringify(body || { model, system, messages }),
+      body: JSON.stringify(body || { provider, model, system, messages }),
       signal,
     });
   } catch (e) {
     if (e.name === 'AbortError') throw e;
-    throw new AssistantError('NETWORK', `Could not reach the relay at ${relayUrl}. Check the address in Settings > Assistant and your connection.`);
+    throw new AssistantError('NETWORK', `Could not reach the relay at ${relayBase(relayUrl)}. Check the address in Settings > Assistant and your connection.`);
   }
-  if (!resp.ok) {
-    let body = {};
-    try { body = await resp.json(); } catch { /* not JSON */ }
-    const code = body.error || `HTTP_${resp.status}`;
-    throw new AssistantError(code, RELAY_ERRORS[code] || body.message || `The relay answered with an error (${resp.status}).`);
-  }
+  if (!resp.ok) throw await relayError(resp);
 
   const blocks = [];
-  let stopReason = null, stopDetails = null, servedBy = model;
+  let stopReason = null, stopDetails = null, servedBy = model || body?.model || null;
   const textSoFar = () => blocks.filter(b => b?.type === 'text').map(b => b.text).join('');
 
   const handle = ev => {
@@ -143,7 +176,7 @@ export async function streamChat({ relayUrl, token, model, system, messages, onT
         if (ev.delta?.stop_details) stopDetails = ev.delta.stop_details;
         break;
       case 'error':
-        throw new AssistantError('UPSTREAM', ev.error?.message || 'Claude stopped with an error.');
+        throw new AssistantError('UPSTREAM', ev.error?.message || 'The model stopped with an error.');
     }
   };
 

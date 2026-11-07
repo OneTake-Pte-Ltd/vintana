@@ -19,6 +19,8 @@ const DDL = [
     assistant_model   TEXT DEFAULT 'claude-opus-5-5',
     company_context   TEXT,
     payroll_pay_day   INTEGER,
+    assistant_provider TEXT DEFAULT 'claude',
+    assistant_openai_model TEXT,
     created_at        TEXT DEFAULT (datetime('now')),
     updated_at        TEXT DEFAULT (datetime('now'))
   )`,
@@ -177,6 +179,7 @@ const DDL = [
     closing_balance   INTEGER,
     transaction_count INTEGER NOT NULL DEFAULT 0,
     discrepancies     TEXT DEFAULT '[]',
+    read_by           TEXT,
     created_at        TEXT DEFAULT (datetime('now'))
   )`,
 
@@ -247,6 +250,11 @@ const ADDED_COLUMNS = {
     assistant_model: "TEXT DEFAULT 'claude-opus-5-5'",
     company_context: 'TEXT',
     payroll_pay_day: 'INTEGER',
+    assistant_provider: "TEXT DEFAULT 'claude'",
+    assistant_openai_model: 'TEXT',
+  },
+  statement_imports: {
+    read_by: 'TEXT',
   },
   expense_items: {
     subcategory_id: 'INTEGER REFERENCES expense_subcategories(id)',
@@ -353,7 +361,8 @@ export async function getSettings() {
 
 export async function updateSettings(fields) {
   const allowed = ['company_name', 'currency', 'fiscal_year_start', 'actuals_through', 'dept_mapping',
-    'assistant_relay_url', 'assistant_model', 'company_context', 'payroll_pay_day'];
+    'assistant_relay_url', 'assistant_model', 'company_context', 'payroll_pay_day',
+    'assistant_provider', 'assistant_openai_model'];
   const sets = [];
   const args = [];
   for (const key of allowed) {

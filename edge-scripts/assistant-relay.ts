@@ -1,15 +1,22 @@
 /**
  * Vintana Assistant relay: BunnyCDN Edge Script
  *
- * The Vintana app runs entirely in the browser, so it can't hold the Anthropic API key. This script holds it,
- * checks that the caller has a Vintana database token, and streams Claude's answer back.
+ * The Vintana app runs entirely in the browser, so it can't hold API keys. This script holds them, checks that the
+ * caller has a Vintana database token, and streams the model's answer back. Two providers:
+ *   claude  Anthropic's API
+ *   openai  any OpenAI-compatible API (OpenRouter, DeepInfra, Together, a vLLM server...). Its answer stream is
+ *           translated into Anthropic's event format, so the app reads both the same way.
  *
  * DEPLOYMENT: Bunny script 101199 at https://assistant.vintana.onetake.ai. Deployed by
  *   .github/workflows/deploy-assistant-relay.yml on every change to this file pushed to main.
  *   The app reads the relay address from the settings table (Settings > Assistant).
  *
  * SECRETS (Bunny dashboard):
- *   ANTHROPIC_API_KEY    required
+ *   ANTHROPIC_API_KEY       for the claude provider
+ *   OPENAI_COMPAT_BASE_URL  for the openai provider: the API base, e.g. https://openrouter.ai/api/v1
+ *   OPENAI_COMPAT_API_KEY   for the openai provider. Kept with the URL on purpose: if the app could choose the
+ *                           address, anyone with a database token could send the key to their own server.
+ *   At least one provider must be set up.
  *   DB_TOKEN_RW_SHA256   SHA-256 (hex) of the read-write Turso token   } at least one; Settings > Assistant >
  *   DB_TOKEN_RO_SHA256   SHA-256 (hex) of the read-only Turso token    } "Show my token's fingerprint" gives it
  *   ALLOWED_ORIGINS      optional, comma-separated, replaces the default https://vintana.onetake.ai
@@ -18,19 +25,24 @@
  *   When a Turso token is rotated, replace its fingerprint here too, or the assistant stops answering.
  *
  * ENDPOINTS:
- *   GET  /health   {"ok": true}
+ *   GET  /health   {"ok": true, "providers": {"claude": bool, "openai": {"configured": bool, "host": string|null}}}
+ *   GET  /v1/models?provider=claude|openai   Authorization: Bearer <database token>
+ *                  The provider's model list: {"models": [{"id", "name"}]}
  *   POST /v1/chat  Authorization: Bearer <database token>
- *                  body {"model": "...", "system": "...", "messages": [{role, content}, ...]}
+ *                  body {"provider"?: "claude"|"openai" (default claude), "model": "...", "system": "...",
+ *                  "messages": [{role, content}, ...]}
  *                  The relay sets everything else (max_tokens, thinking, effort, fallbacks): the browser can't use
  *                  it as a general Anthropic proxy. Answers with Claude's event stream (text/event-stream).
  *   POST /v1/statement  Authorization: Bearer <database token>
- *                  body {"model", "pdf": base64 PDF, "context": {accounts, providers, employees, planned_funding,
- *                  categories}, "file_name"}. Reads one bank statement; the relay sets the instructions and the JSON
- *                  output format. Up to 32 MB. Answers with Claude's event stream; the text is the JSON.
+ *                  body {"provider"?, "model", "context": {accounts, providers, employees, planned_funding,
+ *                  categories}, "file_name"} and the statement: for claude "pdf" (base64 PDF); for openai "markdown"
+ *                  (the PDF's text, converted in the browser) and/or "pages" (JPEG data URLs of pages without text).
+ *                  Reads one bank statement; the relay sets the instructions and the JSON output format. Up to 32 MB.
+ *                  Answers with an event stream in Anthropic's format; the text is the JSON.
  *
  * ERRORS (JSON {"error": CODE, "message"?}):
  *   400 BAD_REQUEST, 400 MODEL_NOT_ALLOWED, 401 UNAUTHORIZED, 403 ORIGIN_NOT_ALLOWED, 405 METHOD_NOT_ALLOWED,
- *   413 TOO_LARGE, 500 NOT_CONFIGURED, 502 UPSTREAM (message carries Anthropic's error text)
+ *   413 TOO_LARGE, 500 NOT_CONFIGURED, 502 UPSTREAM (message carries the provider's error text)
  *
  * PRIVACY: request and answer bodies hold the company's financial data. Never log them, nor the token.
  */
@@ -44,12 +56,33 @@ const MAX_BODY_BYTES    = 3 * 1024 * 1024;
 const MAX_MESSAGES      = 60;
 const MAX_TOKENS        = 16000;
 
-// Models the app may ask for. Opus and Sonnet re-run a declined request on Anthropic's recommended fallback model.
-const MODELS: Record<string, { fallback: boolean }> = {
-  'claude-opus-5-5':   { fallback: true },
-  'claude-sonnet-5-5': { fallback: true },
-  'claude-haiku-5-5':  { fallback: false },
+const ANTHROPIC_MODELS_URL = 'https://api.anthropic.com/v1/models';
+
+// The app picks models from the provider's own list, so the relay only checks the shape of the name
+type Provider = 'claude' | 'openai';
+const MODEL_PATTERN: Record<Provider, RegExp> = {
+  claude: /^claude-[a-z0-9.-]{1,100}$/,
+  openai: /^[\w.:\/@-]{1,200}$/,
 };
+// Claude models other than Haiku re-run a declined request on Anthropic's recommended fallback model
+const usesFallback = (model: string) => !model.includes('haiku');
+
+const openaiBase = () => (process.env.OPENAI_COMPAT_BASE_URL || '').trim().replace(/\/+$/, '');
+const configured = (p: Provider) => p === 'claude'
+  ? !!process.env.ANTHROPIC_API_KEY
+  : !!(openaiBase().startsWith('https://') && process.env.OPENAI_COMPAT_API_KEY);
+const hostOf = (url: string) => { try { return new URL(url).host; } catch { return null; } };
+
+const providerOf = (body: any): Provider | null =>
+  body.provider === undefined || body.provider === 'claude' ? 'claude' : body.provider === 'openai' ? 'openai' : null;
+
+// Checks provider and model; returns an error response, or null when the request can go ahead
+function checkModel(provider: Provider | null, model: unknown, origin: string | null): Response | null {
+  if (!provider) return json({ error: 'BAD_REQUEST', message: 'provider must be claude or openai' }, 400, origin);
+  if (!configured(provider)) return json({ error: 'NOT_CONFIGURED', message: `The ${provider === 'claude' ? 'Claude' : 'OpenAI-compatible'} provider is not set up in the relay secrets.` }, 500, origin);
+  if (typeof model !== 'string' || !MODEL_PATTERN[provider].test(model)) return json({ error: 'MODEL_NOT_ALLOWED' }, 400, origin);
+  return null;
+}
 
 const allowedOrigins = (): string[] => {
   const list = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -193,94 +226,327 @@ For each transaction, choose kind:
 
 confidence: high when the match is certain, medium when likely, low when it is a guess. Use note for anything the person reviewing should know, in one short sentence.`;
 
-const STATEMENT_KEYS = ['model', 'pdf', 'context', 'file_name'];
+const STATEMENT_KEYS = ['provider', 'model', 'pdf', 'markdown', 'pages', 'context', 'file_name'];
+const MAX_PAGE_IMAGES = 40;
 
 async function handleStatement(body: any, origin: string | null) {
-  const model = typeof body.model === 'string' ? body.model : '';
-  if (!MODELS[model]) return json({ error: 'MODEL_NOT_ALLOWED' }, 400, origin);
+  const provider = providerOf(body);
+  const refused = checkModel(provider, body.model, origin);
+  if (refused) return refused;
   if (Object.keys(body).some(k => !STATEMENT_KEYS.includes(k))) return json({ error: 'BAD_REQUEST', message: 'Unknown field' }, 400, origin);
-  if (typeof body.pdf !== 'string' || !/^[A-Za-z0-9+/]+={0,2}$/.test(body.pdf.slice(-200)) || !body.pdf.startsWith('JVBER')) {
-    return json({ error: 'BAD_REQUEST', message: 'pdf must be a base64-encoded PDF' }, 400, origin);
-  }
   const context = JSON.stringify(body.context ?? {});
   if (context.length > CONTEXT_MAX_CHARS) return json({ error: 'TOO_LARGE' }, 413, origin);
+  const contextBlock = `<vintana_context>\n${context}\n</vintana_context>`;
 
-  return forward(model, {
-    max_tokens: STATEMENT_MAX_TOKENS,
-    output_config: { effort: 'medium', format: { type: 'json_schema', schema: STATEMENT_SCHEMA } },
-    system: STATEMENT_SYSTEM,
-    messages: [{
-      role: 'user',
-      content: [
-        { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: body.pdf } },
-        { type: 'text', text: `${STATEMENT_INSTRUCTIONS}\n\n<vintana_context>\n${context}\n</vintana_context>` },
-      ],
-    }],
-  }, origin);
+  if (provider === 'claude') {
+    if (typeof body.pdf !== 'string' || !/^[A-Za-z0-9+/]+={0,2}$/.test(body.pdf.slice(-200)) || !body.pdf.startsWith('JVBER')) {
+      return json({ error: 'BAD_REQUEST', message: 'pdf must be a base64-encoded PDF' }, 400, origin);
+    }
+    return forwardClaude(body.model, {
+      max_tokens: STATEMENT_MAX_TOKENS,
+      output_config: { effort: 'medium', format: { type: 'json_schema', schema: STATEMENT_SCHEMA } },
+      system: STATEMENT_SYSTEM,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: body.pdf } },
+          { type: 'text', text: `${STATEMENT_INSTRUCTIONS}\n\n${contextBlock}` },
+        ],
+      }],
+    }, origin);
+  }
+
+  // OpenAI-compatible models get the statement as text (converted from the PDF in the browser) and, for pages
+  // without a text layer, as images
+  const markdown = typeof body.markdown === 'string' ? body.markdown : '';
+  const pages = body.pages ?? [];
+  if (!Array.isArray(pages) || pages.length > MAX_PAGE_IMAGES
+      || pages.some((p: unknown) => typeof p !== 'string' || !/^data:image\/(jpeg|png);base64,/.test(p))) {
+    return json({ error: 'BAD_REQUEST', message: `pages must be up to ${MAX_PAGE_IMAGES} JPEG or PNG data URLs` }, 400, origin);
+  }
+  if (!markdown.trim() && !pages.length) return json({ error: 'BAD_REQUEST', message: 'The statement has no text and no page images' }, 400, origin);
+
+  const instructions = STATEMENT_INSTRUCTIONS.replace('Read the attached bank statement',
+    'Read the bank statement below. Its text was taken from the PDF: <statement> holds it page by page, with " | " between columns' +
+    (pages.length ? '; pages without text follow as images' : ''));
+  const text = `${instructions}\n\n${contextBlock}\n\n<statement>\n${markdown}\n</statement>`;
+  const content = pages.length
+    ? [{ type: 'text', text }, ...pages.map((url: string) => ({ type: 'image_url', image_url: { url } }))]
+    : text;
+  const messages = [{ role: 'system', content: STATEMENT_SYSTEM }, { role: 'user', content }];
+
+  // Structured output where the provider supports it; otherwise plain JSON mode with the format in the prompt
+  const schemaInPrompt = `\n\nAnswer with one JSON object only, following this JSON Schema:\n${JSON.stringify(STATEMENT_SCHEMA)}`;
+  return forwardOpenAI(body.model, { max_tokens: STATEMENT_MAX_TOKENS, messages,
+    response_format: { type: 'json_schema', json_schema: { name: 'bank_statement', schema: STATEMENT_SCHEMA, strict: true } } }, origin,
+    () => ({ max_tokens: STATEMENT_MAX_TOKENS, response_format: { type: 'json_object' },
+      messages: [messages[0], { role: 'user', content: Array.isArray(content)
+        ? [{ type: 'text', text: text + schemaInPrompt }, ...content.slice(1)] : text + schemaInPrompt }] }));
 }
 
 // --- Shared ----------------------------------------------------------------------------------------------------
 
-async function forward(model: string, request: Record<string, unknown>, origin: string | null) {
-  const headers: Record<string, string> = {
-    'Content-Type':      'application/json',
-    'x-api-key':         process.env.ANTHROPIC_API_KEY as string,
-    'anthropic-version': ANTHROPIC_VERSION,
+const streamHeaders = (origin: string | null) => ({
+  'Content-Type':  'text/event-stream; charset=utf-8',
+  'Cache-Control': 'no-store',
+  ...corsHeaders(origin),
+});
+
+async function errorMessage(upstream: Response, who: string): Promise<string> {
+  let message = `${who} answered with HTTP ${upstream.status}.`;
+  try {
+    const body = await upstream.json();
+    message = body?.error?.message || (typeof body?.error === 'string' ? body.error : '') || body?.message || message;
+  } catch { /* not JSON */ }
+  return message;
+}
+
+const anthropicHeaders = (): Record<string, string> => ({
+  'Content-Type':      'application/json',
+  'x-api-key':         process.env.ANTHROPIC_API_KEY as string,
+  'anthropic-version': ANTHROPIC_VERSION,
+});
+
+async function forwardClaude(model: string, request: Record<string, unknown>, origin: string | null) {
+  const send = (fallback: boolean) => {
+    const headers = anthropicHeaders();
+    const payload: Record<string, unknown> = { model, stream: true, thinking: { type: 'adaptive' }, ...request };
+    if (fallback) {
+      headers['anthropic-beta'] = 'server-side-fallback-2026-07-01';
+      payload.fallbacks = 'default';
+    }
+    return fetch(ANTHROPIC_URL, { method: 'POST', headers, body: JSON.stringify(payload) });
   };
-  const payload: Record<string, unknown> = { model, stream: true, thinking: { type: 'adaptive' }, ...request };
-  if (MODELS[model].fallback) {
-    headers['anthropic-beta'] = 'server-side-fallback-2026-07-01';
-    payload.fallbacks = 'default';
-  }
 
   let upstream: Response;
   try {
-    upstream = await fetch(ANTHROPIC_URL, { method: 'POST', headers, body: JSON.stringify(payload) });
+    upstream = await send(usesFallback(model));
+    // A model that doesn't support server-side fallback: try once without it
+    if (upstream.status === 400 && usesFallback(model)) {
+      const message = await errorMessage(upstream.clone(), 'Claude');
+      if (/fallback/i.test(message)) upstream = await send(false);
+    }
   } catch (e) {
     console.log(`Anthropic fetch failed: ${e}`);
     return json({ error: 'UPSTREAM', message: 'Claude could not be reached. Try again in a moment.' }, 502, origin);
   }
 
   if (!upstream.ok || !upstream.body) {
-    let message = `Claude answered with HTTP ${upstream.status}.`;
-    try { message = (await upstream.json())?.error?.message || message; } catch { /* not JSON */ }
     console.log(`Anthropic error ${upstream.status} for model ${model}`);
-    return json({ error: 'UPSTREAM', message }, 502, origin);
+    return json({ error: 'UPSTREAM', message: await errorMessage(upstream, 'Claude') }, 502, origin);
+  }
+  return new Response(upstream.body, { status: 200, headers: streamHeaders(origin) });
+}
+
+// `retry` builds a second request to send if the provider refuses the first one with HTTP 400
+async function forwardOpenAI(model: string, request: Record<string, unknown>, origin: string | null,
+                             retry?: () => Record<string, unknown>) {
+  const send = (req: Record<string, unknown>) => fetch(`${openaiBase()}/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.OPENAI_COMPAT_API_KEY}` },
+    body: JSON.stringify({ model, stream: true, ...req }),
+  });
+
+  let upstream: Response;
+  try {
+    upstream = await send(request);
+    if (upstream.status === 400 && retry) upstream = await send(retry());
+  } catch (e) {
+    console.log(`OpenAI-compatible fetch failed: ${e}`);
+    return json({ error: 'UPSTREAM', message: `The model provider (${hostOf(openaiBase())}) could not be reached. Try again in a moment.` }, 502, origin);
   }
 
-  return new Response(upstream.body, {
-    status: 200,
-    headers: {
-      'Content-Type':  'text/event-stream; charset=utf-8',
-      'Cache-Control': 'no-store',
-      ...corsHeaders(origin),
+  if (!upstream.ok || !upstream.body) {
+    console.log(`OpenAI-compatible error ${upstream.status} for model ${model}`);
+    return json({ error: 'UPSTREAM', message: await errorMessage(upstream, 'The model provider') }, 502, origin);
+  }
+  return new Response(upstream.body.pipeThrough(translateOpenAIStream(model)), { status: 200, headers: streamHeaders(origin) });
+}
+
+// Conversation in Anthropic's shape (what the app keeps) to OpenAI's chat messages. Only text is carried over:
+// thinking blocks belong to Claude and mean nothing to another model.
+function toOpenAIMessages(system: string | undefined, messages: { role: string; content: any }[]) {
+  const out: { role: string; content: string }[] = [];
+  if (system) out.push({ role: 'system', content: system });
+  for (const m of messages) {
+    const content = typeof m.content === 'string' ? m.content
+      : m.content.filter((b: any) => b?.type === 'text' && typeof b.text === 'string').map((b: any) => b.text).join('');
+    out.push({ role: m.role, content });
+  }
+  return out;
+}
+
+// Length of the longest end of `text` that could be the start of `tag` (a tag split between two chunks)
+function partialTag(text: string, tag: string): number {
+  for (let k = Math.min(tag.length - 1, text.length); k > 0; k--) if (text.endsWith(tag.slice(0, k))) return k;
+  return 0;
+}
+
+const STOP_REASONS: Record<string, string> = {
+  stop: 'end_turn', length: 'max_tokens', content_filter: 'refusal', tool_calls: 'end_turn', function_call: 'end_turn',
+};
+
+// Rewrites an OpenAI chat completion stream as Anthropic's message events (message_start, one text block,
+// message_delta with the stop reason, message_stop). Reasoning is dropped: reasoning / reasoning_content fields,
+// and <think>...</think> spans that some models (Qwen) write into the answer itself.
+export function translateOpenAIStream(requestedModel: string): TransformStream<Uint8Array, Uint8Array> {
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  let buf = '', started = false, stopReason: string | null = null, finished = false;
+  let inThink = false, carry = '', emitted = false;
+
+  const emit = (ctrl: TransformStreamDefaultController<Uint8Array>, ev: Record<string, unknown>) =>
+    ctrl.enqueue(encoder.encode(`event: ${ev.type}\ndata: ${JSON.stringify(ev)}\n\n`));
+
+  const start = (ctrl: TransformStreamDefaultController<Uint8Array>, model?: string) => {
+    if (started) return;
+    started = true;
+    emit(ctrl, { type: 'message_start', message: { model: model || requestedModel, role: 'assistant', content: [] } });
+    emit(ctrl, { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+  };
+
+  const text = (ctrl: TransformStreamDefaultController<Uint8Array>, out: string) => {
+    if (!emitted) out = out.replace(/^\s+/, ''); // the space left after a removed <think> block
+    if (!out) return;
+    emitted = true;
+    emit(ctrl, { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: out } });
+  };
+
+  // Removes <think>...</think>, including tags split across chunks
+  const visible = (chunk: string): string => {
+    let rest = carry + chunk, out = '';
+    carry = '';
+    for (;;) {
+      const tag = inThink ? '</think>' : '<think>';
+      const i = rest.indexOf(tag);
+      if (i === -1) {
+        const k = partialTag(rest, tag);
+        if (!inThink) out += rest.slice(0, rest.length - k);
+        carry = rest.slice(rest.length - k);
+        return out;
+      }
+      if (!inThink) out += rest.slice(0, i);
+      rest = rest.slice(i + tag.length);
+      inThink = !inThink;
+    }
+  };
+
+  const finish = (ctrl: TransformStreamDefaultController<Uint8Array>) => {
+    if (finished) return;
+    finished = true;
+    if (!started) return; // nothing came back: the app reports the answer as cut off
+    if (!inThink && carry) { text(ctrl, carry); carry = ''; }
+    emit(ctrl, { type: 'content_block_stop', index: 0 });
+    // Without a finish reason the stream was cut: no message_delta, so the app says so
+    if (stopReason) emit(ctrl, { type: 'message_delta', delta: { stop_reason: stopReason } });
+    emit(ctrl, { type: 'message_stop' });
+  };
+
+  const line = (ctrl: TransformStreamDefaultController<Uint8Array>, l: string) => {
+    if (!l.startsWith('data:')) return; // comments (": keep-alive"), event names, blank lines
+    const data = l.slice(5).trim();
+    if (!data) return;
+    if (data === '[DONE]') { finish(ctrl); return; }
+    let chunk: any;
+    try { chunk = JSON.parse(data); } catch { return; }
+    if (chunk.error) {
+      emit(ctrl, { type: 'error', error: { message: chunk.error.message || String(chunk.error) } });
+      finished = true;
+      return;
+    }
+    start(ctrl, chunk.model);
+    const choice = chunk.choices?.[0];
+    if (!choice) return;
+    const content = choice.delta?.content ?? choice.message?.content;
+    if (typeof content === 'string' && content) text(ctrl, visible(content));
+    if (choice.finish_reason) stopReason = STOP_REASONS[choice.finish_reason] || 'end_turn';
+  };
+
+  return new TransformStream({
+    transform(chunk, ctrl) {
+      buf += decoder.decode(chunk, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf('\n')) !== -1) {
+        line(ctrl, buf.slice(0, nl).replace(/\r$/, ''));
+        buf = buf.slice(nl + 1);
+      }
+    },
+    flush(ctrl) {
+      if (buf) line(ctrl, buf.replace(/\r$/, ''));
+      finish(ctrl);
     },
   });
 }
 
+// --- Model lists -------------------------------------------------------------------------------------------------
+
+async function handleModels(provider: Provider | null, origin: string | null) {
+  if (!provider) return json({ error: 'BAD_REQUEST', message: 'provider must be claude or openai' }, 400, origin);
+  if (!configured(provider)) return json({ error: 'NOT_CONFIGURED' }, 500, origin);
+  const who = provider === 'claude' ? 'Claude' : 'The model provider';
+  try {
+    const models: { id: string; name: string }[] = [];
+    if (provider === 'claude') {
+      let after = '';
+      for (let page = 0; page < 10; page++) {
+        const r = await fetch(`${ANTHROPIC_MODELS_URL}?limit=1000${after ? `&after_id=${encodeURIComponent(after)}` : ''}`, { headers: anthropicHeaders() });
+        if (!r.ok) return json({ error: 'UPSTREAM', message: await errorMessage(r, who) }, 502, origin);
+        const body = await r.json();
+        for (const m of body.data || []) models.push({ id: m.id, name: m.display_name || m.id });
+        if (!body.has_more || !body.last_id) break;
+        after = body.last_id;
+      }
+    } else {
+      const r = await fetch(`${openaiBase()}/models`, { headers: { Authorization: `Bearer ${process.env.OPENAI_COMPAT_API_KEY}` } });
+      if (!r.ok) return json({ error: 'UPSTREAM', message: await errorMessage(r, who) }, 502, origin);
+      const body = await r.json();
+      for (const m of (Array.isArray(body) ? body : body.data) || []) {
+        if (typeof m?.id === 'string') models.push({ id: m.id, name: typeof m.name === 'string' && m.name ? m.name : m.id });
+      }
+    }
+    const usable = models.filter(m => MODEL_PATTERN[provider].test(m.id));
+    if (provider === 'openai') usable.sort((a, b) => a.name.localeCompare(b.name));
+    return json({ models: usable }, 200, origin);
+  } catch (e) {
+    console.log(`Model list failed for ${provider}: ${e}`);
+    return json({ error: 'UPSTREAM', message: `${who} could not be reached. Try again in a moment.` }, 502, origin);
+  }
+}
+
+// --- Routing -----------------------------------------------------------------------------------------------------
+
 const ROUTES: Record<string, number> = { '/v1/chat': MAX_BODY_BYTES, '/v1/statement': STATEMENT_MAX_BYTES };
 
-BunnySDK.net.http.serve(async (req: Request) => {
+export async function handle(req: Request): Promise<Response> {
   const origin = req.headers.get('origin');
-  const path = new URL(req.url).pathname;
+  const url = new URL(req.url);
+  const path = url.pathname;
 
   if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: corsHeaders(origin) });
-  if (req.method === 'GET' && path === '/health') return json({ ok: true }, 200, origin);
-  if (req.method !== 'POST' || !(path in ROUTES)) return json({ error: 'METHOD_NOT_ALLOWED' }, 405, origin);
+  if (req.method === 'GET' && path === '/health') {
+    return json({ ok: true, providers: {
+      claude: configured('claude'),
+      openai: { configured: configured('openai'), host: configured('openai') ? hostOf(openaiBase()) : null },
+    } }, 200, origin);
+  }
+  const isModels = req.method === 'GET' && path === '/v1/models';
+  if (!isModels && (req.method !== 'POST' || !(path in ROUTES))) return json({ error: 'METHOD_NOT_ALLOWED' }, 405, origin);
 
   // Browsers send Origin; a call without one comes from a script, which the token check still covers
   if (origin && !allowedOrigins().includes(origin)) {
-    console.log(`Refused POST ${path}: ORIGIN_NOT_ALLOWED (origin ${origin})`);
+    console.log(`Refused ${req.method} ${path}: ORIGIN_NOT_ALLOWED (origin ${origin})`);
     return json({ error: 'ORIGIN_NOT_ALLOWED' }, 403, origin);
   }
-  if (!process.env.ANTHROPIC_API_KEY || !(process.env.DB_TOKEN_RW_SHA256 || process.env.DB_TOKEN_RO_SHA256)) {
-    console.log(`Refused POST ${path}: NOT_CONFIGURED`);
+  if (!(process.env.DB_TOKEN_RW_SHA256 || process.env.DB_TOKEN_RO_SHA256) || !(configured('claude') || configured('openai'))) {
+    console.log(`Refused ${req.method} ${path}: NOT_CONFIGURED`);
     return json({ error: 'NOT_CONFIGURED' }, 500, origin);
   }
   if (!(await isAuthorised(req))) {
-    console.log(`Refused POST ${path}: UNAUTHORIZED (origin ${origin || '-'})`);
+    console.log(`Refused ${req.method} ${path}: UNAUTHORIZED (origin ${origin || '-'})`);
     return json({ error: 'UNAUTHORIZED' }, 401, origin);
   }
+
+  if (isModels) return handleModels(providerOf({ provider: url.searchParams.get('provider') ?? undefined }), origin);
 
   const declared = Number(req.headers.get('content-length') || 0);
   if (declared > ROUTES[path]) return json({ error: 'TOO_LARGE' }, 413, origin);
@@ -292,15 +558,21 @@ BunnySDK.net.http.serve(async (req: Request) => {
 
   if (path === '/v1/statement') return handleStatement(body, origin);
 
-  const model = typeof body.model === 'string' ? body.model : '';
-  if (!MODELS[model]) return json({ error: 'MODEL_NOT_ALLOWED' }, 400, origin);
+  const provider = providerOf(body);
+  const refused = checkModel(provider, body.model, origin);
+  if (refused) return refused;
   if (body.system !== undefined && typeof body.system !== 'string') return json({ error: 'BAD_REQUEST', message: 'system must be a string' }, 400, origin);
   if (!validMessages(body.messages)) return json({ error: 'BAD_REQUEST', message: 'messages must alternate user/assistant and end with user' }, 400, origin);
 
-  return forward(model, {
+  if (provider === 'openai') {
+    return forwardOpenAI(body.model, { max_tokens: MAX_TOKENS, messages: toOpenAIMessages(body.system, body.messages) }, origin);
+  }
+  return forwardClaude(body.model, {
     max_tokens: MAX_TOKENS,
     output_config: { effort: 'medium' },
     system: body.system || undefined,
     messages: body.messages,
   }, origin);
-});
+}
+
+BunnySDK.net.http.serve(handle);

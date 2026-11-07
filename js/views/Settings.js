@@ -1,7 +1,7 @@
 import { clearCredentials, getCredentials, query, execute, batch } from '../db.js';
 import { CURRENCIES, monthLabelFull } from '../utils.js';
 import { loadCategoryLookups, categoryOptions } from '../expenses.js';
-import { ASSISTANT_MODELS, DEFAULT_MODEL, DEFAULT_RELAY_URL, sha256Hex } from '../assistant.js';
+import { PROVIDERS, DEFAULT_MODEL, DEFAULT_RELAY_URL, sha256Hex, fetchModels, relayHealth } from '../assistant.js';
 import { getSettings, updateSettings, resetAllData } from '../schema.js';
 import { DEFAULT_DEPT_MAPPING } from '../payroll.js';
 import {
@@ -97,6 +97,8 @@ export default {
         if (settings.value) {
           settings.value.assistant_relay_url ||= DEFAULT_RELAY_URL;
           settings.value.assistant_model ||= DEFAULT_MODEL;
+          settings.value.assistant_provider = settings.value.assistant_provider === 'openai' ? 'openai' : 'claude';
+          settings.value.assistant_openai_model ||= null;
           settings.value.company_context ||= '';
           settings.value.payroll_pay_day ??= null;
         }
@@ -117,7 +119,7 @@ export default {
     // --- Sections whose changes wait for Save: Company, Department mapping, Assistant ---
     const SECTION_TITLES = { company: 'Company', mapping: 'Department mapping', assistant: 'Assistant' };
     const COMPANY_FIELDS = ['company_name', 'currency', 'fiscal_year_start', 'actuals_through', 'payroll_pay_day'];
-    const ASSISTANT_FIELDS = ['company_context', 'assistant_model', 'assistant_relay_url'];
+    const ASSISTANT_FIELDS = ['company_context', 'assistant_provider', 'assistant_model', 'assistant_openai_model', 'assistant_relay_url'];
     const pick = (obj, keys) => Object.fromEntries(keys.map(k => [k, obj?.[k] ?? null]));
     const SNAPSHOTS = {
       company: () => JSON.stringify(pick(settings.value, COMPANY_FIELDS)),
@@ -155,7 +157,9 @@ export default {
         } else if (id === 'assistant') {
           const fields = {
             assistant_relay_url: (settings.value.assistant_relay_url || '').trim() || DEFAULT_RELAY_URL,
+            assistant_provider: settings.value.assistant_provider,
             assistant_model: settings.value.assistant_model || DEFAULT_MODEL,
+            assistant_openai_model: settings.value.assistant_openai_model || null,
             company_context: settings.value.company_context || null,
           };
           await updateSettings(fields);
@@ -204,6 +208,7 @@ export default {
     const toggleSection = async (id) => {
       if (!(await confirmLeave())) return;
       openSection.value = openSection.value === id ? null : id;
+      if (openSection.value === 'assistant') loadHealth();
       await nextTick();
       if (window.lucide) lucide.createIcons();
       if (openSection.value) document.getElementById('settings-' + id)?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
@@ -224,7 +229,8 @@ export default {
       const company = savedValues('company') || {};
       const mapping = savedValues('mapping') || [];
       const assistant = savedValues('assistant') || {};
-      const model = ASSISTANT_MODELS.find(m => m.id === assistant.assistant_model)?.label || assistant.assistant_model;
+      const providerLabel = PROVIDERS.find(p => p.id === assistant.assistant_provider)?.label || PROVIDERS[0].label;
+      const model = (assistant.assistant_provider === 'openai' ? assistant.assistant_openai_model : assistant.assistant_model) || 'no model chosen';
       const nSubs = subcategories.value.length;
       return {
         company: [company.company_name, company.currency,
@@ -233,7 +239,7 @@ export default {
         bank: bankAccounts.value.map(a => `${a.bank_name} (${a.currency})`).join(', '),
         subcategories: `${nSubs} sub-categor${nSubs === 1 ? 'y' : 'ies'} across ${expCategories.value.length} categories`,
         mapping: `${mapping.length} department${mapping.length === 1 ? '' : 's'} mapped to P&L categories`,
-        assistant: [model, assistant.company_context ? 'Company description set' : 'No company description yet'].filter(Boolean).join(' · '),
+        assistant: [providerLabel, model, assistant.company_context ? 'Company description set' : 'No company description yet'].filter(Boolean).join(' · '),
         csv: 'Import or export expenses and payroll as CSV files',
         data: 'Back up or restore all data as a JSON file',
         danger: 'Reset all data or disconnect this browser',
@@ -471,6 +477,56 @@ export default {
       } catch (e) { toast('Delete failed: ' + e.message, 'error'); }
     };
 
+    // --- Assistant provider and model. The model list comes from the provider itself, only when asked for ---
+    const modelField = computed(() => settings.value?.assistant_provider === 'openai' ? 'assistant_openai_model' : 'assistant_model');
+    const currentModel = computed(() => settings.value?.[modelField.value] || '');
+    const picker = ref({ open: false, loading: false, error: '', models: [], filter: '', provider: '' });
+    const providerHealth = ref(null);   // what the relay reports it has keys for
+    const healthError = ref('');
+
+    const loadHealth = async () => {
+      healthError.value = '';
+      try { providerHealth.value = await relayHealth(settings.value?.assistant_relay_url); }
+      catch (e) { providerHealth.value = null; healthError.value = e.message; }
+    };
+    const providerReady = computed(() => {
+      const h = providerHealth.value;
+      if (!h) return null; // unknown
+      return settings.value?.assistant_provider === 'openai' ? !!h.openai?.configured : !!h.claude;
+    });
+
+    const setProvider = (id) => {
+      if (settings.value.assistant_provider === id) return;
+      settings.value.assistant_provider = id;
+      picker.value = { open: false, loading: false, error: '', models: [], filter: '', provider: '' };
+    };
+    const openPicker = async () => {
+      const provider = settings.value.assistant_provider;
+      picker.value = { open: true, loading: true, error: '', models: [], filter: '', provider };
+      try {
+        const models = await fetchModels({ relayUrl: settings.value.assistant_relay_url, token: getCredentials().token, provider });
+        if (picker.value.provider === provider) picker.value.models = models;
+      } catch (e) {
+        if (picker.value.provider === provider) picker.value.error = e.message;
+      } finally {
+        if (picker.value.provider === provider) picker.value.loading = false;
+      }
+    };
+    const closePicker = () => { picker.value.open = false; };
+    const pickModel = (id) => {
+      settings.value[modelField.value] = id;
+      picker.value.open = false;
+    };
+    const filteredModels = computed(() => {
+      const f = picker.value.filter.trim().toLowerCase();
+      return f ? picker.value.models.filter(m => m.id.toLowerCase().includes(f) || m.name.toLowerCase().includes(f)) : picker.value.models;
+    });
+    // Only known once the list has been fetched: the chosen model is no longer offered
+    const modelMissing = computed(() => picker.value.provider === settings.value?.assistant_provider && !picker.value.loading
+      && !picker.value.error && picker.value.models.length > 0 && !!currentModel.value
+      && !picker.value.models.some(m => m.id === currentModel.value));
+    const currentModelName = computed(() => picker.value.models.find(m => m.id === currentModel.value)?.name || '');
+
     // Fingerprint of this browser's database token, for the relay secrets. Only computed when asked for.
     const tokenHash = ref('');
     const showTokenHash = async () => {
@@ -495,7 +551,9 @@ export default {
       exportData, importData,
       csvKinds, csvBusy, csvErrors, exportCsv, importCsv,
       showResetConfirm, doReset, disconnect,
-      CURRENCIES, ASSISTANT_MODELS, tokenHash,
+      CURRENCIES, PROVIDERS, tokenHash,
+      currentModel, currentModelName, picker, providerHealth, healthError, providerReady, setProvider,
+      openPicker, closePicker, pickModel, filteredModels, modelMissing,
       bankAccounts, accountUsage, newAccount, currencyOptions, addAccount, updateAccount, deleteAccount, showTokenHash, copyTokenHash,
       expCategories, subcategories, subUsage, newSub, expCategoryOptions, subsOf,
       addSubcategory, updateSubcategory, deleteSubcategory,
@@ -616,7 +674,7 @@ export default {
         </settings-section>
 
         <settings-section id="assistant" title="Assistant" :summary="summaries.assistant" :open="openSection === 'assistant'" :dirty="isDirty('assistant')" @toggle="toggleSection('assistant')">
-          <p class="text-sm text-gray-500 mb-4">The Ask button on every page sends what the page shows, the description below and this month's cash, burn and revenue to Claude through the relay.</p>
+          <p class="text-sm text-gray-500 mb-4">The Ask button on every page sends what the page shows, the description below and this month's cash, burn and revenue to the chosen model through the relay. Bank statements are read by the same model.</p>
           <div class="space-y-4">
             <div>
               <label for="company-context" class="block text-sm font-medium text-gray-700 mb-1">About the company</label>
@@ -624,17 +682,59 @@ export default {
                 placeholder="What the company sells, to whom, stage and funding, team, goals for this year, anything the assistant should keep in mind..."
                 class="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"></textarea>
             </div>
-            <div class="grid grid-cols-2 gap-4">
-              <div>
-                <label for="assistant-model" class="block text-sm font-medium text-gray-700 mb-1">Model</label>
-                <select id="assistant-model" v-model="settings.assistant_model" class="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500">
-                  <option v-for="m in ASSISTANT_MODELS" :key="m.id" :value="m.id">{{ m.label }}</option>
-                </select>
+
+            <div>
+              <div id="provider-label" class="text-sm font-medium text-gray-700 mb-1">Provider</div>
+              <div role="radiogroup" aria-labelledby="provider-label" class="inline-flex rounded-lg border border-gray-200 p-0.5 bg-gray-50">
+                <button v-for="p in PROVIDERS" :key="p.id" type="button" role="radio" :aria-checked="settings.assistant_provider === p.id" @click="setProvider(p.id)"
+                  :class="['px-3 py-1.5 text-sm rounded-md transition-colors', settings.assistant_provider === p.id ? 'bg-white shadow-sm text-gray-900 font-medium' : 'text-gray-500 hover:text-gray-800']">{{ p.label }}</button>
               </div>
-              <div>
-                <label for="relay-url" class="block text-sm font-medium text-gray-700 mb-1">Relay address</label>
-                <input id="relay-url" v-model="settings.assistant_relay_url" type="url" class="w-full px-3 py-2 text-sm font-mono border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+              <p v-if="settings.assistant_provider === 'openai' && providerHealth?.openai?.host" class="text-xs text-gray-500 mt-1.5">Endpoint: <span class="font-mono">{{ providerHealth.openai.host }}</span> (set in the relay secrets)</p>
+              <p v-if="providerReady === false" class="text-xs text-amber-700 mt-1.5">
+                <template v-if="settings.assistant_provider === 'openai'">Not set up yet: add <code>OPENAI_COMPAT_BASE_URL</code> and <code>OPENAI_COMPAT_API_KEY</code> to the relay secrets in the Bunny dashboard.</template>
+                <template v-else>Not set up yet: add <code>ANTHROPIC_API_KEY</code> to the relay secrets in the Bunny dashboard.</template>
+              </p>
+              <p v-if="healthError" class="text-xs text-red-600 mt-1.5">Could not check the relay: {{ healthError }}</p>
+            </div>
+
+            <div>
+              <div class="text-sm font-medium text-gray-700 mb-1">Model</div>
+              <div class="flex items-center gap-3 flex-wrap">
+                <span v-if="currentModel" class="font-mono text-sm text-gray-900 break-all">{{ currentModel }}</span>
+                <span v-else class="text-sm text-amber-700">No model chosen yet</span>
+                <span v-if="currentModelName && currentModelName !== currentModel" class="text-sm text-gray-500">{{ currentModelName }}</span>
+                <button v-if="!picker.open" type="button" @click="openPicker" class="px-3 py-1.5 text-sm border border-gray-200 rounded-lg hover:bg-gray-50">Change model</button>
               </div>
+              <p v-if="modelMissing" class="text-xs text-amber-700 mt-1">No longer offered by the provider. Pick another model.</p>
+              <div v-if="picker.open" class="mt-3 border border-gray-200 rounded-lg">
+                <div class="flex items-center gap-2 p-2 border-b border-gray-100">
+                  <input v-model="picker.filter" type="search" placeholder="Filter models" aria-label="Filter models" :disabled="picker.loading || !!picker.error"
+                    class="flex-1 px-3 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+                  <button type="button" @click="closePicker" class="px-3 py-1.5 text-sm text-gray-500 hover:text-gray-900">Cancel</button>
+                </div>
+                <div v-if="picker.loading" class="flex items-center gap-2 px-3 py-4 text-sm text-gray-500">
+                  <span class="inline-block w-2 h-2 rounded-full bg-indigo-400 animate-pulse"></span> Getting the list of models from the provider...
+                </div>
+                <div v-else-if="picker.error" class="px-3 py-3 text-sm">
+                  <p class="text-red-600">{{ picker.error }}</p>
+                  <button type="button" @click="openPicker" class="mt-2 px-3 py-1.5 text-sm border border-gray-200 rounded-lg hover:bg-gray-50">Retry</button>
+                </div>
+                <ul v-else role="listbox" aria-label="Models" class="max-h-64 overflow-y-auto py-1">
+                  <li v-for="m in filteredModels" :key="m.id">
+                    <button type="button" role="option" :aria-selected="m.id === currentModel" @click="pickModel(m.id)"
+                      :class="['w-full text-left px-3 py-1.5 text-sm hover:bg-indigo-50', m.id === currentModel ? 'bg-indigo-50' : '']">
+                      <span class="text-gray-900">{{ m.name }}</span>
+                      <span v-if="m.name !== m.id" class="ml-2 font-mono text-xs text-gray-400">{{ m.id }}</span>
+                    </button>
+                  </li>
+                  <li v-if="!filteredModels.length" class="px-3 py-3 text-sm text-gray-400">{{ picker.models.length ? 'No model matches this filter' : 'The provider returned no models' }}</li>
+                </ul>
+              </div>
+            </div>
+
+            <div>
+              <label for="relay-url" class="block text-sm font-medium text-gray-700 mb-1">Relay address</label>
+              <input id="relay-url" v-model="settings.assistant_relay_url" type="url" class="w-full px-3 py-2 text-sm font-mono border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
             </div>
             <div class="pt-2 border-t border-gray-100">
               <div class="text-sm font-medium text-gray-700 mb-1">Relay access</div>

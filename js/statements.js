@@ -1,11 +1,12 @@
-// Bank statements: read a PDF with Claude (through the relay), prepare it for review, save what the person
+// Bank statements: read a PDF with the assistant's model (through the relay), prepare it for review, save what the person
 // confirms, then check the result for discrepancies.
 //
 // Two views of the same money are kept apart:
 // - Cash actuals: every statement line, on the date it hit the bank (bank_transactions). Cash Flow uses these.
 // - Run rate: monthly values of each expense (expense_values). A charge from a statement replaces the monthly
 //   values of the months it covers (1 for monthly, 3 for quarterly, 12 for annual), marked as actual.
-// The PDF itself is never stored: the browser reads it, sends it once, and drops it.
+// The PDF itself is never stored: the browser reads it, sends it once, and drops it. Claude reads the PDF itself;
+// for an OpenAI-compatible model the browser first turns it into text (and images of scanned pages), see pdfText.js.
 
 import { query, execute, batch, getCredentials } from './db.js';
 import { getBaseScenarioId } from './schema.js';
@@ -14,7 +15,8 @@ import {
 } from './utils.js';
 import { loadScenarioEmployees, employeeCost, isEmployedIn } from './payroll.js';
 import { loadAccounts, getRate, convert, monthEnd, accountLabel } from './bank.js';
-import { streamChat, AssistantError, DEFAULT_MODEL, DEFAULT_RELAY_URL } from './assistant.js';
+import { streamChat, AssistantError, assistantChoice, DEFAULT_RELAY_URL } from './assistant.js';
+import { pdfToMarkdown } from './pdfText.js';
 
 export const MAX_PDF_BYTES = 24 * 1024 * 1024; // base64 adds a third; the request limit is 32 MB
 
@@ -44,7 +46,7 @@ function fileToBase64(file) {
   });
 }
 
-// What Claude needs to match lines to Vintana's own records
+// What the model needs to match lines to Vintana's own records
 export async function buildContext() {
   const baseId = await baseScenarioId();
   const [accounts, providers, categories, emp, planned] = await Promise.all([
@@ -65,33 +67,56 @@ export async function buildContext() {
   };
 }
 
-// Sends one PDF to the relay and returns the parsed statement. The file contents are dropped when this returns.
+// Sends one statement to the relay and returns the parsed statement, with read_by set to the model that read it.
+// The file contents are dropped when this returns.
 export async function readStatement(file, settings, context, signal) {
   if (file.size > MAX_PDF_BYTES) throw new Error(`This PDF is ${(file.size / 1048576).toFixed(1)} MB; the limit is 24 MB. Split it into smaller statements.`);
-  let pdf = await fileToBase64(file);
-  if (!pdf.startsWith('JVBER')) throw new Error('This file is not a PDF.');
+  const { provider, model } = assistantChoice(settings);
+  if (!model) throw new AssistantError('MODEL_NOT_ALLOWED', 'No model is chosen for the assistant. Pick one in Settings > Assistant.');
+  let body;
+  if (provider === 'openai') {
+    if (!(await isPdf(file))) throw new Error('This file is not a PDF.');
+    const { markdown, pages } = await pdfToMarkdown(file);
+    body = { provider, model, markdown, pages, context, file_name: file.name };
+  } else {
+    const pdf = await fileToBase64(file);
+    if (!pdf.startsWith('JVBER')) throw new Error('This file is not a PDF.');
+    body = { provider, model, pdf, context, file_name: file.name };
+  }
   let result;
   try {
     result = await streamChat({
       relayUrl: settings?.assistant_relay_url || DEFAULT_RELAY_URL,
       token: getCredentials().token,
       path: '/v1/statement',
-      body: { model: settings?.assistant_model || DEFAULT_MODEL, pdf, context, file_name: file.name },
+      body,
       signal,
     });
   } finally {
-    pdf = null; // nothing keeps the PDF after this point
+    body = null; // nothing keeps the statement after this point
   }
-  if (result.stopReason === 'refusal') throw new AssistantError('REFUSED', 'Claude declined to read this statement.');
+  if (result.stopReason === 'refusal') throw new AssistantError('REFUSED', 'The model declined to read this statement.');
   if (result.stopReason === 'max_tokens') throw new AssistantError('TOO_LONG', 'This statement has too many lines to read in one go. Split it into shorter periods.');
+  let parsed;
   try {
-    return JSON.parse(result.text);
+    // Some models wrap JSON in a code fence even when asked not to
+    parsed = JSON.parse(result.text.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, ''));
   } catch {
-    throw new AssistantError('BAD_OUTPUT', 'The statement could not be read into a usable format. Try again.');
+    throw new AssistantError('BAD_OUTPUT', 'The statement could not be read into a usable format. Try again, or pick another model in Settings > Assistant.');
   }
+  if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.transactions)) {
+    throw new AssistantError('BAD_OUTPUT', 'The model\'s reading of this statement is incomplete. Try again, or pick another model in Settings > Assistant.');
+  }
+  parsed.read_by = result.servedBy || model;
+  return parsed;
 }
 
-// Turns Claude's reading into a review: one row per line, with the decision pre-filled from Claude's matches
+async function isPdf(file) {
+  const head = new Uint8Array(await file.slice(0, 5).arrayBuffer());
+  return String.fromCharCode(...head) === '%PDF-';
+}
+
+// Turns the model's reading into a review: one row per line, with the decision pre-filled from its matches
 export async function prepareReview(parsed, fileName) {
   const accounts = await loadAccounts();
   const account = accounts.find(a => a.id === parsed.matched_account_id)
@@ -130,7 +155,7 @@ export async function prepareReview(parsed, fileName) {
   });
 
   return {
-    fileName, parsed, accountId: account?.id ?? null,
+    fileName, parsed, readBy: parsed.read_by || null, accountId: account?.id ?? null,
     currency: parsed.currency, periodStart: parsed.period_start, periodEnd: parsed.period_end,
     opening: toCents(parsed.opening_balance), closing: toCents(parsed.closing_balance),
     monthEnds: (parsed.month_end_balances || []).map(b => ({ month: b.month, balance: toCents(b.balance) })),
@@ -138,7 +163,7 @@ export async function prepareReview(parsed, fileName) {
   };
 }
 
-// A row needs a decision when Claude wasn't sure or couldn't link it
+// A row needs a decision when the model wasn't sure or couldn't link it
 export function needsDecision(row) {
   if (row.kind === 'ignore' || row.kind === 'transfer') return false;
   if (row.confidence === 'low') return true;
@@ -203,12 +228,12 @@ export async function saveReview(review, { replaceImportIds = [] } = {}) {
 
   for (const id of replaceImportIds) await deleteImport(id);
 
-  // Notes Claude made while reading (unreadable parts and the like) are kept with the import's discrepancies
+  // Notes the model made while reading (unreadable parts and the like) are kept with the import's discrepancies
   const readingNotes = review.warnings.map(w => ({ severity: 'warning', title: 'Note from reading the statement', detail: w, fromReading: true }));
   const res = await execute(`INSERT INTO statement_imports (account_id, file_name, period_start, period_end, currency,
-    opening_balance, closing_balance, transaction_count, discrepancies) VALUES (?,?,?,?,?,?,?,?,?)`,
+    opening_balance, closing_balance, transaction_count, discrepancies, read_by) VALUES (?,?,?,?,?,?,?,?,?,?)`,
     [account.id, review.fileName, review.periodStart, review.periodEnd, account.currency, review.opening, review.closing,
-     review.rows.length, JSON.stringify(readingNotes)]);
+     review.rows.length, JSON.stringify(readingNotes), review.readBy]);
   const importId = res.lastInsertRowid;
 
   // New providers (one per distinct name, so two lines from the same new supplier share it)
