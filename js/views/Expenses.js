@@ -266,9 +266,9 @@ export default {
   },
   template: `
     <div class="space-y-6">
-      <div class="flex items-center justify-between">
+      <div class="flex items-center justify-between flex-wrap gap-3">
         <h1 class="text-2xl font-bold text-gray-900">Expenses</h1>
-        <div class="flex items-center gap-4">
+        <div class="flex items-center flex-wrap gap-3 md:gap-4">
           <button @click="includePayroll = !includePayroll" role="switch" :aria-checked="includePayroll" class="flex items-center gap-2 text-sm text-gray-600">
             <span :class="['relative inline-flex h-5 w-9 rounded-full transition-colors', includePayroll ? 'bg-indigo-600' : 'bg-gray-200']">
               <span :class="['absolute top-0.5 left-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform', includePayroll ? 'translate-x-4' : '']"></span>
@@ -304,8 +304,8 @@ export default {
         </div>
 
         <!-- Search -->
-        <div class="flex items-center gap-4">
-          <div class="relative flex-1">
+        <div class="flex flex-wrap items-center gap-3 md:gap-4">
+          <div class="relative flex-1 min-w-[12rem]">
             <i data-lucide="search" class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400"></i>
             <input v-model="search" type="text" placeholder="Search expenses..." class="w-full pl-10 pr-4 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
           </div>
@@ -329,7 +329,7 @@ export default {
               <tr class="bg-gray-50 border-b border-gray-200">
                 <th v-for="col in columns" :key="col.key"
                   :aria-sort="sortCol === col.key ? (sortAsc ? 'ascending' : 'descending') : 'none'"
-                  :class="['px-4 py-3 text-xs font-medium uppercase', col.align === 'right' ? 'text-right' : 'text-left']">
+                  :class="['px-4 py-3 text-xs font-medium uppercase', col.align === 'right' ? 'text-right' : 'text-left', col === columns[0] ? 'sticky-col bg-gray-50' : '']">
                   <button @click="toggleSort(col.key)" class="inline-flex items-center gap-1 uppercase select-none hover:text-gray-700"
                     :class="sortCol === col.key ? 'text-gray-900' : 'text-gray-500'">
                     {{ col.label }}<span class="w-3 text-[10px]">{{ sortCol === col.key ? (sortAsc ? '\u25B2' : '\u25BC') : '' }}</span>
@@ -340,7 +340,7 @@ export default {
             </thead>
             <tbody class="divide-y divide-gray-100">
               <tr v-for="row in filtered" :key="row.id" class="hover:bg-gray-50">
-                <td class="px-4 py-3 min-w-[15rem]">
+                <td class="sticky-col px-4 py-3 min-w-[10rem] md:min-w-[15rem]">
                   <div class="flex items-center gap-2 flex-wrap">
                     <inline-edit :value="row.name" @save="v => saveField(row, 'name', v)">
                       <span class="font-medium text-gray-900" :title="row.charge_label ? 'Charge label: ' + row.charge_label : ''">{{ row.name }}</span>

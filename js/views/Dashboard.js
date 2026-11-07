@@ -228,24 +228,26 @@ export default {
     <!-- Row 4: Upcoming Renewals -->
     <div class="bg-white rounded-xl border border-gray-200 p-5">
       <h2 class="text-sm font-semibold text-gray-700 mb-4">Upcoming Renewals</h2>
-      <table v-if="renewals.length > 0" class="w-full text-sm">
+      <div v-if="renewals.length > 0" class="overflow-x-auto">
+      <table class="w-full text-sm whitespace-nowrap">
         <thead>
           <tr class="text-left text-xs text-gray-500 uppercase tracking-wider border-b border-gray-100">
-            <th class="pb-2 font-medium">Name</th>
-            <th class="pb-2 font-medium">Company</th>
+            <th class="sticky-col pb-2 pr-3 font-medium">Name</th>
+            <th class="pb-2 pr-3 font-medium">Company</th>
             <th class="pb-2 font-medium text-right">Amount</th>
             <th class="pb-2 font-medium text-right">Renewal Date</th>
           </tr>
         </thead>
         <tbody>
           <tr v-for="r in renewals" :key="r.name + r.renewal_day" class="border-b border-gray-50">
-            <td class="py-2.5 text-gray-900">{{ r.name }}</td>
+            <td class="sticky-col py-2.5 pr-3 text-gray-900">{{ r.name }}</td>
             <td class="py-2.5 text-gray-500">{{ r.company || '—' }}</td>
             <td class="py-2.5 text-right text-gray-900">{{ formatCents(r.amount) }}</td>
             <td class="py-2.5 text-right text-gray-500">{{ formatRenewalDate(r) }}</td>
           </tr>
         </tbody>
       </table>
+      </div>
       <p v-else class="text-sm text-gray-400 py-4 text-center">No renewals in the next 30 days</p>
     </div>
   </div>

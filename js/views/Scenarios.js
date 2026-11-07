@@ -190,7 +190,7 @@ export default {
 
   template: `
 <div class="max-w-7xl mx-auto">
-  <div class="flex items-center justify-between mb-6">
+  <div class="flex items-center justify-between flex-wrap gap-3 mb-6">
     <h1 class="text-2xl font-bold text-gray-900">Scenarios</h1>
     <button @click="openCreate" class="px-4 py-2 bg-indigo-600 text-white text-sm font-medium rounded-lg hover:bg-indigo-700 transition-colors">+ Create Scenario</button>
   </div>
@@ -285,9 +285,9 @@ export default {
 
   <!-- Compare Modal -->
   <div v-if="showCompare" class="fixed inset-0 bg-black/50 flex items-center justify-center z-50 overflow-y-auto py-8">
-    <div class="bg-white rounded-xl p-6 max-w-3xl w-full mx-4">
+    <div class="bg-white rounded-xl p-4 md:p-6 max-w-3xl w-full mx-4">
       <h3 class="text-lg font-semibold text-gray-900 mb-4">Compare Scenarios</h3>
-      <div class="flex items-end gap-4 mb-6">
+      <div class="flex flex-wrap items-end gap-4 mb-6">
         <div class="flex-1">
           <label class="block text-sm font-medium text-gray-700 mb-1">Scenario A</label>
           <select v-model="compareA" class="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500">
@@ -325,7 +325,7 @@ export default {
         <table class="w-full text-sm">
           <thead>
             <tr class="text-left text-xs text-gray-500 uppercase tracking-wider border-b border-gray-200">
-              <th class="pb-2 font-medium">Line Item</th>
+              <th class="sticky-col pb-2 pr-3 font-medium">Line Item</th>
               <th class="pb-2 font-medium text-right">{{ scenarioName(compareA) }}</th>
               <th class="pb-2 font-medium text-right">{{ scenarioName(compareB) }}</th>
               <th class="pb-2 font-medium text-right">Delta</th>
@@ -334,7 +334,7 @@ export default {
           </thead>
           <tbody>
             <tr v-for="row in PNL_ROWS" :key="row.key" class="border-b border-gray-100" :class="row.computed ? 'font-semibold bg-gray-50' : ''">
-              <td class="py-2.5 text-gray-900">{{ row.label }}</td>
+              <td class="sticky-col py-2.5 pr-3 text-gray-900 whitespace-nowrap" :class="row.computed ? 'bg-gray-50' : ''">{{ row.label }}</td>
               <td class="py-2.5 text-right text-gray-900">{{ formatCents(compareData.a[row.key]) }}</td>
               <td class="py-2.5 text-right text-gray-900">{{ formatCents(compareData.b[row.key]) }}</td>
               <td class="py-2.5 text-right" :class="delta(row.key) > 0 ? 'text-emerald-600' : delta(row.key) < 0 ? 'text-red-600' : 'text-gray-400'">{{ formatCents(delta(row.key)) }}</td>

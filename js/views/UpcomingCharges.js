@@ -216,7 +216,7 @@ export default {
               <tr class="bg-gray-50 border-b border-gray-200">
                 <th v-for="col in columns" :key="col.key"
                   :aria-sort="sortCol === col.key ? (sortAsc ? 'ascending' : 'descending') : 'none'"
-                  :class="['px-4 py-3 text-xs font-medium uppercase', col.right ? 'text-right' : 'text-left']">
+                  :class="['px-4 py-3 text-xs font-medium uppercase', col.right ? 'text-right' : 'text-left', col === columns[0] ? 'sticky-col bg-gray-50' : '']">
                   <button @click="toggleSort(col.key)" class="inline-flex items-center gap-1 uppercase select-none hover:text-gray-700"
                     :class="sortCol === col.key ? 'text-gray-900' : 'text-gray-500'">
                     {{ col.label }}<span class="w-3 text-[10px]">{{ sortCol === col.key ? (sortAsc ? '\\u25B2' : '\\u25BC') : '' }}</span>
@@ -233,11 +233,11 @@ export default {
                   <td></td>
                 </tr>
                 <tr v-for="c in g.charges" :key="c.key" @click="open(c)" class="border-b border-gray-100 hover:bg-gray-50 cursor-pointer">
-                  <td class="px-4 py-3 whitespace-nowrap">
+                  <td class="sticky-col px-4 py-3 whitespace-nowrap">
                     <div class="text-gray-900">{{ fmtDate(c.date) }}</div>
                     <div class="text-xs text-gray-400">{{ daysAway(c.date) }}</div>
                   </td>
-                  <td class="px-4 py-3 min-w-[15rem]">
+                  <td class="px-4 py-3 min-w-[10rem] md:min-w-[15rem]">
                     <div class="flex items-center gap-2 flex-wrap">
                       <inline-edit v-if="c.kind === 'expense'" :value="c.name" @save="v => saveField(c, 'name', v)">
                         <span class="font-medium text-gray-900" :title="c.charge_label ? 'Charge label: ' + c.charge_label : ''">{{ c.name }}</span>

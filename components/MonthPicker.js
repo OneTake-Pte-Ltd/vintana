@@ -20,7 +20,7 @@ export default {
         type="month"
         :value="modelValue"
         @input="onInput"
-        class="px-3 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent bg-white"
+        class="w-[9.5rem] md:w-auto px-2 md:px-3 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent bg-white"
       />
     </div>
   `,

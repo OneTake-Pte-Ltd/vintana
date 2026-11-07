@@ -344,7 +344,7 @@ export default {
         <table class="w-full text-xs whitespace-nowrap">
           <thead>
             <tr class="border-b border-gray-200 text-gray-500 uppercase tracking-wider">
-              <th class="text-left py-2 px-4 font-medium sticky left-0 bg-white z-10 min-w-[200px]"></th>
+              <th class="text-left py-2 px-4 font-medium sticky left-0 whitespace-normal md:whitespace-nowrap w-36 md:w-auto bg-white z-10 min-w-[9rem] md:min-w-[200px]"></th>
               <th v-for="r in waterfall" :key="r.month" class="text-right py-2 px-3 font-medium min-w-[100px]">
                 <div>{{ monthLabel(r.month) }}</div>
                 <div :class="['text-[10px] normal-case tracking-normal font-normal', r.isBank ? 'text-emerald-600' : 'text-gray-400']" :title="r.isBank ? 'From bank statements' : 'From the plan'">{{ r.isBank ? 'Bank' : 'Plan' }}</div>
@@ -353,35 +353,35 @@ export default {
           </thead>
           <tbody class="text-sm">
             <tr class="border-b border-gray-100">
-              <td class="py-2 px-4 font-medium text-gray-700 sticky left-0 bg-white z-10">Starting Cash Balance</td>
+              <td class="py-2 px-4 font-medium text-gray-700 sticky left-0 whitespace-normal md:whitespace-nowrap w-36 md:w-auto bg-white z-10">Starting Cash Balance</td>
               <td v-for="r in waterfall" :key="r.month" class="text-right py-2 px-3 text-gray-900">{{ formatCents(r.startCash) }}</td>
             </tr>
             <tr class="border-b border-gray-100 bg-emerald-50/50">
-              <td class="py-2 px-4 text-emerald-700 sticky left-0 bg-emerald-50/50 z-10" title="Plan months: MRR from Revenue. Bank months: money received from customers.">+ Revenue (received in bank months)</td>
+              <td class="py-2 px-4 text-emerald-700 sticky left-0 whitespace-normal md:whitespace-nowrap w-36 md:w-auto bg-emerald-50/50 z-10" title="Plan months: MRR from Revenue. Bank months: money received from customers.">+ Revenue (received in bank months)</td>
               <td v-for="r in waterfall" :key="r.month" class="text-right py-2 px-3 text-emerald-700">{{ formatCents(r.revenue) }}</td>
             </tr>
             <tr class="border-b border-gray-100 bg-emerald-50/50">
-              <td class="py-2 px-4 text-emerald-700 sticky left-0 bg-emerald-50/50 z-10">+ Funding / Cash Injections</td>
+              <td class="py-2 px-4 text-emerald-700 sticky left-0 whitespace-normal md:whitespace-nowrap w-36 md:w-auto bg-emerald-50/50 z-10">+ Funding / Cash Injections</td>
               <td v-for="r in waterfall" :key="r.month" class="text-right py-2 px-3 text-emerald-700">{{ formatCents(r.funding) }}</td>
             </tr>
             <tr v-if="waterfall.some(r => r.otherIn)" class="border-b border-gray-100 bg-emerald-50/50">
-              <td class="py-2 px-4 text-emerald-700 sticky left-0 bg-emerald-50/50 z-10">+ Interest, tax refunds, other</td>
+              <td class="py-2 px-4 text-emerald-700 sticky left-0 whitespace-normal md:whitespace-nowrap w-36 md:w-auto bg-emerald-50/50 z-10">+ Interest, tax refunds, other</td>
               <td v-for="r in waterfall" :key="r.month" class="text-right py-2 px-3 text-emerald-700">{{ formatCents(r.otherIn) }}</td>
             </tr>
             <tr v-for="cat in CAT_ROWS" :key="cat.key" class="border-b border-gray-100">
-              <td class="py-2 px-4 text-red-700 sticky left-0 bg-white z-10">- {{ cat.label }}</td>
+              <td class="py-2 px-4 text-red-700 sticky left-0 whitespace-normal md:whitespace-nowrap w-36 md:w-auto bg-white z-10">- {{ cat.label }}</td>
               <td v-for="r in waterfall" :key="r.month" class="text-right py-2 px-3 text-red-700">{{ formatCents(r[cat.key]) }}</td>
             </tr>
             <tr v-if="waterfall.some(r => r.unexplained)" class="border-b border-gray-100">
-              <td class="py-2 px-4 text-gray-500 sticky left-0 bg-white z-10" title="Difference between the bank balances and the flows above: exchange-rate movements between months, or lines not linked">± Exchange rates and unlinked lines</td>
+              <td class="py-2 px-4 text-gray-500 sticky left-0 whitespace-normal md:whitespace-nowrap w-36 md:w-auto bg-white z-10" title="Difference between the bank balances and the flows above: exchange-rate movements between months, or lines not linked">± Exchange rates and unlinked lines</td>
               <td v-for="r in waterfall" :key="r.month" class="text-right py-2 px-3 text-gray-500">{{ r.unexplained ? formatCents(r.unexplained) : '' }}</td>
             </tr>
             <tr class="border-b border-gray-200 bg-gray-50 font-semibold">
-              <td class="py-2.5 px-4 text-gray-900 sticky left-0 bg-gray-50 z-10">Net Cash Flow</td>
+              <td class="py-2.5 px-4 text-gray-900 sticky left-0 whitespace-normal md:whitespace-nowrap w-36 md:w-auto bg-gray-50 z-10">Net Cash Flow</td>
               <td v-for="r in waterfall" :key="r.month" class="text-right py-2.5 px-3" :class="r.net >= 0 ? 'text-emerald-700' : 'text-red-700'">{{ formatCents(r.net) }}</td>
             </tr>
             <tr class="font-bold">
-              <td class="py-2.5 px-4 text-gray-900 sticky left-0 bg-white z-10">Ending Cash Balance</td>
+              <td class="py-2.5 px-4 text-gray-900 sticky left-0 whitespace-normal md:whitespace-nowrap w-36 md:w-auto bg-white z-10">Ending Cash Balance</td>
               <td v-for="r in waterfall" :key="r.month" class="text-right py-2.5 px-3" :class="r.endCash < 0 ? 'text-red-700' : 'text-gray-900'">{{ formatCents(r.endCash) }}</td>
             </tr>
           </tbody>
@@ -398,15 +398,16 @@ export default {
 
     <!-- Funding Events -->
     <div class="bg-white rounded-xl border border-gray-200 p-5">
-      <div class="flex items-center justify-between mb-4">
+      <div class="flex items-center justify-between flex-wrap gap-2 mb-4">
         <h2 class="text-sm font-semibold text-gray-700">Funding Events</h2>
         <button @click="openAdd" class="text-sm text-indigo-600 hover:text-indigo-700 font-medium">+ Add</button>
       </div>
-      <table v-if="fundingEvents.length > 0" class="w-full text-sm">
+      <div v-if="fundingEvents.length > 0" class="overflow-x-auto">
+      <table class="w-full text-sm whitespace-nowrap">
         <thead>
           <tr class="text-left text-xs text-gray-500 uppercase tracking-wider border-b border-gray-100">
-            <th class="pb-2 font-medium">Name</th>
-            <th class="pb-2 font-medium">Month</th>
+            <th class="sticky-col pb-2 pr-3 font-medium">Name</th>
+            <th class="pb-2 pr-3 font-medium">Month</th>
             <th class="pb-2 font-medium text-right">Amount</th>
             <th class="pb-2 font-medium">Notes</th>
             <th class="pb-2 font-medium text-right">Actions</th>
@@ -414,7 +415,7 @@ export default {
         </thead>
         <tbody>
           <tr v-for="ev in fundingEvents" :key="ev.id" class="border-b border-gray-50">
-            <td class="py-2.5 text-gray-900">{{ ev.name }} <span v-if="ev.is_actual" class="ml-1 inline-flex px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 text-xs">Received</span></td>
+            <td class="sticky-col py-2.5 pr-3 text-gray-900">{{ ev.name }} <span v-if="ev.is_actual" class="ml-1 inline-flex px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 text-xs">Received</span></td>
             <td class="py-2.5 text-gray-500">{{ monthLabel(ev.month) }}</td>
             <td class="py-2.5 text-right text-gray-900">{{ formatCents(ev.amount) }}</td>
             <td class="py-2.5 text-gray-500 max-w-[200px] truncate">{{ ev.notes || '—' }}</td>
@@ -425,6 +426,7 @@ export default {
           </tr>
         </tbody>
       </table>
+      </div>
       <p v-else class="text-sm text-gray-400 text-center py-4">No funding events for this scenario</p>
     </div>
 
@@ -440,14 +442,14 @@ export default {
         <table class="text-sm">
           <thead>
             <tr class="text-left text-xs text-gray-500 uppercase tracking-wider border-b border-gray-100">
-              <th class="pb-2 pr-4 font-medium">Month</th>
+              <th class="sticky-col pb-2 pr-4 font-medium">Month</th>
               <th v-for="a in accounts" :key="a.id" class="pb-2 pr-3 font-medium whitespace-nowrap">{{ accountLabel(a) }} ({{ a.currency }})</th>
               <th class="pb-2 font-medium text-right whitespace-nowrap">Total ({{ currency }})</th>
             </tr>
           </thead>
           <tbody>
             <tr v-for="m in months" :key="m" class="border-b border-gray-50">
-              <td class="py-2 pr-4 text-gray-700 whitespace-nowrap">{{ monthLabel(m) }}</td>
+              <td class="sticky-col py-2 pr-4 text-gray-700 whitespace-nowrap">{{ monthLabel(m) }}</td>
               <td v-for="a in accounts" :key="a.id" class="py-2 pr-3">
                 <input type="number" step="0.01"
                   :value="centsToInput(balances[m] && balances[m][a.id])"

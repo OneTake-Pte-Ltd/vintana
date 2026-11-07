@@ -234,7 +234,7 @@ export default {
   },
   template: `
     <div>
-      <div class="flex items-center justify-between mb-6">
+      <div class="flex items-center justify-between flex-wrap gap-3 mb-6">
         <h1 class="text-2xl font-bold text-gray-900">Profit & Loss</h1>
         <div class="flex items-center gap-2 text-sm text-gray-500">
           <span>Sort lines</span>
@@ -258,11 +258,11 @@ export default {
         <table class="min-w-max w-full text-sm border-collapse">
           <thead>
             <tr>
-              <th class="sticky left-0 z-20 bg-gray-50 px-4 py-2.5 text-left font-semibold text-gray-700 border-b border-r border-gray-200 min-w-[220px]">
+              <th class="sticky left-0 z-20 bg-gray-50 px-4 py-2.5 text-left font-semibold text-gray-700 border-b border-r border-gray-200 min-w-[10rem] md:min-w-[220px]">
               </th>
               <th v-for="m in months" :key="m"
                   :class="isForecast(m) ? 'bg-blue-50' : 'bg-gray-50'"
-                  class="px-4 py-2.5 text-right font-medium text-gray-700 border-b border-gray-200 whitespace-nowrap min-w-[120px]">
+                  class="px-4 py-2.5 text-right font-medium text-gray-700 border-b border-gray-200 whitespace-nowrap min-w-[90px] md:min-w-[120px]">
                 <div>{{ monthLabel(m) }}</div>
                 <div v-if="isForecast(m)" class="text-xs font-normal text-blue-500">Forecast</div>
               </th>

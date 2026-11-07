@@ -146,8 +146,8 @@ export default {
     };
   },
   template: `
-    <div class="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" @click.self="emit('close')" @keydown.esc="emit('close')">
-      <div class="bg-white rounded-xl w-full max-w-2xl max-h-[90vh] overflow-y-auto p-6" role="dialog" aria-modal="true">
+    <div class="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-2 md:p-4" @click.self="emit('close')" @keydown.esc="emit('close')">
+      <div class="bg-white rounded-xl w-full max-w-2xl max-h-[95vh] md:max-h-[90vh] overflow-y-auto p-4 md:p-6" role="dialog" aria-modal="true">
         <h2 class="text-lg font-semibold text-gray-900 mb-4">{{ editing ? 'Edit' : 'Add' }} Expense</h2>
         <div v-if="loading && editing" class="text-gray-400 py-8 text-center">Loading...</div>
         <template v-else>

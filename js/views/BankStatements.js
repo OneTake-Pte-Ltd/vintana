@@ -327,16 +327,16 @@ export default {
           <table class="w-full text-sm">
             <thead>
               <tr class="text-left text-xs text-gray-500 uppercase tracking-wider border-b border-gray-100">
-                <th class="px-3 py-2 font-medium">Date</th>
+                <th class="sticky-col px-3 py-2 font-medium">Date</th>
                 <th class="px-3 py-2 font-medium">Bank line</th>
                 <th class="px-3 py-2 font-medium text-right">Amount</th>
                 <th class="px-3 py-2 font-medium">Type</th>
-                <th class="px-3 py-2 font-medium min-w-[16rem]">Linked to</th>
+                <th class="px-3 py-2 font-medium min-w-[12rem] md:min-w-[16rem]">Linked to</th>
               </tr>
             </thead>
             <tbody>
               <tr v-for="r in rowsShown" :key="r.key" :class="['border-b border-gray-50 align-top', r.kind === 'ignore' ? 'opacity-50' : '']">
-                <td class="px-3 py-2 whitespace-nowrap text-gray-600">{{ fmtShort(r.date) }}</td>
+                <td class="sticky-col px-3 py-2 whitespace-nowrap text-gray-600">{{ fmtShort(r.date) }}</td>
                 <td class="px-3 py-2 max-w-[22rem]">
                   <div class="text-gray-900 break-words">{{ r.description }}</div>
                   <div v-if="r.note" class="text-xs text-gray-500 mt-0.5">{{ r.note }}</div>
@@ -406,7 +406,7 @@ export default {
           <table class="w-full text-sm">
             <thead>
               <tr class="text-left text-xs text-gray-500 uppercase tracking-wider border-b border-gray-100">
-                <th class="px-5 py-2 font-medium">Account</th>
+                <th class="sticky-col px-5 py-2 font-medium">Account</th>
                 <th class="px-3 py-2 font-medium">Period</th>
                 <th class="px-3 py-2 font-medium">File</th>
                 <th class="px-3 py-2 font-medium text-right">Lines</th>
@@ -418,7 +418,7 @@ export default {
             <tbody>
               <template v-for="h in history" :key="h.id">
                 <tr class="border-b border-gray-50">
-                  <td class="px-5 py-2.5 text-gray-900 whitespace-nowrap">{{ h.label || h.bank_name || 'Deleted account' }}</td>
+                  <td class="sticky-col px-5 py-2.5 text-gray-900 whitespace-nowrap">{{ h.label || h.bank_name || 'Deleted account' }}</td>
                   <td class="px-3 py-2.5 text-gray-600 whitespace-nowrap">{{ fmtDate(h.period_start) }} to {{ fmtDate(h.period_end) }}</td>
                   <td class="px-3 py-2.5 text-gray-500 max-w-[14rem]">
                     <div class="truncate">{{ h.file_name }}</div>

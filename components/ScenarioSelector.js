@@ -10,7 +10,7 @@ export default {
     return { onChange };
   },
   template: `
-    <div class="flex items-center gap-2">
+    <div class="flex items-center gap-2 flex-shrink-0">
       <i data-lucide="git-branch" class="w-4 h-4 text-gray-400"></i>
       <select
         :value="modelValue"
