@@ -2,7 +2,8 @@
  * Vintana Assistant relay: BunnyCDN Edge Script
  *
  * The Vintana app runs entirely in the browser, so it can't hold API keys. This script holds them, checks that the
- * caller has a Vintana database token, and streams the model's answer back. Two providers:
+ * caller has a Vintana database token, and streams the model's answer back. It also reads MRR from ProfitWell
+ * (/v1/profitwell). Two model providers:
  *   claude  Anthropic's API
  *   openai  any OpenAI-compatible API (OpenRouter, DeepInfra, Together, a vLLM server...). Its answer stream is
  *           translated into Anthropic's event format, so the app reads both the same way.
@@ -16,7 +17,9 @@
  *   OPENAI_COMPAT_BASE_URL  for the openai provider: the API base, e.g. https://openrouter.ai/api/v1
  *   OPENAI_COMPAT_API_KEY   for the openai provider. Kept with the URL on purpose: if the app could choose the
  *                           address, anyone with a database token could send the key to their own server.
- *   At least one provider must be set up.
+ *   At least one provider must be set up for the assistant and statement reading.
+ *   PROFITWELL_API_TOKEN    optional: the ProfitWell *private* API token (ProfitWell > Account Settings >
+ *                           Integrations > ProfitWell API). Needed for /v1/profitwell.
  *   DB_TOKEN_RW_SHA256   SHA-256 (hex) of the read-write Turso token   } at least one; Settings > Assistant >
  *   DB_TOKEN_RO_SHA256   SHA-256 (hex) of the read-only Turso token    } "Show my token's fingerprint" gives it
  *   ALLOWED_ORIGINS      optional, comma-separated, replaces the default https://vintana.onetake.ai
@@ -25,7 +28,8 @@
  *   When a Turso token is rotated, replace its fingerprint here too, or the assistant stops answering.
  *
  * ENDPOINTS:
- *   GET  /health   {"ok": true, "providers": {"claude": bool, "openai": {"configured": bool, "host": string|null}}}
+ *   GET  /health   {"ok": true, "providers": {"claude": bool, "openai": {"configured": bool, "host": string|null}},
+ *                  "profitwell": bool}
  *   GET  /v1/models?provider=claude|openai   Authorization: Bearer <database token>
  *                  The provider's model list: {"models": [{"id", "name"}]}
  *   POST /v1/chat  Authorization: Bearer <database token>
@@ -39,6 +43,12 @@
  *                  (the PDF's text, converted in the browser) and/or "pages" (JPEG data URLs of pages without text).
  *                  Reads one bank statement; the relay sets the instructions and the JSON output format. Up to 32 MB.
  *                  Answers with an event stream in Anthropic's format; the text is the JSON.
+ *
+ *   POST /v1/profitwell  Authorization: Bearer <database token>
+ *                  body {"kind": "plans"} or {"kind": "monthly", "plan_id"?: string, "metrics": [names]}
+ *                  Read-only pass-through to ProfitWell's v2 Metrics API (GET /v2/metrics/plans/ and
+ *                  GET /v2/metrics/monthly/). Only these two calls and a fixed list of metrics are allowed.
+ *                  Answers with ProfitWell's JSON unchanged.
  *
  * ERRORS (JSON {"error": CODE, "message"?}):
  *   400 BAD_REQUEST, 400 MODEL_NOT_ALLOWED, 401 UNAUTHORIZED, 403 ORIGIN_NOT_ALLOWED, 405 METHOD_NOT_ALLOWED,
@@ -513,9 +523,51 @@ async function handleModels(provider: Provider | null, origin: string | null) {
   }
 }
 
+// --- ProfitWell ---------------------------------------------------------------------------------------------------
+
+const PROFITWELL_URL = 'https://api.profitwell.com/v2/metrics';
+// Metrics the app reads, all available per plan. Anything else is refused so the token can't be used more widely.
+const PROFITWELL_METRICS = new Set(['recurring_revenue', 'active_customers', 'new_recurring_revenue', 'churned_recurring_revenue',
+  'existing_recurring_revenue', 'growth_rate']);
+const profitwellConfigured = () => !!(process.env.PROFITWELL_API_TOKEN || '').trim();
+
+async function handleProfitwell(body: any, origin: string | null) {
+  if (!profitwellConfigured()) {
+    return json({ error: 'NOT_CONFIGURED', message: 'PROFITWELL_API_TOKEN is not set in the relay secrets.' }, 500, origin);
+  }
+  let target: string;
+  if (body.kind === 'plans') {
+    target = `${PROFITWELL_URL}/plans/?limit=150`;
+  } else if (body.kind === 'monthly') {
+    const metrics = body.metrics;
+    if (!Array.isArray(metrics) || !metrics.length || !metrics.every((m: unknown) => typeof m === 'string' && PROFITWELL_METRICS.has(m))) {
+      return json({ error: 'BAD_REQUEST', message: 'metrics must list allowed metric names' }, 400, origin);
+    }
+    const q = new URLSearchParams({ metrics: metrics.join(',') });
+    if (body.plan_id !== undefined) {
+      if (typeof body.plan_id !== 'string' || !body.plan_id || body.plan_id.length > 300) {
+        return json({ error: 'BAD_REQUEST', message: 'plan_id must be a non-empty string' }, 400, origin);
+      }
+      q.set('plan_id', body.plan_id);
+    }
+    target = `${PROFITWELL_URL}/monthly/?${q}`;
+  } else {
+    return json({ error: 'BAD_REQUEST', message: 'kind must be "plans" or "monthly"' }, 400, origin);
+  }
+  try {
+    // ProfitWell takes the bare token, without "Bearer"
+    const r = await fetch(target, { headers: { Authorization: process.env.PROFITWELL_API_TOKEN!.trim() } });
+    if (!r.ok) return json({ error: 'UPSTREAM', message: await errorMessage(r, 'ProfitWell') }, 502, origin);
+    return json(await r.json(), 200, origin);
+  } catch (e) {
+    console.log(`ProfitWell request failed: ${e}`);
+    return json({ error: 'UPSTREAM', message: 'ProfitWell could not be reached. Try again in a moment.' }, 502, origin);
+  }
+}
+
 // --- Routing -----------------------------------------------------------------------------------------------------
 
-const ROUTES: Record<string, number> = { '/v1/chat': MAX_BODY_BYTES, '/v1/statement': STATEMENT_MAX_BYTES };
+const ROUTES: Record<string, number> = { '/v1/chat': MAX_BODY_BYTES, '/v1/statement': STATEMENT_MAX_BYTES, '/v1/profitwell': 4096 };
 
 export async function handle(req: Request): Promise<Response> {
   const origin = req.headers.get('origin');
@@ -527,7 +579,7 @@ export async function handle(req: Request): Promise<Response> {
     return json({ ok: true, providers: {
       claude: configured('claude'),
       openai: { configured: configured('openai'), host: configured('openai') ? hostOf(openaiBase()) : null },
-    } }, 200, origin);
+    }, profitwell: profitwellConfigured() }, 200, origin);
   }
   const isModels = req.method === 'GET' && path === '/v1/models';
   if (!isModels && (req.method !== 'POST' || !(path in ROUTES))) return json({ error: 'METHOD_NOT_ALLOWED' }, 405, origin);
@@ -537,7 +589,8 @@ export async function handle(req: Request): Promise<Response> {
     console.log(`Refused ${req.method} ${path}: ORIGIN_NOT_ALLOWED (origin ${origin})`);
     return json({ error: 'ORIGIN_NOT_ALLOWED' }, 403, origin);
   }
-  if (!(process.env.DB_TOKEN_RW_SHA256 || process.env.DB_TOKEN_RO_SHA256) || !(configured('claude') || configured('openai'))) {
+  const servicesReady = path === '/v1/profitwell' ? profitwellConfigured() : (configured('claude') || configured('openai'));
+  if (!(process.env.DB_TOKEN_RW_SHA256 || process.env.DB_TOKEN_RO_SHA256) || !servicesReady) {
     console.log(`Refused ${req.method} ${path}: NOT_CONFIGURED`);
     return json({ error: 'NOT_CONFIGURED' }, 500, origin);
   }
@@ -557,6 +610,7 @@ export async function handle(req: Request): Promise<Response> {
   if (!body || typeof body !== 'object') return json({ error: 'BAD_REQUEST', message: 'Body must be an object' }, 400, origin);
 
   if (path === '/v1/statement') return handleStatement(body, origin);
+  if (path === '/v1/profitwell') return handleProfitwell(body, origin);
 
   const provider = providerOf(body);
   const refused = checkModel(provider, body.model, origin);

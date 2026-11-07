@@ -21,6 +21,9 @@ const DDL = [
     payroll_pay_day   INTEGER,
     assistant_provider TEXT DEFAULT 'claude',
     assistant_openai_model TEXT,
+    profitwell_currency TEXT,
+    profitwell_last_sync TEXT,
+    profitwell_sync_note TEXT,
     created_at        TEXT DEFAULT (datetime('now')),
     updated_at        TEXT DEFAULT (datetime('now'))
   )`,
@@ -209,6 +212,48 @@ const DDL = [
     rate_date TEXT,
     PRIMARY KEY (month, base, quote)
   )`,
+
+  // Revenue comes from ProfitWell. Its plans are grouped into product lines, and lines into families, for display.
+  // Plans without a line belong to the built-in "Unassigned" line (line id 0, not stored).
+  `CREATE TABLE IF NOT EXISTS product_families (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL UNIQUE,
+    sort_order INTEGER NOT NULL DEFAULT 0
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS product_lines (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL UNIQUE,
+    family_id  INTEGER REFERENCES product_families(id) ON DELETE SET NULL,
+    sort_order INTEGER NOT NULL DEFAULT 0
+  )`,
+
+  // ProfitWell decides which plans exist; a sync adds new ones and keeps the line each one was given
+  `CREATE TABLE IF NOT EXISTS pw_plans (
+    plan_id      TEXT PRIMARY KEY,
+    line_id      INTEGER REFERENCES product_lines(id) ON DELETE SET NULL,
+    last_seen_at TEXT
+  )`,
+
+  // ProfitWell's monthly figures per plan, in the reporting currency (cents). Replaced in full by every sync.
+  `CREATE TABLE IF NOT EXISTS pw_mrr (
+    plan_id       TEXT NOT NULL,
+    month         TEXT NOT NULL,
+    mrr           INTEGER NOT NULL DEFAULT 0,
+    customers     INTEGER NOT NULL DEFAULT 0,
+    new_mrr       INTEGER NOT NULL DEFAULT 0,
+    churned_mrr   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (plan_id, month)
+  )`,
+
+  // Planned MRR growth per product line, in % per month. The base scenario holds the defaults; another scenario's
+  // row replaces the base one for that line.
+  `CREATE TABLE IF NOT EXISTS line_growth (
+    line_id     INTEGER NOT NULL,
+    scenario_id INTEGER NOT NULL REFERENCES scenarios(id) ON DELETE CASCADE,
+    rate_pct    REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (line_id, scenario_id)
+  )`,
 ];
 
 const SEED = [
@@ -252,6 +297,9 @@ const ADDED_COLUMNS = {
     payroll_pay_day: 'INTEGER',
     assistant_provider: "TEXT DEFAULT 'claude'",
     assistant_openai_model: 'TEXT',
+    profitwell_currency: 'TEXT',
+    profitwell_last_sync: 'TEXT',
+    profitwell_sync_note: 'TEXT',
   },
   statement_imports: {
     read_by: 'TEXT',
@@ -264,7 +312,8 @@ const ADDED_COLUMNS = {
   },
 };
 
-const ADDED_TABLES = ['expense_subcategories', 'bank_accounts', 'bank_balances', 'statement_imports', 'bank_transactions', 'fx_rates'];
+const ADDED_TABLES = ['expense_subcategories', 'bank_accounts', 'bank_balances', 'statement_imports', 'bank_transactions', 'fx_rates',
+  'product_families', 'product_lines', 'pw_plans', 'pw_mrr', 'line_growth'];
 
 // Changes whenever the lists above change, so new upgrades run once on every database, then never again
 const UPGRADES_SIGNATURE = JSON.stringify([ADDED_TABLES, Object.entries(ADDED_COLUMNS).map(([t, c]) => [t, Object.keys(c)])]);
@@ -341,6 +390,7 @@ export async function ensureSchemaUpgrades() {
 export async function resetAllData() {
   const tables = [
     'bank_transactions', 'statement_imports', 'bank_balances', 'bank_accounts', 'fx_rates',
+    'line_growth', 'pw_mrr', 'pw_plans', 'product_lines', 'product_families',
     'funding_events', 'cash_actuals', 'scenario_employees',
     'employee_overrides', 'employees', 'revenue_values',
     'revenue_products', 'expense_values', 'expense_items',
@@ -362,7 +412,7 @@ export async function getSettings() {
 export async function updateSettings(fields) {
   const allowed = ['company_name', 'currency', 'fiscal_year_start', 'actuals_through', 'dept_mapping',
     'assistant_relay_url', 'assistant_model', 'company_context', 'payroll_pay_day',
-    'assistant_provider', 'assistant_openai_model'];
+    'assistant_provider', 'assistant_openai_model', 'profitwell_currency', 'profitwell_last_sync', 'profitwell_sync_note'];
   const sets = [];
   const args = [];
   for (const key of allowed) {

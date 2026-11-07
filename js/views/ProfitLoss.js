@@ -3,6 +3,7 @@ import { getBaseScenarioId } from '../schema.js';
 import { formatCents, monthLabel, generateMonthRange } from '../utils.js';
 import { loadCategoryLookups } from '../expenses.js';
 import { payrollCategory } from '../payroll.js';
+import { loadMrrSeries } from '../profitwell.js';
 
 export default {
   name: 'ProfitLossView',
@@ -11,6 +12,7 @@ export default {
     const scenarioId = inject('scenarioId');
     const dateRange = inject('dateRange');
     const settings = inject('settings');
+    const mrrVersion = inject('mrrVersion', Vue.ref(0));
     const toast = inject('toast');
 
     const loading = ref(true);
@@ -86,10 +88,8 @@ export default {
           query(`SELECT * FROM ${table} WHERE scenario_id = ? AND month >= ? AND month <= ?`, [scenario, first, last]);
 
         // Everything at once; a scenario's values replace the base values
-        const [products, revBase, revScen, { subcategories }, expItems, expBase, expScen, employees] = await Promise.all([
-          query('SELECT * FROM revenue_products ORDER BY id'),
-          valuesOf('revenue_values', baseId),
-          isBase ? [] : valuesOf('revenue_values', sid),
+        const [mrr, { subcategories }, expItems, expBase, expScen, employees] = await Promise.all([
+          loadMrrSeries(sid, first, last),
           loadCategoryLookups(),
           query(`
             SELECT ei.*, ec.name as category_name, ec.sort_order
@@ -100,14 +100,6 @@ export default {
           isBase ? [] : valuesOf('expense_values', sid),
           query('SELECT * FROM employees'),
         ]);
-
-        // --- Revenue ---
-        const revRaw = isBase ? revBase : overlayValues(revBase, revScen, v => `${v.product_id}:${v.month}`);
-        const revMap = {};
-        for (const v of revRaw) {
-          if (!revMap[v.product_id]) revMap[v.product_id] = {};
-          revMap[v.product_id][v.month] = v.customers * v.arpu;
-        }
 
         // --- Expenses ---
         const expRaw = isBase ? expBase : overlayValues(expBase, expScen, v => `${v.expense_item_id}:${v.month}`);
@@ -159,10 +151,11 @@ export default {
         // Revenue
         R.push({ label: 'Revenue', type: 'header' });
         const totalRev = emptyMonths();
-        for (const p of products) {
+        // MRR per product line: ProfitWell for past months, the planned growth after that
+        for (const l of mrr.lines) {
           const v = emptyMonths();
-          for (const m of ml) { v[m] = (revMap[p.id] || {})[m] || 0; totalRev[m] += v[m]; }
-          R.push({ label: p.name, type: 'item', values: v, indent: true });
+          for (const m of ml) { v[m] = l.values[m]?.mrr || 0; totalRev[m] += v[m]; }
+          if (ml.some(m => v[m])) R.push({ label: l.line.name, type: 'item', values: v, indent: true });
         }
         R.push({ label: 'Total Revenue', type: 'subtotal', values: totalRev });
 
@@ -221,7 +214,7 @@ export default {
     }
 
     onMounted(loadData);
-    watch([scenarioId, dateRange, settings], loadData, { deep: true });
+    watch([scenarioId, dateRange, settings, mrrVersion], loadData, { deep: true });
 
     const labelBg = (row) => row.type === 'total' ? 'bg-gray-100' : 'bg-white';
 
@@ -251,7 +244,7 @@ export default {
       <div v-if="loading" class="text-gray-400 py-12 text-center">Loading...</div>
 
       <div v-else-if="!rows.length" class="text-gray-400 py-12 text-center">
-        No data to display. Add revenue products, expenses, and employees first.
+        No data to display. Sync ProfitWell, or add expenses and employees first.
       </div>
 
       <div v-else class="overflow-x-auto border border-gray-200 rounded-xl bg-white">

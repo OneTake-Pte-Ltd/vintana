@@ -2,6 +2,7 @@ import { query, execute } from '../db.js';
 import { formatCents, monthLabel, generateMonthRange, currentMonth, prevMonth, getReportingCurrency } from '../utils.js';
 import { payrollCategory } from '../payroll.js';
 import { loadAccounts, loadBalances, cashTotals, accountLabel, monthEnd } from '../bank.js';
+import { loadMrrTotals } from '../profitwell.js';
 
 const CAT_ROWS = [
   { db: 'Cost of Goods Sold (COGS)', key: 'cogs', label: 'Total COGS' },
@@ -19,6 +20,7 @@ export default {
     const scenarioId = inject('scenarioId');
     const dateRange = inject('dateRange');
     const settings = inject('settings');
+    const mrrVersion = inject('mrrVersion', Vue.ref(0));
     const toast = inject('toast');
 
     const loading = ref(true);
@@ -61,9 +63,7 @@ export default {
         months.value = ms;
 
         const [revRows, expRows, empRows, fundRows, acc, bal, imports] = await Promise.all([
-          query(`SELECT month, COALESCE(SUM(customers * arpu), 0) AS total
-                 FROM revenue_values WHERE scenario_id = ? AND month >= ? AND month <= ?
-                 GROUP BY month`, [sid, ms[0], ms[ms.length - 1]]),
+          loadMrrTotals(sid, ms[0], ms[ms.length - 1]),
           query(`SELECT ev.month, ec.name AS category, COALESCE(SUM(ev.amount), 0) AS total
                  FROM expense_values ev
                  JOIN expense_items ei ON ev.expense_item_id = ei.id
@@ -98,8 +98,7 @@ export default {
             WHERE bt.month IN (${[...bankSet].map(() => '?').join(',')}) AND bt.kind NOT IN ('transfer', 'ignore')`, [...bankSet]) : [];
         if (run !== loadSeq) return;
 
-        const revMap = {};
-        revRows.forEach(r => { revMap[r.month] = r.total; });
+        const revMap = revRows;
 
         const expMap = {};
         expRows.forEach(r => {
@@ -299,7 +298,7 @@ export default {
 
     onMounted(() => loadData());
     onBeforeUnmount(() => destroyChart());
-    watch(() => [scenarioId.value, dateRange.value], () => loadData(), { deep: true });
+    watch(() => [scenarioId.value, dateRange.value, mrrVersion.value], () => loadData(), { deep: true });
 
     return {
       loading, waterfall, months, fundingEvents, accounts, balances, totalsByMonth, fxErrors, accountLabel,
@@ -357,7 +356,7 @@ export default {
               <td v-for="r in waterfall" :key="r.month" class="text-right py-2 px-3 text-gray-900">{{ formatCents(r.startCash) }}</td>
             </tr>
             <tr class="border-b border-gray-100 bg-emerald-50/50">
-              <td class="py-2 px-4 text-emerald-700 sticky left-0 whitespace-normal md:whitespace-nowrap w-36 md:w-auto bg-emerald-50/50 z-10" title="Plan months: MRR from Revenue. Bank months: money received from customers.">+ Revenue (received in bank months)</td>
+              <td class="py-2 px-4 text-emerald-700 sticky left-0 whitespace-normal md:whitespace-nowrap w-36 md:w-auto bg-emerald-50/50 z-10" title="Plan months: MRR from ProfitWell and the planned growth. Bank months: money received from customers.">+ Revenue (received in bank months)</td>
               <td v-for="r in waterfall" :key="r.month" class="text-right py-2 px-3 text-emerald-700">{{ formatCents(r.revenue) }}</td>
             </tr>
             <tr class="border-b border-gray-100 bg-emerald-50/50">
