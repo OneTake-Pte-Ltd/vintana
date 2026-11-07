@@ -249,7 +249,7 @@ export default {
         :class="['rounded-xl border-2 border-dashed p-6 text-center transition-colors', dragging ? 'border-indigo-400 bg-indigo-50' : 'border-gray-300 bg-white']">
         <p class="text-sm text-gray-700">Drop PDF bank statements here, one or several, or
           <button @click="fileInput.click()" class="text-indigo-600 hover:text-indigo-800 font-medium">choose files</button>.</p>
-        <p class="text-xs text-gray-400 mt-1">Each statement is read by Claude on its own, one after the other. PDFs are never stored: each one is discarded as soon as it has been read, or if reading fails.</p>
+        <p class="text-xs text-gray-400 mt-1">Each statement is read by the assistant's model (Settings > Assistant) on its own, one after the other. PDFs are never stored: each one is discarded as soon as it has been read, or if reading fails.</p>
         <input ref="fileInput" type="file" accept="application/pdf,.pdf" multiple class="hidden" @change="onPick" aria-label="Choose PDF statements"/>
         <p v-if="accounts.length" class="text-xs text-gray-500 mt-3">Accounts: {{ accounts.map(a => accountLabel(a) + ' · ' + a.currency).join(', ') }}</p>
       </div>
@@ -289,6 +289,7 @@ export default {
               <div class="text-xs font-medium text-indigo-600 uppercase tracking-wider">Review before saving</div>
               <h2 class="text-lg font-semibold text-gray-900">{{ active.name }}</h2>
               <div class="text-sm text-gray-500">{{ review.parsed.bank_name }} · {{ review.currency }} · {{ fmtDate(review.periodStart) }} to {{ fmtDate(review.periodEnd) }}</div>
+              <div v-if="review.readBy" class="text-xs text-gray-400 mt-0.5">Read by {{ review.readBy }}</div>
             </div>
             <div class="flex items-center gap-2">
               <label for="review-account" class="text-sm text-gray-600">Account</label>
@@ -385,7 +386,7 @@ export default {
                   <span v-else class="text-gray-400 text-xs">{{ r.kind === 'transfer' ? 'Not counted: money stays in the company' : r.kind === 'ignore' ? 'Not counted' : 'Counted in Cash Flow' }}</span>
                 </td>
               </tr>
-              <tr v-if="!rowsShown.length"><td colspan="5" class="px-3 py-6 text-center text-gray-400">{{ filter === 'decide' ? 'Claude was sure about every line. Look through "All lines" if you want, then save.' : 'No lines on this statement.' }}</td></tr>
+              <tr v-if="!rowsShown.length"><td colspan="5" class="px-3 py-6 text-center text-gray-400">{{ filter === 'decide' ? 'The model was sure about every line. Look through "All lines" if you want, then save.' : 'No lines on this statement.' }}</td></tr>
             </tbody>
           </table>
         </div>
@@ -419,7 +420,10 @@ export default {
                 <tr class="border-b border-gray-50">
                   <td class="px-5 py-2.5 text-gray-900 whitespace-nowrap">{{ h.label || h.bank_name || 'Deleted account' }}</td>
                   <td class="px-3 py-2.5 text-gray-600 whitespace-nowrap">{{ fmtDate(h.period_start) }} to {{ fmtDate(h.period_end) }}</td>
-                  <td class="px-3 py-2.5 text-gray-500 truncate max-w-[14rem]">{{ h.file_name }}</td>
+                  <td class="px-3 py-2.5 text-gray-500 max-w-[14rem]">
+                    <div class="truncate">{{ h.file_name }}</div>
+                    <div v-if="h.read_by" class="text-xs text-gray-400 truncate">Read by {{ h.read_by }}</div>
+                  </td>
                   <td class="px-3 py-2.5 text-right tabular-nums">{{ h.transaction_count }}</td>
                   <td class="px-3 py-2.5 text-right tabular-nums">{{ formatCents(h.closing_balance, h.currency) }}</td>
                   <td class="px-3 py-2.5">

@@ -2,7 +2,7 @@ import { getCredentials } from '../js/db.js';
 import { formatCents, monthLabelFull } from '../js/utils.js';
 import { loadHeadlineMetrics } from '../js/metrics.js';
 import {
-  ASSISTANT_MODELS, DEFAULT_MODEL, DEFAULT_RELAY_URL,
+  assistantChoice, DEFAULT_RELAY_URL,
   snapshotPage, hashText, streamChat, renderMarkdown,
 } from '../js/assistant.js';
 
@@ -37,8 +37,8 @@ export default {
       return conversations[key];
     });
 
-    const model = computed(() => settings.value?.assistant_model || DEFAULT_MODEL);
-    const modelLabel = computed(() => (ASSISTANT_MODELS.find(m => m.id === model.value)?.label || model.value).replace(/ \(.*\)$/, ''));
+    const choice = computed(() => assistantChoice(settings.value));
+    const modelLabel = computed(() => choice.value.model || 'No model chosen');
     const relayUrl = computed(() => settings.value?.assistant_relay_url || DEFAULT_RELAY_URL);
     const scenarioName = computed(() => scenarios.value.find(s => s.id === scenarioId.value)?.name || 'Base');
     const pageTitle = () => (document.querySelector('main h1')?.textContent.trim() || 'this page').replace(/"/g, "'");
@@ -118,7 +118,7 @@ export default {
       }
 
       c.display.push({ role: 'user', text: question });
-      const answer = reactive({ role: 'assistant', text: '', error: '', note: snap.truncated ? 'This page was too long to send in full; the end of it was cut.' : '', pending: true });
+      const answer = reactive({ role: 'assistant', text: '', model: '', error: '', note: snap.truncated ? 'This page was too long to send in full; the end of it was cut.' : '', pending: true });
       c.display.push(answer);
       scrollDown();
 
@@ -127,13 +127,14 @@ export default {
         if (!c.system) c.system = await buildSystem();
         const messages = [...c.messages, { role: 'user', content }];
         const result = await streamChat({
-          relayUrl: relayUrl.value, token, model: model.value, system: c.system, messages,
+          relayUrl: relayUrl.value, token, provider: choice.value.provider, model: choice.value.model, system: c.system, messages,
           signal: controller.signal,
           onText: t => { answer.text = t; scrollDown(); },
         });
         answer.text = result.text;
+        answer.model = result.servedBy; // what the provider reports, so a fallback model shows as such
         if (result.stopReason === 'refusal') {
-          answer.error = 'Claude declined to answer this question.';
+          answer.error = 'The model declined to answer this question.';
         } else {
           c.messages.push({ role: 'user', content }, { role: 'assistant', content: result.content });
           c.lastSnapshot = snapHash;
@@ -202,6 +203,7 @@ export default {
               </div>
               <p v-if="m.error" class="text-red-600">{{ m.error }}</p>
               <p v-if="m.note" class="text-xs text-gray-400">{{ m.note }}</p>
+              <p v-if="m.model && !m.pending" class="text-[11px] text-gray-400">Answered by {{ m.model }}</p>
             </div>
           </div>
         </div>
