@@ -1,8 +1,9 @@
 import { query } from '../db.js';
 import { cashPosition } from '../bank.js';
+import { loadMrrSeries, mrrChartDatasets } from '../profitwell.js';
 import {
   formatCents, formatPct, formatDelta, monthLabel,
-  generateMonthRange, currentMonth, prevMonth, ordinalDay,
+  currentMonth, prevMonth, ordinalDay,
   chargeFromMonthly, isChargeMonth,
 } from '../utils.js';
 
@@ -18,12 +19,13 @@ export default {
     const scenarioId = inject('scenarioId');
     const dateRange = inject('dateRange');
     const settings = inject('settings');
+    const mrrVersion = inject('mrrVersion', Vue.ref(0));
 
     const loading = ref(true);
     const revenueNow = ref(0), revenuePrev = ref(0);
     const cashBalance = ref(null);
     const totalExpenses = ref(0), totalPayroll = ref(0);
-    const mrrSeries = ref([]), expensesByCat = ref([]);
+    const mrrSeries = ref(null), expensesByCat = ref([]);
     const employees = ref([]), renewals = ref([]);
     const mrrCanvasRef = ref(null), expenseCanvasRef = ref(null), teamCanvasRef = ref(null);
     let charts = [];
@@ -54,29 +56,27 @@ export default {
       const sid = scenarioId.value, month = currentMonth(), prev = prevMonth(month);
       const range = dateRange.value;
       try {
-        const [revNow, revPrev, cash, expenses, payroll, mrrRows, expCat, empRows, renewRows] =
+        const start = range?.start || month, end = range?.end || month;
+        const [series, cash, expenses, payroll, mrrAround, expCat, empRows, renewRows] =
           await Promise.all([
-            query(`SELECT COALESCE(SUM(customers * arpu), 0) AS v FROM revenue_values WHERE scenario_id = ? AND month = ?`, [sid, month]),
-            query(`SELECT COALESCE(SUM(customers * arpu), 0) AS v FROM revenue_values WHERE scenario_id = ? AND month = ?`, [sid, prev]),
+            loadMrrSeries(sid, start, end),
             cashPosition().catch(() => null),
             query(`SELECT COALESCE(SUM(amount), 0) AS v FROM expense_values WHERE scenario_id = ? AND month = ?`, [sid, month]),
             query(`SELECT salary_monthly, tax_pct FROM employees WHERE start_date <= ? AND (end_date IS NULL OR end_date >= ?)`, [month + '-31', month + '-01']),
-            query(`SELECT month, COALESCE(SUM(customers * arpu), 0) AS mrr FROM revenue_values WHERE scenario_id = ? AND month >= ? AND month <= ? GROUP BY month ORDER BY month`, [sid, range?.start || month, range?.end || month]),
+            loadMrrSeries(sid, prev, month),
             query(`SELECT ec.name AS category, COALESCE(SUM(ev.amount), 0) AS total FROM expense_values ev JOIN expense_items ei ON ev.expense_item_id = ei.id JOIN expense_categories ec ON ei.category_id = ec.id WHERE ev.scenario_id = ? AND ev.month = ? GROUP BY ec.name ORDER BY total DESC`, [sid, month]),
             query(`SELECT name, department FROM employees WHERE start_date <= ? AND (end_date IS NULL OR end_date >= ?)`, [month + '-31', month + '-01']),
             query(`SELECT ei.name, ei.company, ev.amount, ei.renewal_day, ei.recurrence, ei.start_month FROM expense_items ei JOIN expense_values ev ON ev.expense_item_id = ei.id WHERE ev.scenario_id = ? AND ev.month = ? AND ei.renewal_day IS NOT NULL ORDER BY ei.renewal_day ASC`, [sid, month]),
           ]);
         if (run !== loadSeq) return;
 
-        revenueNow.value = revNow[0]?.v || 0;
-        revenuePrev.value = revPrev[0]?.v || 0;
+        revenueNow.value = mrrAround.totals[month] || 0;
+        revenuePrev.value = mrrAround.totals[prev] || 0;
         cashBalance.value = cash ? cash.total : null;
         totalExpenses.value = expenses[0]?.v || 0;
         totalPayroll.value = payroll.reduce((s, e) => s + Math.round(e.salary_monthly * (1 + (e.tax_pct || 0) / 100)), 0);
 
-        const months = range ? generateMonthRange(range.start, range.end) : [month];
-        const mrrMap = {}; mrrRows.forEach(r => { mrrMap[r.month] = r.mrr; });
-        mrrSeries.value = months.map(m => ({ month: m, mrr: mrrMap[m] || 0 }));
+        mrrSeries.value = series.months.some(m => series.totals[m]) ? series : null;
         expensesByCat.value = expCat;
         employees.value = empRows;
 
@@ -103,22 +103,16 @@ export default {
     function renderCharts() {
       destroyCharts();
       // MRR line chart
-      if (mrrSeries.value.length) {
-        const at = settings.value?.actuals_through;
-        const annotationPlugin = at ? { annotation: { annotations: { boundary: {
-          type: 'line', xMin: monthLabel(at), xMax: monthLabel(at),
-          borderColor: '#9ca3af', borderWidth: 1.5, borderDash: [6, 4],
-          label: { content: 'Actuals / Forecast', enabled: true, position: 'start', font: { size: 10 }, color: '#9ca3af' },
-        }}}} : {};
+      if (mrrSeries.value) {
+        const s = mrrSeries.value;
         makeChart(mrrCanvasRef, {
           type: 'line',
-          data: { labels: mrrSeries.value.map(d => monthLabel(d.month)), datasets: [{
-            label: 'MRR', data: mrrSeries.value.map(d => d.mrr / 100),
-            borderColor: '#6366f1', backgroundColor: 'rgba(99,102,241,0.08)',
-            fill: true, tension: 0.3, pointRadius: 2, pointHoverRadius: 5,
-          }]},
+          data: { labels: s.months.map(monthLabel), datasets: mrrChartDatasets(s) },
           options: { responsive: true, maintainAspectRatio: false,
-            plugins: { legend: { display: false }, tooltip: { callbacks: { label: centsTooltip } }, ...annotationPlugin },
+            plugins: {
+              legend: { display: s.months.some(m => !s.isActual(m)), position: 'bottom', labels: { usePointStyle: true, boxWidth: 8 } },
+              tooltip: { callbacks: { label: c => `${c.dataset.label}: ${centsTooltip(c)}` } },
+            },
             scales: { y: { beginAtZero: true, ticks: { callback: centsTick, maxTicksLimit: 6 }, grid: { color: '#f3f4f6' } }, x: { grid: { display: false } } },
           },
         });
@@ -148,7 +142,7 @@ export default {
 
     onMounted(() => loadData());
     onBeforeUnmount(() => destroyCharts());
-    watch(() => [scenarioId.value, dateRange.value], () => loadData(), { deep: true });
+    watch(() => [scenarioId.value, dateRange.value, mrrVersion.value], () => loadData(), { deep: true });
 
     function formatRenewalDate(item) {
       const now = new Date();
@@ -181,7 +175,7 @@ export default {
       <div class="bg-white rounded-xl border border-gray-200 p-5">
         <h2 class="text-sm font-semibold text-gray-700 mb-4">MRR Over Time</h2>
         <div style="height:280px"><canvas ref="mrrCanvasRef"></canvas></div>
-        <p v-if="mrrSeries.length === 0" class="text-sm text-gray-400 text-center py-8">No revenue data for this period</p>
+        <p v-if="!mrrSeries" class="text-sm text-gray-400 text-center py-8">No MRR for this period. Sync ProfitWell in Settings.</p>
       </div>
       <div class="bg-white rounded-xl border border-gray-200 p-5">
         <h2 class="text-sm font-semibold text-gray-700 mb-4">Expenses by Category</h2>
@@ -228,24 +222,26 @@ export default {
     <!-- Row 4: Upcoming Renewals -->
     <div class="bg-white rounded-xl border border-gray-200 p-5">
       <h2 class="text-sm font-semibold text-gray-700 mb-4">Upcoming Renewals</h2>
-      <table v-if="renewals.length > 0" class="w-full text-sm">
+      <div v-if="renewals.length > 0" class="overflow-x-auto">
+      <table class="w-full text-sm whitespace-nowrap">
         <thead>
           <tr class="text-left text-xs text-gray-500 uppercase tracking-wider border-b border-gray-100">
-            <th class="pb-2 font-medium">Name</th>
-            <th class="pb-2 font-medium">Company</th>
+            <th class="sticky-col pb-2 pr-3 font-medium">Name</th>
+            <th class="pb-2 pr-3 font-medium">Company</th>
             <th class="pb-2 font-medium text-right">Amount</th>
             <th class="pb-2 font-medium text-right">Renewal Date</th>
           </tr>
         </thead>
         <tbody>
           <tr v-for="r in renewals" :key="r.name + r.renewal_day" class="border-b border-gray-50">
-            <td class="py-2.5 text-gray-900">{{ r.name }}</td>
+            <td class="sticky-col py-2.5 pr-3 text-gray-900">{{ r.name }}</td>
             <td class="py-2.5 text-gray-500">{{ r.company || '—' }}</td>
             <td class="py-2.5 text-right text-gray-900">{{ formatCents(r.amount) }}</td>
             <td class="py-2.5 text-right text-gray-500">{{ formatRenewalDate(r) }}</td>
           </tr>
         </tbody>
       </table>
+      </div>
       <p v-else class="text-sm text-gray-400 py-4 text-center">No renewals in the next 30 days</p>
     </div>
   </div>

@@ -3,6 +3,7 @@ import { getBaseScenarioId } from '../schema.js';
 import { formatCents, monthLabel, generateMonthRange } from '../utils.js';
 import { loadCategoryLookups } from '../expenses.js';
 import { payrollCategory } from '../payroll.js';
+import { loadMrrSeries } from '../profitwell.js';
 
 export default {
   name: 'ProfitLossView',
@@ -11,6 +12,7 @@ export default {
     const scenarioId = inject('scenarioId');
     const dateRange = inject('dateRange');
     const settings = inject('settings');
+    const mrrVersion = inject('mrrVersion', Vue.ref(0));
     const toast = inject('toast');
 
     const loading = ref(true);
@@ -86,10 +88,8 @@ export default {
           query(`SELECT * FROM ${table} WHERE scenario_id = ? AND month >= ? AND month <= ?`, [scenario, first, last]);
 
         // Everything at once; a scenario's values replace the base values
-        const [products, revBase, revScen, { subcategories }, expItems, expBase, expScen, employees] = await Promise.all([
-          query('SELECT * FROM revenue_products ORDER BY id'),
-          valuesOf('revenue_values', baseId),
-          isBase ? [] : valuesOf('revenue_values', sid),
+        const [mrr, { subcategories }, expItems, expBase, expScen, employees] = await Promise.all([
+          loadMrrSeries(sid, first, last),
           loadCategoryLookups(),
           query(`
             SELECT ei.*, ec.name as category_name, ec.sort_order
@@ -100,14 +100,6 @@ export default {
           isBase ? [] : valuesOf('expense_values', sid),
           query('SELECT * FROM employees'),
         ]);
-
-        // --- Revenue ---
-        const revRaw = isBase ? revBase : overlayValues(revBase, revScen, v => `${v.product_id}:${v.month}`);
-        const revMap = {};
-        for (const v of revRaw) {
-          if (!revMap[v.product_id]) revMap[v.product_id] = {};
-          revMap[v.product_id][v.month] = v.customers * v.arpu;
-        }
 
         // --- Expenses ---
         const expRaw = isBase ? expBase : overlayValues(expBase, expScen, v => `${v.expense_item_id}:${v.month}`);
@@ -159,10 +151,11 @@ export default {
         // Revenue
         R.push({ label: 'Revenue', type: 'header' });
         const totalRev = emptyMonths();
-        for (const p of products) {
+        // MRR per product line: ProfitWell for past months, the planned growth after that
+        for (const l of mrr.lines) {
           const v = emptyMonths();
-          for (const m of ml) { v[m] = (revMap[p.id] || {})[m] || 0; totalRev[m] += v[m]; }
-          R.push({ label: p.name, type: 'item', values: v, indent: true });
+          for (const m of ml) { v[m] = l.values[m]?.mrr || 0; totalRev[m] += v[m]; }
+          if (ml.some(m => v[m])) R.push({ label: l.line.name, type: 'item', values: v, indent: true });
         }
         R.push({ label: 'Total Revenue', type: 'subtotal', values: totalRev });
 
@@ -221,7 +214,7 @@ export default {
     }
 
     onMounted(loadData);
-    watch([scenarioId, dateRange, settings], loadData, { deep: true });
+    watch([scenarioId, dateRange, settings, mrrVersion], loadData, { deep: true });
 
     const labelBg = (row) => row.type === 'total' ? 'bg-gray-100' : 'bg-white';
 
@@ -234,7 +227,7 @@ export default {
   },
   template: `
     <div>
-      <div class="flex items-center justify-between mb-6">
+      <div class="flex items-center justify-between flex-wrap gap-3 mb-6">
         <h1 class="text-2xl font-bold text-gray-900">Profit & Loss</h1>
         <div class="flex items-center gap-2 text-sm text-gray-500">
           <span>Sort lines</span>
@@ -251,18 +244,18 @@ export default {
       <div v-if="loading" class="text-gray-400 py-12 text-center">Loading...</div>
 
       <div v-else-if="!rows.length" class="text-gray-400 py-12 text-center">
-        No data to display. Add revenue products, expenses, and employees first.
+        No data to display. Sync ProfitWell, or add expenses and employees first.
       </div>
 
       <div v-else class="overflow-x-auto border border-gray-200 rounded-xl bg-white">
         <table class="min-w-max w-full text-sm border-collapse">
           <thead>
             <tr>
-              <th class="sticky left-0 z-20 bg-gray-50 px-4 py-2.5 text-left font-semibold text-gray-700 border-b border-r border-gray-200 min-w-[220px]">
+              <th class="sticky left-0 z-20 bg-gray-50 px-4 py-2.5 text-left font-semibold text-gray-700 border-b border-r border-gray-200 min-w-[10rem] md:min-w-[220px]">
               </th>
               <th v-for="m in months" :key="m"
                   :class="isForecast(m) ? 'bg-blue-50' : 'bg-gray-50'"
-                  class="px-4 py-2.5 text-right font-medium text-gray-700 border-b border-gray-200 whitespace-nowrap min-w-[120px]">
+                  class="px-4 py-2.5 text-right font-medium text-gray-700 border-b border-gray-200 whitespace-nowrap min-w-[90px] md:min-w-[120px]">
                 <div>{{ monthLabel(m) }}</div>
                 <div v-if="isForecast(m)" class="text-xs font-normal text-blue-500">Forecast</div>
               </th>

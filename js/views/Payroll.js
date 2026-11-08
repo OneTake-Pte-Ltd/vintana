@@ -206,7 +206,7 @@ export default {
   },
   template: `
 <div class="space-y-6">
-  <div class="flex items-center justify-between">
+  <div class="flex items-center justify-between flex-wrap gap-3">
     <h1 class="text-2xl font-bold text-gray-900">Payroll</h1>
     <button @click="openAdd" class="px-4 py-2 text-sm font-medium text-white bg-indigo-600 rounded-lg hover:bg-indigo-700 transition-colors">+ Add Employee</button>
   </div>
@@ -231,7 +231,7 @@ export default {
       </div>
     </div>
     <div class="bg-white rounded-xl border border-gray-200">
-      <div class="p-4 border-b border-gray-200 flex items-center gap-3">
+      <div class="p-4 border-b border-gray-200 flex flex-wrap items-center gap-3">
         <select v-model="deptFilter" class="text-sm border border-gray-200 rounded-lg px-3 py-1.5 bg-white focus:outline-none focus:ring-2 focus:ring-indigo-500">
           <option value="">All Departments</option>
           <option v-for="d in departments" :key="d" :value="d">{{ d }}</option>
@@ -246,7 +246,7 @@ export default {
         <table class="w-full text-sm">
           <thead><tr class="bg-gray-50 border-b border-gray-200">
             <th v-for="col in [{key:'name',label:'Name'},{key:'role',label:'Role'},{key:'department',label:'Dept'},{key:'salary_monthly',label:'Gross Salary'},{key:'tax_pct',label:'Tax %'},{key:'total_cost',label:'Total Cost'},{key:'start_date',label:'Start'},{key:'end_date',label:'End'}]"
-              :key="col.key" @click="toggleSort(col.key)" class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:text-gray-700 select-none whitespace-nowrap">
+              :key="col.key" @click="toggleSort(col.key)" :class="col.key === 'name' ? 'sticky-col bg-gray-50' : ''" class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:text-gray-700 select-none whitespace-nowrap">
               {{ col.label }}<span v-if="sortCol===col.key" class="ml-1">{{ sortAsc ? '\\u25B2' : '\\u25BC' }}</span>
             </th>
             <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider whitespace-nowrap" title="From imported bank statements">Last Paid</th>
@@ -254,7 +254,7 @@ export default {
           </tr></thead>
           <tbody class="divide-y divide-gray-100">
             <tr v-for="emp in filteredEmployees" :key="emp.id||emp._scenarioEmployeeId" class="hover:bg-gray-50 transition-colors">
-              <td class="px-4 py-3 font-medium text-gray-900"><inline-edit :value="emp.name" @save="v => saveField(emp, 'name', v)"/></td>
+              <td class="sticky-col px-4 py-3 font-medium text-gray-900"><inline-edit :value="emp.name" @save="v => saveField(emp, 'name', v)"/></td>
               <td class="px-4 py-3 text-gray-600"><inline-edit :value="emp.role" placeholder="Add role" @save="v => saveField(emp, 'role', v)"/></td>
               <td class="px-4 py-3 text-gray-600"><inline-edit :value="emp.department" :options="deptOptions" placeholder="None" @save="v => saveField(emp, 'department', v)"/></td>
               <td class="px-4 py-3 text-gray-900">{{ formatCents(emp.salary_monthly) }}</td>

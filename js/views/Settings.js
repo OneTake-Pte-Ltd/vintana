@@ -9,6 +9,7 @@ import {
   exportExpensesCsv, importExpensesCsv, exportPayrollCsv, importPayrollCsv,
 } from '../csvTransfer.js';
 import { downloadCsv } from '../csv.js';
+import ProductsSettings from '../../components/ProductsSettings.js';
 
 // One collapsible block of the Settings page. The header shows a summary while it is closed.
 const SettingsSection = {
@@ -62,7 +63,7 @@ const SaveBar = {
 
 export default {
   name: 'SettingsView',
-  components: { SettingsSection, SaveBar },
+  components: { SettingsSection, SaveBar, ProductsSettings },
   setup() {
     const { ref, computed, onMounted, onBeforeUnmount, inject, nextTick } = Vue;
     const router = VueRouter.useRouter();
@@ -102,7 +103,7 @@ export default {
           settings.value.company_context ||= '';
           settings.value.payroll_pay_day ??= null;
         }
-        await Promise.all([loadSubcategories(), loadBankAccounts()]);
+        await Promise.all([loadSubcategories(), loadBankAccounts(), loadProductsSummary()]);
         const mapping = settings.value?.dept_mapping || {};
         const entries = Object.keys(mapping).length > 0
           ? Object.entries(mapping)
@@ -225,6 +226,18 @@ export default {
     onBeforeUnmount(() => clearTimeout(savedTimer));
 
     // One-line summaries for closed sections, from what is saved
+    // Settings > Products keeps its own state; the summary only needs counts
+    const productsSummary = ref('');
+    const loadProductsSummary = async () => {
+      try {
+        const [r] = await query(`SELECT (SELECT COUNT(*) FROM pw_plans) AS plans, (SELECT COUNT(*) FROM product_lines) AS lines,
+          (SELECT profitwell_last_sync FROM settings WHERE id = 1) AS last_sync`);
+        productsSummary.value = [`${r.plans} ProfitWell plan${r.plans === 1 ? '' : 's'}`, `${r.lines} product line${r.lines === 1 ? '' : 's'}`,
+          r.last_sync ? `Synced ${new Date(r.last_sync).toLocaleDateString()}` : 'Never synced'].join(' · ');
+      } catch { productsSummary.value = 'ProfitWell sync and product lines'; }
+    };
+    const productsSaved = () => { loadProductsSummary(); flashSaved('products'); };
+
     const summaries = computed(() => {
       const company = savedValues('company') || {};
       const mapping = savedValues('mapping') || [];
@@ -238,6 +251,7 @@ export default {
           `Actuals through ${company.actuals_through ? monthLabelFull(company.actuals_through) : 'not set'}`].filter(Boolean).join(' · '),
         bank: bankAccounts.value.map(a => `${a.bank_name} (${a.currency})`).join(', '),
         subcategories: `${nSubs} sub-categor${nSubs === 1 ? 'y' : 'ies'} across ${expCategories.value.length} categories`,
+        products: productsSummary.value,
         mapping: `${mapping.length} department${mapping.length === 1 ? '' : 's'} mapped to P&L categories`,
         assistant: [providerLabel, model, assistant.company_context ? 'Company description set' : 'No company description yet'].filter(Boolean).join(' · '),
         csv: 'Import or export expenses and payroll as CSV files',
@@ -260,7 +274,8 @@ export default {
         const tables = ['settings', 'scenarios', 'expense_categories', 'expense_subcategories', 'expense_items',
           'expense_values', 'revenue_products', 'revenue_values', 'employees',
           'employee_overrides', 'scenario_employees', 'cash_actuals', 'funding_events',
-          'bank_accounts', 'bank_balances', 'statement_imports', 'bank_transactions', 'fx_rates'];
+          'bank_accounts', 'bank_balances', 'statement_imports', 'bank_transactions', 'fx_rates',
+          'product_families', 'product_lines', 'pw_plans', 'pw_mrr', 'line_growth'];
         const dump = {};
         const rows = await Promise.all(tables.map(t => query(`SELECT * FROM ${t}`).catch(() => [])));
         tables.forEach((t, i) => { dump[t] = rows[i]; });
@@ -290,6 +305,7 @@ export default {
           const { batch, execute } = await import('../db.js');
           const { runMigrations } = await import('../schema.js');
           const tables = ['bank_transactions', 'statement_imports', 'bank_balances', 'bank_accounts', 'fx_rates',
+            'line_growth', 'pw_mrr', 'pw_plans', 'product_lines', 'product_families',
             'funding_events', 'cash_actuals', 'scenario_employees',
             'employee_overrides', 'employees', 'revenue_values', 'revenue_products',
             'expense_values', 'expense_items', 'expense_subcategories', 'expense_categories', 'scenarios', 'settings'];
@@ -546,7 +562,7 @@ export default {
     return {
       settings, loading, saving, months, categories,
       isDirty, dirtySection, discard, saveSection, leaveDialog, answerLeave,
-      openSection, toggleSection, justSaved, summaries,
+      openSection, toggleSection, justSaved, summaries, productsSaved,
       deptEntries, addDeptEntry, removeDeptEntry,
       exportData, importData,
       csvKinds, csvBusy, csvErrors, exportCsv, importCsv,
@@ -602,6 +618,10 @@ export default {
             </div>
           </div>
           <save-bar :dirty="isDirty('company')" :saving="saving === 'company'" @save="saveSection('company')" @discard="discard('company')"></save-bar>
+        </settings-section>
+
+        <settings-section id="products" title="Products (ProfitWell)" :summary="summaries.products" :open="openSection === 'products'" :saved="justSaved === 'products'" @toggle="toggleSection('products')">
+          <products-settings @saved="productsSaved"></products-settings>
         </settings-section>
 
         <settings-section v-if="bankAccounts.length" id="bank" title="Bank accounts" :summary="summaries.bank" :open="openSection === 'bank'" :saved="justSaved === 'bank'" @toggle="toggleSection('bank')">

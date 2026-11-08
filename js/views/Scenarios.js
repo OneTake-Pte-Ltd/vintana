@@ -1,5 +1,6 @@
 import { query, execute } from '../db.js';
 import { formatCents, monthLabel, generateMonthRange } from '../utils.js';
+import { loadMrrTotals } from '../profitwell.js';
 
 const PNL_ROWS = [
   { key: 'revenue', label: 'Revenue' },
@@ -78,8 +79,8 @@ export default {
             `INSERT INTO expense_values (expense_item_id, scenario_id, month, amount, is_actual)
              SELECT expense_item_id, ?, month, amount, is_actual FROM expense_values WHERE scenario_id = ?`, [newId, src]);
           await execute(
-            `INSERT INTO revenue_values (product_id, scenario_id, month, customers, arpu, is_actual)
-             SELECT product_id, ?, month, customers, arpu, is_actual FROM revenue_values WHERE scenario_id = ?`, [newId, src]);
+            `INSERT INTO line_growth (line_id, scenario_id, rate_pct)
+             SELECT line_id, ?, rate_pct FROM line_growth WHERE scenario_id = ?`, [newId, src]);
           await execute(
             `INSERT INTO employee_overrides (employee_id, scenario_id, salary_monthly, tax_pct, start_date, end_date)
              SELECT employee_id, ?, salary_monthly, tax_pct, start_date, end_date FROM employee_overrides WHERE scenario_id = ?`, [newId, src]);
@@ -122,7 +123,7 @@ export default {
       const s = deleteTarget.value; if (!s) return;
       saving.value = true;
       try {
-        for (const t of ['expense_values','revenue_values','employee_overrides','scenario_employees','funding_events'])
+        for (const t of ['expense_values','line_growth','employee_overrides','scenario_employees','funding_events'])
           await execute(`DELETE FROM ${t} WHERE scenario_id = ?`, [s.id]);
         await execute(`DELETE FROM scenarios WHERE id = ? AND is_base = 0`, [s.id]);
         showDelete.value = false; deleteTarget.value = null;
@@ -141,16 +142,15 @@ export default {
     async function loadPnl(sid) {
       const range = dateRange.value;
       if (!range) return { revenue: 0, cogs: 0, rnd: 0, snm: 0, gna: 0, other: 0 };
-      const [revRows, expRows] = await Promise.all([
-        query(`SELECT COALESCE(SUM(customers * arpu), 0) AS total FROM revenue_values
-               WHERE scenario_id = ? AND month >= ? AND month <= ?`, [sid, range.start, range.end]),
+      const [mrr, expRows] = await Promise.all([
+        loadMrrTotals(sid, range.start, range.end),
         query(`SELECT ec.name AS category, COALESCE(SUM(ev.amount), 0) AS total
                FROM expense_values ev JOIN expense_items ei ON ev.expense_item_id = ei.id
                JOIN expense_categories ec ON ei.category_id = ec.id
                WHERE ev.scenario_id = ? AND ev.month >= ? AND ev.month <= ? GROUP BY ec.name`,
               [sid, range.start, range.end]),
       ]);
-      const d = { revenue: revRows[0]?.total || 0, cogs: 0, rnd: 0, snm: 0, gna: 0, other: 0 };
+      const d = { revenue: Object.values(mrr).reduce((a, b) => a + b, 0), cogs: 0, rnd: 0, snm: 0, gna: 0, other: 0 };
       for (const row of expRows) d[CAT_MAP[row.category] || 'other'] += row.total;
       d.gross_profit = d.revenue - d.cogs;
       d.total_opex = d.rnd + d.snm + d.gna + d.other;
@@ -190,7 +190,7 @@ export default {
 
   template: `
 <div class="max-w-7xl mx-auto">
-  <div class="flex items-center justify-between mb-6">
+  <div class="flex items-center justify-between flex-wrap gap-3 mb-6">
     <h1 class="text-2xl font-bold text-gray-900">Scenarios</h1>
     <button @click="openCreate" class="px-4 py-2 bg-indigo-600 text-white text-sm font-medium rounded-lg hover:bg-indigo-700 transition-colors">+ Create Scenario</button>
   </div>
@@ -285,9 +285,9 @@ export default {
 
   <!-- Compare Modal -->
   <div v-if="showCompare" class="fixed inset-0 bg-black/50 flex items-center justify-center z-50 overflow-y-auto py-8">
-    <div class="bg-white rounded-xl p-6 max-w-3xl w-full mx-4">
+    <div class="bg-white rounded-xl p-4 md:p-6 max-w-3xl w-full mx-4">
       <h3 class="text-lg font-semibold text-gray-900 mb-4">Compare Scenarios</h3>
-      <div class="flex items-end gap-4 mb-6">
+      <div class="flex flex-wrap items-end gap-4 mb-6">
         <div class="flex-1">
           <label class="block text-sm font-medium text-gray-700 mb-1">Scenario A</label>
           <select v-model="compareA" class="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500">
@@ -325,7 +325,7 @@ export default {
         <table class="w-full text-sm">
           <thead>
             <tr class="text-left text-xs text-gray-500 uppercase tracking-wider border-b border-gray-200">
-              <th class="pb-2 font-medium">Line Item</th>
+              <th class="sticky-col pb-2 pr-3 font-medium">Line Item</th>
               <th class="pb-2 font-medium text-right">{{ scenarioName(compareA) }}</th>
               <th class="pb-2 font-medium text-right">{{ scenarioName(compareB) }}</th>
               <th class="pb-2 font-medium text-right">Delta</th>
@@ -334,7 +334,7 @@ export default {
           </thead>
           <tbody>
             <tr v-for="row in PNL_ROWS" :key="row.key" class="border-b border-gray-100" :class="row.computed ? 'font-semibold bg-gray-50' : ''">
-              <td class="py-2.5 text-gray-900">{{ row.label }}</td>
+              <td class="sticky-col py-2.5 pr-3 text-gray-900 whitespace-nowrap" :class="row.computed ? 'bg-gray-50' : ''">{{ row.label }}</td>
               <td class="py-2.5 text-right text-gray-900">{{ formatCents(compareData.a[row.key]) }}</td>
               <td class="py-2.5 text-right text-gray-900">{{ formatCents(compareData.b[row.key]) }}</td>
               <td class="py-2.5 text-right" :class="delta(row.key) > 0 ? 'text-emerald-600' : delta(row.key) < 0 ? 'text-red-600' : 'text-gray-400'">{{ formatCents(delta(row.key)) }}</td>

@@ -1,6 +1,7 @@
 import { hasCredentials, query } from './db.js';
 import { checkSchema, getSettings, ensureSchemaUpgrades } from './schema.js';
 import { currentMonth, addMonths, setReportingCurrency } from './utils.js';
+import { autoSync } from './profitwell.js';
 
 import Sidebar from '../components/Sidebar.js';
 import KpiCard from '../components/KpiCard.js';
@@ -55,10 +56,24 @@ const app = Vue.createApp({
     const route = VueRouter.useRoute();
 
     const sidebarCollapsed = ref(false);
+
+    // Below Tailwind's md breakpoint the sidebar becomes a drawer over the page
+    const mobileQuery = window.matchMedia('(max-width: 767px)');
+    const isMobile = ref(mobileQuery.matches);
+    const mobileNavOpen = ref(false);
+    mobileQuery.addEventListener('change', (e) => {
+      isMobile.value = e.matches;
+      if (!e.matches) mobileNavOpen.value = false;
+    });
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') mobileNavOpen.value = false;
+    });
     const scenarioId = ref(null);
     const scenarios = ref([]);
     const settings = ref(null);
     const toasts = ref([]);
+    // Bumped when ProfitWell data changes, so pages showing MRR reload
+    const mrrVersion = ref(0);
     let toastCounter = 0;
 
     // Default: 12 months centred on the 1st of the current month (6 before, 6 from it).
@@ -130,6 +145,7 @@ const app = Vue.createApp({
     provide('toast', toast);
     provide('loadScenarios', loadScenarios);
     provide('loadSettings', loadSettings);
+    provide('mrrVersion', mrrVersion);
 
     const loadAppData = async () => {
       try {
@@ -140,6 +156,9 @@ const app = Vue.createApp({
           await ensureSchemaUpgrades().catch(() => {});
           await Promise.all([loadScenarios(), loadSettings()]);
         }
+        // ProfitWell is re-read in full once a month, from the 1st. Runs in the background; pages that show MRR
+        // reload when it finishes.
+        autoSync(settings.value, toast).then(synced => { if (synced) { loadSettings(); mrrVersion.value++; } });
       } catch {
         // will redirect to login via router guard
       }
@@ -157,17 +176,18 @@ const app = Vue.createApp({
     });
 
     watch(route, async () => {
+      mobileNavOpen.value = false;
       await nextTick();
       if (window.lucide) lucide.createIcons();
     });
 
-    watch([scenarioId, () => dateRange.value.start, () => dateRange.value.end], async () => {
+    watch([scenarioId, () => dateRange.value.start, () => dateRange.value.end, isMobile, mobileNavOpen], async () => {
       await nextTick();
       if (window.lucide) lucide.createIcons();
     });
 
     return {
-      sidebarCollapsed, scenarioId, scenarios, settings,
+      sidebarCollapsed, isMobile, mobileNavOpen, scenarioId, scenarios, settings,
       dateRange, rangeIsCustom, setRange, resetRange, isLoggedIn, companyName, toasts, toast,
     };
   },
