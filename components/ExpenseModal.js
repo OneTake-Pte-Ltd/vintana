@@ -3,7 +3,7 @@ import { getBaseScenarioId } from '../js/schema.js';
 import {
   monthLabel, generateMonthRange, currentMonth, chargeFromMonthly, expenseMonthlyValues, forecastEnd,
 } from '../js/utils.js';
-import { subcategoryOptions } from '../js/expenses.js';
+import { subcategoryOptions, respreadExpense } from '../js/expenses.js';
 
 const INPUT = 'w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500';
 
@@ -41,6 +41,8 @@ export default {
     const hasSubcategories = computed(() => props.subcategories.length > 0);
 
     const baseScenarioId = getBaseScenarioId;
+    // Amount and recurrence as loaded, to tell whether the forecast needs rewriting on save
+    let original = null;
 
     onMounted(async () => {
       try {
@@ -55,6 +57,7 @@ export default {
           WHERE ei.id = ?`, [sid, currentMonth(), baseId, currentMonth(), props.itemId]);
         const item = rows[0];
         if (!item) { toast('This expense no longer exists', 'error'); emit('close'); return; }
+        original = { amount: '', recurrence: item.recurrence };
         form.value = {
           name: item.name, alias: item.alias || '', company: item.company || '',
           charge_label: item.charge_label || '', category_id: item.category_id,
@@ -65,6 +68,7 @@ export default {
           start_month: item.start_month || '', end_month: item.end_month || '',
           notes: item.notes || '',
         };
+        original.amount = form.value.amount;
         const vals = await query(`
           SELECT m.month, COALESCE(sv.amount, bv.amount) AS amount
           FROM (${months.value.map(m => `SELECT '${m}' AS month`).join(' UNION ALL ')}) m
@@ -101,6 +105,16 @@ export default {
             [f.name, f.alias, f.company || null, f.charge_label || null, f.category_id,
              formulaVal, f.recurrence, f.renewal_day || null, f.start_month || null, f.end_month || null, f.notes || null, props.itemId]);
           if (hasSubcategories.value) await execute('UPDATE expense_items SET subcategory_id=? WHERE id=?', [sub, props.itemId]);
+          // A new amount or recurrence rewrites the forecast from this month on, keeping past months and actuals
+          const toCents = a => (a === '' || a == null ? null : Math.round(parseFloat(a) * 100));
+          const cents = toCents(f.amount);
+          const changed = cents !== toCents(original?.amount) || f.recurrence !== original?.recurrence;
+          if (f.entryMode === 'manual' && changed) {
+            if (cents !== null && !Number.isNaN(cents)) {
+              await respreadExpense(props.itemId, scenarioId.value, cents, f.recurrence,
+                f.start_month || null, f.end_month || null, dateRange.value?.end);
+            }
+          }
         } else {
           const res = await execute(`INSERT INTO expense_items (name, alias, company, charge_label, category_id,
             formula, recurrence, renewal_day, start_month, end_month, notes) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,

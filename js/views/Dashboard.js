@@ -4,8 +4,10 @@ import { loadMrrSeries, mrrChartDatasets } from '../profitwell.js';
 import {
   formatCents, formatPct, formatDelta, monthLabel,
   currentMonth, prevMonth, ordinalDay,
-  chargeFromMonthly, isChargeMonth,
 } from '../utils.js';
+import { loadExpenseValues, computeUpcomingCharges, horizonMonth } from '../charges.js';
+
+const RENEWAL_DAYS = 7;
 
 const COLORS = ['#6366f1', '#f59e0b', '#10b981', '#ef4444', '#8b5cf6'];
 
@@ -57,7 +59,7 @@ export default {
       const range = dateRange.value;
       try {
         const start = range?.start || month, end = range?.end || month;
-        const [series, cash, expenses, payroll, mrrAround, expCat, empRows, renewRows] =
+        const [series, cash, expenses, payroll, mrrAround, expCat, empRows, renewItems, renewValues] =
           await Promise.all([
             loadMrrSeries(sid, start, end),
             cashPosition().catch(() => null),
@@ -66,7 +68,8 @@ export default {
             loadMrrSeries(sid, prev, month),
             query(`SELECT ec.name AS category, COALESCE(SUM(ev.amount), 0) AS total FROM expense_values ev JOIN expense_items ei ON ev.expense_item_id = ei.id JOIN expense_categories ec ON ei.category_id = ec.id WHERE ev.scenario_id = ? AND ev.month = ? GROUP BY ec.name ORDER BY total DESC`, [sid, month]),
             query(`SELECT name, department FROM employees WHERE start_date <= ? AND (end_date IS NULL OR end_date >= ?)`, [month + '-31', month + '-01']),
-            query(`SELECT ei.name, ei.company, ev.amount, ei.renewal_day, ei.recurrence, ei.start_month FROM expense_items ei JOIN expense_values ev ON ev.expense_item_id = ei.id WHERE ev.scenario_id = ? AND ev.month = ? AND ei.renewal_day IS NOT NULL ORDER BY ei.renewal_day ASC`, [sid, month]),
+            query(`SELECT * FROM expense_items WHERE visible = 1`),
+            loadExpenseValues(sid, month, horizonMonth(RENEWAL_DAYS)),
           ]);
         if (run !== loadSeq) return;
 
@@ -80,14 +83,8 @@ export default {
         expensesByCat.value = expCat;
         employees.value = empRows;
 
-        const now = new Date();
-        renewals.value = renewRows.filter(r => {
-          if (!r.renewal_day) return false;
-          const d = new Date(now.getFullYear(), now.getMonth(), r.renewal_day);
-          if (d < now) d.setMonth(d.getMonth() + 1);
-          const renewalMonth = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
-          return (d - now) / 864e5 <= 30 && isChargeMonth(r.recurrence, r.start_month, renewalMonth);
-        }).map(r => ({ ...r, amount: chargeFromMonthly(r.amount, r.recurrence) }));
+        // Same charges as the Upcoming Charges page, soonest first
+        renewals.value = computeUpcomingCharges(renewItems, renewValues, RENEWAL_DAYS);
       } catch (e) { console.error('Dashboard load error:', e); }
       finally { if (run === loadSeq) { loading.value = false; await nextTick(); renderCharts(); } }
     }
@@ -145,9 +142,7 @@ export default {
     watch(() => [scenarioId.value, dateRange.value, mrrVersion.value], () => loadData(), { deep: true });
 
     function formatRenewalDate(item) {
-      const now = new Date();
-      const d = new Date(now.getFullYear(), now.getMonth(), item.renewal_day);
-      if (d < now) d.setMonth(d.getMonth() + 1);
+      const d = item.date;
       const ml = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
       return `${ml[d.getMonth()]} ${ordinalDay(d.getDate())}`;
     }
@@ -155,7 +150,7 @@ export default {
     return {
       loading, mrr, mrrDelta, arr, arrDelta, cashBalance, burnRate, runway,
       headcount, deptBreakdown, mrrSeries, expensesByCat, renewals,
-      mrrCanvasRef, expenseCanvasRef, teamCanvasRef, formatCents, formatRenewalDate,
+      mrrCanvasRef, expenseCanvasRef, teamCanvasRef, formatCents, formatRenewalDate, RENEWAL_DAYS,
     };
   },
   template: `
@@ -221,7 +216,10 @@ export default {
     </div>
     <!-- Row 4: Upcoming Renewals -->
     <div class="bg-white rounded-xl border border-gray-200 p-5">
-      <h2 class="text-sm font-semibold text-gray-700 mb-4">Upcoming Renewals</h2>
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="text-sm font-semibold text-gray-700">Upcoming Renewals <span class="font-normal text-gray-400">(next {{ RENEWAL_DAYS }} days)</span></h2>
+        <router-link to="/upcoming" class="text-xs text-indigo-600 hover:text-indigo-800">See all upcoming charges</router-link>
+      </div>
       <div v-if="renewals.length > 0" class="overflow-x-auto">
       <table class="w-full text-sm whitespace-nowrap">
         <thead>
@@ -233,7 +231,7 @@ export default {
           </tr>
         </thead>
         <tbody>
-          <tr v-for="r in renewals" :key="r.name + r.renewal_day" class="border-b border-gray-50">
+          <tr v-for="r in renewals" :key="r.key" class="border-b border-gray-50">
             <td class="sticky-col py-2.5 pr-3 text-gray-900">{{ r.name }}</td>
             <td class="py-2.5 text-gray-500">{{ r.company || '—' }}</td>
             <td class="py-2.5 text-right text-gray-900">{{ formatCents(r.amount) }}</td>
@@ -242,7 +240,7 @@ export default {
         </tbody>
       </table>
       </div>
-      <p v-else class="text-sm text-gray-400 py-4 text-center">No renewals in the next 30 days</p>
+      <p v-else class="text-sm text-gray-400 py-4 text-center">No renewals in the next {{ RENEWAL_DAYS }} days</p>
     </div>
   </div>
 </div>

@@ -225,8 +225,11 @@ export default {
     // Saves one cell and updates the row in place, so the table doesn't reload or jump
     const saveField = async (row, field, value) => {
       try {
-        await updateExpenseField(row, field, value, subcategories.value);
-        if (field === 'category_id') {
+        await updateExpenseField(row, field, value, subcategories.value, scenarioId.value);
+        if (field === 'recurrence') {
+          // The monthly values were rewritten to keep each charge's amount
+          await loadItems();
+        } else if (field === 'category_id') {
           const cat = categories.value.find(c => c.id === Number(value));
           const sub = subcategories.value.find(sc => sc.id === row.subcategory_id);
           row.category_id = Number(value);

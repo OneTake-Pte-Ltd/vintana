@@ -1,4 +1,5 @@
 import { query, execute } from './db.js';
+import { currentMonth, expenseMonthlyValues, forecastEnd, chargeFromMonthly } from './utils.js';
 
 export const RECURRENCE_OPTIONS = [
   { value: 'monthly', label: 'Monthly' },
@@ -26,14 +27,47 @@ export const subcategoryOptions = (subcategories, categoryId) => [
   ...subcategories.filter(s => s.category_id === Number(categoryId)).map(s => ({ value: s.id, label: s.name })),
 ];
 
+// Rewrites an expense's forecast for a scenario from this month on (or its start month, if later) so that
+// each charge is `chargeCents` on `recurrence`. Past months and actuals read from bank statements are kept.
+export async function respreadExpense(itemId, scenarioId, chargeCents, recurrence, startMonth, endMonth, rangeEnd) {
+  const from = startMonth && startMonth > currentMonth() ? startMonth : currentMonth();
+  const end = endMonth || forecastEnd(rangeEnd);
+  await execute('DELETE FROM expense_values WHERE expense_item_id = ? AND scenario_id = ? AND is_actual = 0 AND month >= ?',
+    [itemId, scenarioId, from]);
+  if (end < from) return;
+  const vals = recurrence === 'one_time'
+    ? (startMonth && startMonth >= from ? expenseMonthlyValues(chargeCents, recurrence, startMonth, end) : [])
+    : expenseMonthlyValues(chargeCents, recurrence, from, end);
+  for (const v of vals) {
+    await execute('INSERT OR IGNORE INTO expense_values (expense_item_id, scenario_id, month, amount, is_actual) VALUES (?,?,?,?,0)',
+      [itemId, scenarioId, v.month, v.amount]);
+  }
+}
+
+// Amount of one charge this month (scenario value, else base value), in cents
+export async function currentChargeAmount(item, scenarioId) {
+  const rows = await query(`
+    SELECT ev.amount FROM expense_values ev JOIN scenarios s ON s.id = ev.scenario_id
+    WHERE ev.expense_item_id = ? AND ev.month = ? AND (ev.scenario_id = ? OR s.is_base = 1)
+    ORDER BY (ev.scenario_id = ?) DESC LIMIT 1`, [item.id, currentMonth(), scenarioId, scenarioId]);
+  return rows.length ? chargeFromMonthly(rows[0].amount, item.recurrence) : 0;
+}
+
 const EDITABLE = ['name', 'company', 'charge_label', 'category_id', 'subcategory_id', 'recurrence'];
 const NUMERIC = ['category_id', 'subcategory_id'];
 
 // Saves one field of an expense. Moving an expense to another category clears a sub-category that
-// belongs to the old one.
-export async function updateExpenseField(item, field, value, subcategories = []) {
+// belongs to the old one. Changing the recurrence keeps the amount of each charge (a 688.99 monthly
+// charge becomes a 688.99 quarterly charge) by rewriting the scenario's forecast from this month on.
+export async function updateExpenseField(item, field, value, subcategories = [], scenarioId = null) {
   if (!EDITABLE.includes(field)) throw new Error(`Field ${field} can't be edited here`);
   const v = NUMERIC.includes(field) ? (value === null || value === '' ? null : Number(value)) : value;
+  if (field === 'recurrence' && scenarioId && v !== item.recurrence && !item.formula) {
+    const charge = await currentChargeAmount(item, scenarioId);
+    await execute('UPDATE expense_items SET recurrence = ? WHERE id = ?', [v, item.id]);
+    if (charge) await respreadExpense(item.id, scenarioId, charge, v, item.start_month, item.end_month);
+    return;
+  }
   if (field === 'category_id') {
     const sub = subcategories.find(s => s.id === item.subcategory_id);
     if (sub && sub.category_id !== v) {
