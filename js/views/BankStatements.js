@@ -5,8 +5,17 @@ import { loadAccounts, accountLabel } from '../bank.js';
 import { loadScenarioEmployees } from '../payroll.js';
 import {
   MAX_PDF_BYTES, KIND_OPTIONS, kindLabel, buildContext, readStatement, prepareReview, needsDecision, findOverlaps,
-  saveReview, findDiscrepancies, applyFix, deleteImport,
+  saveReview, findDiscrepancies, applyFix, deleteImport, discrepancyType, discrepancyFixes, distinctCompany,
 } from '../statements.js';
+import { loadCategoryLookups, subcategoryOptions } from '../expenses.js';
+import ExpenseModal from '../../components/ExpenseModal.js';
+
+// Colour and tag of each kind of discrepancy
+const D_STYLE = {
+  mismatch: { box: 'bg-amber-50 border-amber-400', tag: 'bg-amber-100 text-amber-800', label: 'Discrepancy' },
+  missing: { box: 'bg-slate-50 border-slate-300', tag: 'bg-slate-200 text-slate-700', label: 'Not found' },
+  suggestion: { box: 'bg-emerald-50 border-emerald-400', tag: 'bg-emerald-100 text-emerald-800', label: 'Suggestion' },
+};
 
 const SELECT = 'max-w-full px-2 py-1 text-sm border border-gray-200 rounded-md bg-white focus:outline-none focus:ring-2 focus:ring-indigo-500';
 const INPUT = 'w-full px-2 py-1 text-sm border border-gray-200 rounded-md focus:outline-none focus:ring-2 focus:ring-indigo-500';
@@ -14,8 +23,9 @@ let nextId = 1;
 
 export default {
   name: 'BankStatementsView',
+  components: { ExpenseModal },
   setup() {
-    const { ref, reactive, computed, onMounted, inject, watch } = Vue;
+    const { ref, reactive, computed, onMounted, onBeforeUnmount, inject, watch } = Vue;
     const settings = inject('settings');
     const loadSettings = inject('loadSettings');
     const toast = inject('toast');
@@ -23,6 +33,7 @@ export default {
     const accounts = ref([]);
     const providers = ref([]);
     const categories = ref([]);
+    const subcategories = ref([]);
     const employees = ref([]);
     const planned = ref([]);
     const history = ref([]);
@@ -34,18 +45,19 @@ export default {
 
     const loadLookups = async () => {
       try {
-        const [acc, prov, cats, emp, plan] = await Promise.all([
+        const [acc, prov, lookups, emp, plan] = await Promise.all([
           loadAccounts(),
           query(`SELECT ei.id, ei.name, ei.company, ec.name AS category_name, ec.sort_order FROM expense_items ei
                  JOIN expense_categories ec ON ec.id = ei.category_id WHERE ei.visible = 1 ORDER BY ec.sort_order, ei.name`),
-          query('SELECT id, name FROM expense_categories ORDER BY sort_order'),
+          loadCategoryLookups(),
           getBaseScenarioId().then(loadScenarioEmployees),
           query(`SELECT fe.id, fe.name, fe.month, fe.amount FROM funding_events fe JOIN scenarios s ON s.id = fe.scenario_id AND s.is_base = 1
                  WHERE fe.is_actual = 0 ORDER BY fe.month`).catch(() => []),
         ]);
         accounts.value = acc;
         providers.value = prov;
-        categories.value = cats;
+        categories.value = lookups.categories;
+        subcategories.value = lookups.subcategories;
         employees.value = emp.employees.filter(e => e._source !== 'scenario');
         planned.value = plan;
       } catch (e) {
@@ -64,7 +76,8 @@ export default {
     const addFiles = (files) => {
       for (const f of files) {
         const isPdf = f.type === 'application/pdf' || /\.pdf$/i.test(f.name);
-        const item = reactive({ id: nextId++, name: f.name, size: f.size, file: f, status: 'queued', error: '', review: null, overlaps: [], discrepancies: [], importId: null });
+        const item = reactive({ id: nextId++, name: f.name, size: f.size, file: f, status: 'queued', error: '', review: null, overlaps: [], importId: null,
+          progress: { phase: 'sending', lines: 0 }, startedAt: null });
         if (!isPdf) { item.file = null; item.status = 'failed'; item.error = 'Not a PDF file.'; }
         else if (f.size > MAX_PDF_BYTES) { item.file = null; item.status = 'failed'; item.error = 'Larger than 24 MB. Split the statement into shorter periods.'; }
         queue.push(item);
@@ -74,6 +87,21 @@ export default {
     const onPick = e => { addFiles([...e.target.files]); e.target.value = ''; };
     const onDrop = e => { dragging.value = false; addFiles([...e.dataTransfer.files]); };
 
+    // Ticks every second while a statement is being read, for the elapsed time
+    const now = ref(Date.now());
+    const ticker = setInterval(() => { if (queue.some(i => i.status === 'reading')) now.value = Date.now(); }, 1000);
+    onBeforeUnmount(() => clearInterval(ticker));
+    const elapsed = item => {
+      const s = Math.max(0, Math.round((now.value - (item.startedAt || now.value)) / 1000));
+      return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s`;
+    };
+    const progressText = item => {
+      const p = item.progress;
+      if (p.phase === 'preparing') return 'Extracting the text of the PDF...';
+      if (p.phase === 'sending' || !p.lines) return 'Sending to the model, waiting for the first lines...';
+      return `${p.lines} line${p.lines !== 1 ? 's' : ''} read so far...`;
+    };
+
     let reading = false;
     async function pump() {
       if (reading) return;
@@ -81,10 +109,12 @@ export default {
       if (!item) return;
       reading = true;
       item.status = 'reading';
+      item.startedAt = Date.now();
+      now.value = item.startedAt;
       const file = item.file;
       item.file = null; // the queue no longer holds the PDF; readStatement drops it once sent
       try {
-        const parsed = await readStatement(file, settings.value, await buildContext());
+        const parsed = await readStatement(file, settings.value, await buildContext(), undefined, p => { item.progress = p; });
         item.review = reactive(await prepareReview(parsed, item.name));
         item.overlaps = await findOverlaps(item.review.accountId, item.review.periodStart, item.review.periodEnd);
         item.status = 'review';
@@ -140,26 +170,38 @@ export default {
     });
 
     // Changing a line's type or provider keeps the other fields consistent
+    const blankProvider = row => ({
+      name: row.counterparty || row.description, company: '', subcategory_id: null, recurrence: 'one_time',
+      category_id: categories.value.find(c => c.name.startsWith('Uncategorized'))?.id || categories.value[0]?.id,
+    });
     const setKind = (row, kind) => {
       row.kind = kind;
       row.confidence = 'high';
-      if (kind === 'expense' && !row.expense_item_id && !row.newProvider) {
-        row.newProvider = { name: row.counterparty || row.description, company: row.counterparty || '', category_id: categories.value.find(c => c.name.startsWith('Uncategorized'))?.id || categories.value[0]?.id, recurrence: 'monthly' };
-      }
+      row.saveLabel = false;
+      if (kind === 'expense' && !row.expense_item_id && !row.newProvider) row.newProvider = blankProvider(row);
     };
     const providerChoice = row => row.expense_item_id ? String(row.expense_item_id) : (row.newProvider ? 'new' : '');
     const setProvider = (row, v) => {
       row.confidence = 'high';
-      if (v === 'new') {
+      if (v.startsWith('emp:')) {
+        // A person on the Payroll page: the line is a salary payment
+        row.kind = 'salary';
+        row.employee_id = Number(v.slice(4));
+        row.saveLabel = true;
+      } else if (v === 'new') {
         row.expense_item_id = null;
-        row.newProvider ||= { name: row.counterparty || row.description, company: row.counterparty || '', category_id: categories.value[0]?.id, recurrence: 'monthly' };
+        row.newProvider ||= blankProvider(row);
         row.saveLabel = false;
       } else {
         row.expense_item_id = v ? Number(v) : null;
         row.saveLabel = !!v; // the bank's wording becomes the provider's charge label, so next time it matches
       }
     };
-    const setEmployee = (row, v) => { row.employee_id = v ? Number(v) : null; row.confidence = 'high'; };
+    const setEmployee = (row, v) => { row.employee_id = v ? Number(v) : null; row.confidence = 'high'; row.saveLabel = !!v; };
+    const employeeName = id => employees.value.find(e => e.id === id)?.name || 'this person';
+    const subOptionsFor = np => subcategoryOptions(subcategories.value, np.category_id);
+    const onNewCategory = np => { if (!subOptionsFor(np).some(o => o.value === np.subcategory_id)) np.subcategory_id = null; };
+
     const setFunding = (row, v) => { row.funding_event_id = v ? Number(v) : null; row.confidence = 'high'; };
 
     const canSave = computed(() => review.value && review.value.accountId && !currencyMismatch.value
@@ -171,9 +213,11 @@ export default {
       if (!item || !canSave.value) return;
       item.status = 'saving';
       try {
-        item.importId = await saveReview(item.review, { replaceImportIds: item.overlaps.map(o => o.id) });
+        const replaced = item.overlaps.map(o => o.id);
+        item.importId = await saveReview(item.review, { replaceImportIds: replaced });
+        sessionImports.value = [...sessionImports.value.filter(id => !replaced.includes(id)), item.importId];
         await loadSettings?.();
-        item.discrepancies = reactive(await findDiscrepancies(item.importId, settings.value));
+        await refreshDiscrepancies();
         item.status = 'done';
         item.review = null;
         toast(`${item.name} saved`, 'success');
@@ -186,17 +230,42 @@ export default {
     const discard = () => { const item = active.value; if (!item) return; item.status = 'discarded'; item.review = null; };
     const removeFromList = item => { const i = queue.indexOf(item); if (i >= 0) queue.splice(i, 1); };
 
-    // --- Discrepancies and history ---
-    const fix = async (d, importId) => {
+    // --- Discrepancies: one list for every statement saved in this visit, checked again after each save ---
+    // A later statement can settle an earlier one's discrepancy (a missing month, a charge paid from another
+    // account), and two statements can raise the same one, so the list is rebuilt and de-duplicated each time.
+    const sessionImports = ref([]);
+    const discrepancies = ref([]);
+    const checking = ref(false);
+    const refreshDiscrepancies = async () => {
+      checking.value = true;
       try {
-        const msg = await applyFix(d.fix);
+        const seen = new Map();
+        for (const id of sessionImports.value) {
+          for (const d of await findDiscrepancies(id, settings.value)) seen.set(d.title + '|' + d.detail, { ...d, importId: id });
+        }
+        const order = { mismatch: 0, missing: 1, suggestion: 2 };
+        discrepancies.value = [...seen.values()].sort((a, b) => order[discrepancyType(a)] - order[discrepancyType(b)]);
+      } catch (e) {
+        toast('Could not check for discrepancies: ' + e.message, 'error');
+      } finally {
+        checking.value = false;
+      }
+    };
+    const dStyle = d => D_STYLE[discrepancyType(d)];
+    const sessionImportsCount = computed(() => sessionImports.value.length);
+
+    // --- Discrepancies and history ---
+    const fix = async (d, f, importId) => {
+      try {
+        const msg = await applyFix(f);
         d.applied = true;
         const row = history.value.find(h => h.id === importId);
         const stored = JSON.parse(row?.discrepancies || '[]');
         const match = stored.find(s => s.title === d.title && s.detail === d.detail);
         if (match) match.applied = true;
         await execute('UPDATE statement_imports SET discrepancies = ? WHERE id = ?', [JSON.stringify(stored), importId]);
-        if (d.fix.action === 'set_actuals_through') await loadSettings?.();
+        if (f.action === 'set_actuals_through') await loadSettings?.();
+        if (f.action === 'set_recurrence') await loadLookups();
         toast(msg, 'success');
         await loadHistory();
       } catch (e) { toast('Could not apply: ' + e.message, 'error'); }
@@ -208,6 +277,18 @@ export default {
         toast('Checked again', 'success');
       } catch (e) { toast('Check failed: ' + e.message, 'error'); }
     };
+    // Edit the expense behind a discrepancy in the usual window; the discrepancies are checked again when it closes
+    const editing = ref(null); // { itemId, history }
+    const editExpense = (d, h) => { editing.value = { itemId: d.itemId, history: h, changed: false }; };
+    const onEditClose = async () => {
+      const e = editing.value;
+      editing.value = null;
+      if (!e?.changed) return;
+      await loadLookups();
+      if (e.history) await recheck(e.history);
+      if (sessionImports.value.length) await refreshDiscrepancies();
+    };
+
     const confirmDelete = ref(null);
     const doDelete = async () => {
       const h = confirmDelete.value;
@@ -230,10 +311,11 @@ export default {
 
     return {
       SELECT, INPUT, KIND_OPTIONS, accounts, providers, providerGroups, categories, employees, planned, history, queue,
+      discrepancies, checking, dStyle, sessionImportsCount, discrepancyFixes, elapsed, progressText, employeeName, subOptionsFor, onNewCategory, subcategories,
       dragging, filter, fileInput, openHistory, active, review, reviewAccount, currencyMismatch, rowsShown, toDecide, flaggedCount, totals,
       canSave, confirmDelete, statusLabel,
       onPick, onDrop, onAccountChange, setKind, providerChoice, setProvider, setEmployee, setFunding, save, discard,
-      removeFromList, fix, recheck, doDelete, issues, openIssues, needsDecision, kindLabel, accountLabel,
+      removeFromList, fix, recheck, editing, editExpense, onEditClose, doDelete, issues, openIssues, needsDecision, kindLabel, accountLabel,
       money, formatCents, monthLabelFull, fmtDate, fmtShort,
     };
   },
@@ -267,17 +349,44 @@ export default {
             <span class="text-xs text-gray-400">{{ (item.size / 1048576).toFixed(1) }} MB</span>
             <button v-if="['done','failed','discarded'].includes(item.status)" @click="removeFromList(item)" class="ml-auto text-xs text-gray-400 hover:text-gray-700">Remove from list</button>
           </div>
-          <p v-if="item.status === 'failed'" class="text-xs text-red-600 mt-1">{{ item.error }}<template v-if="/\.pdf$/i.test(item.name)"> The PDF was discarded; drop it again to retry.</template></p>
-          <div v-if="item.status === 'done' && item.discrepancies.length" class="mt-3 space-y-2">
-            <div v-for="(d, i) in item.discrepancies" :key="i"
-              :class="['rounded-lg px-3 py-2 text-sm', d.applied ? 'bg-gray-50 text-gray-400' : d.severity === 'warning' ? 'bg-amber-50' : 'bg-indigo-50/60']">
-              <div class="font-medium text-gray-900">{{ d.title }}</div>
-              <div class="text-gray-600 text-xs mt-0.5">{{ d.detail }}</div>
-              <button v-if="d.fix && !d.applied" @click="fix(d, item.importId)" class="mt-1.5 px-2.5 py-1 text-xs rounded-md bg-white border border-gray-200 hover:bg-gray-50">{{ d.fix.label }}</button>
-              <span v-if="d.applied" class="text-xs">Done</span>
+          <div v-if="item.status === 'reading'" class="mt-2" role="status" aria-live="polite">
+            <div class="h-1.5 w-full rounded-full bg-indigo-100 overflow-hidden">
+              <div class="h-full w-1/3 rounded-full bg-indigo-500 progress-slide"></div>
+            </div>
+            <div class="flex justify-between text-xs text-gray-500 mt-1">
+              <span>{{ progressText(item) }}</span><span class="tabular-nums">{{ elapsed(item) }}</span>
             </div>
           </div>
-          <p v-else-if="item.status === 'done'" class="text-xs text-emerald-700 mt-1">No discrepancies found.</p>
+          <p v-if="item.status === 'failed'" class="text-xs text-red-600 mt-1">{{ item.error }}<template v-if="/\.pdf$/i.test(item.name)"> The PDF was discarded; drop it again to retry.</template></p>
+        </div>
+      </div>
+
+      <!-- Discrepancies of every statement saved in this visit, one up-to-date list -->
+      <div v-if="sessionImportsCount" class="bg-white rounded-xl border border-gray-200 p-4">
+        <div class="flex items-center justify-between gap-3 flex-wrap mb-2">
+          <h2 class="text-sm font-semibold text-gray-700">Discrepancies <span class="font-normal text-gray-400">({{ discrepancies.filter(d => !d.applied).length }} open, checked across the {{ sessionImportsCount }} statement{{ sessionImportsCount !== 1 ? 's' : '' }} saved)</span></h2>
+          <div class="flex items-center gap-3 text-[11px] text-gray-500">
+            <span class="inline-flex items-center gap-1"><span class="w-2.5 h-2.5 rounded-sm bg-amber-400"></span>Discrepancy</span>
+            <span class="inline-flex items-center gap-1"><span class="w-2.5 h-2.5 rounded-sm bg-slate-300"></span>Not found</span>
+            <span class="inline-flex items-center gap-1"><span class="w-2.5 h-2.5 rounded-sm bg-emerald-400"></span>Suggestion</span>
+          </div>
+        </div>
+        <p v-if="checking" class="text-xs text-gray-400">Checking...</p>
+        <div v-else class="space-y-2">
+          <div v-for="d in discrepancies" :key="d.title + d.detail" :class="['rounded-lg border-l-4 px-3 py-2 text-sm', d.applied ? 'bg-gray-50 border-gray-200 text-gray-400' : dStyle(d).box]">
+                      <div class="flex items-start gap-2">
+                        <span :class="['shrink-0 mt-0.5 px-1.5 py-0.5 rounded text-[11px] font-medium', d.applied ? 'bg-gray-100 text-gray-400' : dStyle(d).tag]">{{ d.applied ? 'Done' : dStyle(d).label }}</span>
+                        <div class="min-w-0">
+                          <div class="font-medium text-gray-900">{{ d.title }}</div>
+                          <div class="text-gray-600 text-xs mt-0.5">{{ d.detail }}</div>
+                          <div v-if="!d.applied && (discrepancyFixes(d).length || d.itemId)" class="mt-1.5 flex flex-wrap gap-1.5">
+                            <button v-for="f in discrepancyFixes(d)" :key="f.label" @click="fix(d, f, d.importId)" class="px-2.5 py-1 text-xs rounded-md bg-white border border-gray-200 hover:bg-gray-50">{{ f.label }}</button>
+                            <button v-if="d.itemId" @click="editExpense(d, null)" class="px-2.5 py-1 text-xs rounded-md text-indigo-600 hover:text-indigo-800 hover:bg-white">Edit expense...</button>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+          <p v-if="!discrepancies.length" class="text-xs text-emerald-700">No discrepancies found.</p>
         </div>
       </div>
 
@@ -356,12 +465,19 @@ export default {
                       <optgroup v-for="g in providerGroups" :key="g.name" :label="g.name">
                         <option v-for="p in g.items" :key="p.id" :value="String(p.id)">{{ p.name }}{{ p.company ? ' (' + p.company + ')' : '' }}</option>
                       </optgroup>
+                      <optgroup v-if="r.kind === 'expense' && employees.length" label="Payroll (records the line as a salary)">
+                        <option v-for="e in employees" :key="'emp' + e.id" :value="'emp:' + e.id">{{ e.name }}{{ e.role ? ' (' + e.role + ')' : '' }}</option>
+                      </optgroup>
                     </select>
                     <div v-if="r.kind === 'expense' && !r.expense_item_id && r.newProvider" class="mt-2 grid grid-cols-2 gap-2">
                       <input v-model="r.newProvider.name" :class="INPUT" placeholder="Provider name" :aria-label="'New provider name for ' + r.description"/>
                       <input v-model="r.newProvider.company" :class="INPUT" placeholder="Company" aria-label="Company"/>
-                      <select v-model.number="r.newProvider.category_id" :class="SELECT" aria-label="Category">
+                      <select v-model.number="r.newProvider.category_id" @change="onNewCategory(r.newProvider)" :class="SELECT" aria-label="Category">
                         <option v-for="c in categories" :key="c.id" :value="c.id">{{ c.name }}</option>
+                      </select>
+                      <select v-model="r.newProvider.subcategory_id" :class="SELECT" aria-label="Sub-category" :disabled="!subcategories.length"
+                        :title="subcategories.length ? '' : 'Sub-categories are not set up on this database yet'">
+                        <option v-for="o in subOptionsFor(r.newProvider)" :key="String(o.value)" :value="o.value">{{ o.value === null ? 'No sub-category' : o.label }}</option>
                       </select>
                       <select v-model="r.newProvider.recurrence" :class="SELECT" aria-label="Recurrence">
                         <option value="monthly">Monthly</option><option value="quarterly">Quarterly</option>
@@ -372,10 +488,15 @@ export default {
                       <input type="checkbox" v-model="r.saveLabel"/> Save this bank wording as the provider's charge label
                     </label>
                   </template>
-                  <select v-else-if="r.kind === 'salary'" :value="r.employee_id ? String(r.employee_id) : ''" @change="setEmployee(r, $event.target.value)" :class="SELECT + ' w-full'" :aria-label="'Employee for ' + r.description">
+                  <template v-else-if="r.kind === 'salary'">
+                  <select :value="r.employee_id ? String(r.employee_id) : ''" @change="setEmployee(r, $event.target.value)" :class="SELECT + ' w-full'" :aria-label="'Employee for ' + r.description">
                     <option value="">Choose...</option>
                     <option v-for="e in employees" :key="e.id" :value="String(e.id)">{{ e.name }}{{ e.role ? ' (' + e.role + ')' : '' }}</option>
                   </select>
+                  <label v-if="r.kind === 'salary' && r.employee_id" class="mt-1.5 flex items-center gap-1.5 text-xs text-gray-500">
+                    <input type="checkbox" v-model="r.saveLabel"/> Save this bank wording as {{ employeeName(r.employee_id) }}'s charge label
+                  </label>
+                  </template>
                   <div v-else-if="r.kind === 'funding'" class="space-y-1.5">
                     <input v-model="r.investor_name" :class="INPUT" placeholder="Investor name" :aria-label="'Investor for ' + r.description"/>
                     <select :value="r.funding_event_id ? String(r.funding_event_id) : ''" @change="setFunding(r, $event.target.value)" :class="SELECT + ' w-full'" aria-label="Funding event">
@@ -438,11 +559,20 @@ export default {
                 </tr>
                 <tr v-if="openHistory === h.id">
                   <td colspan="7" class="px-5 pb-4">
-                    <div v-for="(d, i) in issues(h)" :key="i" :class="['rounded-lg px-3 py-2 text-sm mt-2', d.applied ? 'bg-gray-50 text-gray-400' : d.severity === 'warning' ? 'bg-amber-50' : 'bg-indigo-50/60']">
-                      <div class="font-medium text-gray-900">{{ d.title }}</div>
-                      <div class="text-gray-600 text-xs mt-0.5">{{ d.detail }}</div>
-                      <button v-if="d.fix && !d.applied" @click="fix(d, h.id)" class="mt-1.5 px-2.5 py-1 text-xs rounded-md bg-white border border-gray-200 hover:bg-gray-50">{{ d.fix.label }}</button>
-                      <span v-if="d.applied" class="text-xs">Done</span>
+                    <div class="space-y-2 mt-2">
+                    <div v-for="(d, i) in issues(h)" :key="i" :class="['rounded-lg border-l-4 px-3 py-2 text-sm', d.applied ? 'bg-gray-50 border-gray-200 text-gray-400' : dStyle(d).box]">
+                      <div class="flex items-start gap-2">
+                        <span :class="['shrink-0 mt-0.5 px-1.5 py-0.5 rounded text-[11px] font-medium', d.applied ? 'bg-gray-100 text-gray-400' : dStyle(d).tag]">{{ d.applied ? 'Done' : dStyle(d).label }}</span>
+                        <div class="min-w-0">
+                          <div class="font-medium text-gray-900">{{ d.title }}</div>
+                          <div class="text-gray-600 text-xs mt-0.5">{{ d.detail }}</div>
+                          <div v-if="!d.applied && (discrepancyFixes(d).length || d.itemId)" class="mt-1.5 flex flex-wrap gap-1.5">
+                            <button v-for="f in discrepancyFixes(d)" :key="f.label" @click="fix(d, f, h.id)" class="px-2.5 py-1 text-xs rounded-md bg-white border border-gray-200 hover:bg-gray-50">{{ f.label }}</button>
+                            <button v-if="d.itemId" @click="editExpense(d, h)" class="px-2.5 py-1 text-xs rounded-md text-indigo-600 hover:text-indigo-800 hover:bg-white">Edit expense...</button>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
                     </div>
                     <p v-if="!issues(h).length" class="text-sm text-gray-400 mt-2">No discrepancies.</p>
                   </td>
@@ -453,6 +583,9 @@ export default {
           </table>
         </div>
       </div>
+
+      <expense-modal v-if="editing" :item-id="editing.itemId" :categories="categories" :subcategories="subcategories"
+        @saved="editing.changed = true" @close="onEditClose"/>
 
       <div v-if="confirmDelete" class="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
         <div class="bg-white rounded-xl p-6 max-w-sm" role="dialog" aria-modal="true">

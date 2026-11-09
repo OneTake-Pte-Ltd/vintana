@@ -11,9 +11,10 @@
 import { query, execute, batch, getCredentials } from './db.js';
 import { getBaseScenarioId } from './schema.js';
 import {
-  getReportingCurrency, addMonths, currentMonth, generateMonthRange, prevMonth, RECURRENCE_MONTHS, formatCents, monthLabelFull, isChargeMonth,
+  getReportingCurrency, addMonths, currentMonth, generateMonthRange, prevMonth, RECURRENCE_MONTHS, formatCents, monthLabelFull, isChargeMonth, ordinalDay,
 } from './utils.js';
 import { loadScenarioEmployees, employeeCost, isEmployedIn } from './payroll.js';
+import { respreadExpense } from './expenses.js';
 import { loadAccounts, getRate, convert, monthEnd, accountLabel } from './bank.js';
 import { streamChat, AssistantError, assistantChoice, DEFAULT_RELAY_URL } from './assistant.js';
 import { pdfToMarkdown } from './pdfText.js';
@@ -62,20 +63,24 @@ export async function buildContext() {
     accounts: accounts.map(a => ({ id: a.id, bank_name: a.bank_name, label: a.label, currency: a.currency })),
     providers,
     categories: categories.map(c => c.name),
-    employees: emp.employees.filter(e => e._source !== 'scenario').map(e => ({ id: e.id, name: e.name, role: e.role })),
+    employees: emp.employees.filter(e => e._source !== 'scenario')
+      .map(e => ({ id: e.id, name: e.name, role: e.role, charge_label: e.charge_label || null })),
     planned_funding: planned.map(f => ({ id: f.id, investor: f.name, month: f.month, amount: f.amount / 100 })),
   };
 }
 
 // Sends one statement to the relay and returns the parsed statement, with read_by set to the model that read it.
 // The file contents are dropped when this returns.
-export async function readStatement(file, settings, context, signal) {
+// `onProgress({ phase, lines })` reports how far reading has got: 'preparing' (turning the PDF into text), 'sending',
+// then 'reading' with the number of transactions read so far.
+export async function readStatement(file, settings, context, signal, onProgress = () => {}) {
   if (file.size > MAX_PDF_BYTES) throw new Error(`This PDF is ${(file.size / 1048576).toFixed(1)} MB; the limit is 24 MB. Split it into smaller statements.`);
   const { provider, model } = assistantChoice(settings);
   if (!model) throw new AssistantError('MODEL_NOT_ALLOWED', 'No model is chosen for the assistant. Pick one in Settings > Assistant.');
   let body;
   if (provider === 'openai') {
     if (!(await isPdf(file))) throw new Error('This file is not a PDF.');
+    onProgress({ phase: 'preparing', lines: 0 });
     const { markdown, pages } = await pdfToMarkdown(file);
     body = { provider, model, markdown, pages, context, file_name: file.name };
   } else {
@@ -84,8 +89,20 @@ export async function readStatement(file, settings, context, signal) {
     body = { provider, model, pdf, context, file_name: file.name };
   }
   let result;
+  onProgress({ phase: 'sending', lines: 0 });
+  // Count transactions as the model writes them: each one has a "date" key. Only the new text is scanned.
+  let lines = 0, scanned = 0;
+  const onText = text => {
+    const from = Math.max(0, scanned - 8);
+    const added = (text.slice(from).match(/"date"\s*:/g) || []).length
+      - (text.slice(from, scanned).match(/"date"\s*:/g) || []).length;
+    scanned = text.length;
+    lines += added;
+    onProgress({ phase: 'reading', lines });
+  };
   try {
     result = await streamChat({
+      onText,
       relayUrl: settings?.assistant_relay_url || DEFAULT_RELAY_URL,
       token: getCredentials().token,
       path: '/v1/statement',
@@ -127,6 +144,7 @@ export async function prepareReview(parsed, fileName) {
   const catId = name => categories.find(c => c.name.toLowerCase() === (name || '').toLowerCase())?.id
     || categories.find(c => c.name.startsWith('Uncategorized'))?.id || categories[0]?.id;
   const known = id => providers.some(p => p.id === id);
+  const RECURRENCES = ['monthly', 'quarterly', 'annual', 'one_time'];
 
   const rows = (parsed.transactions || []).map((t, i) => {
     const amount = toCents(t.amount);
@@ -145,9 +163,12 @@ export async function prepareReview(parsed, fileName) {
     if (row.kind === 'expense' && !row.expense_item_id && same) { row.expense_item_id = same.id; row.saveLabel = true; }
     if (row.kind === 'expense' && !row.expense_item_id) {
       const sp = t.suggested_provider;
+      const name = sp?.name || t.counterparty || t.description;
       row.newProvider = {
-        name: sp?.name || t.counterparty || t.description, company: sp?.company || t.counterparty || '',
-        category_id: catId(sp?.category), recurrence: 'monthly',
+        name, company: distinctCompany(name, sp?.company ?? t.counterparty),
+        category_id: catId(sp?.category), subcategory_id: null,
+        // Unknown recurrence: a one-off is the safer guess (hotels, travel, meals)
+        recurrence: RECURRENCES.includes(sp?.recurrence) ? sp.recurrence : 'one_time',
       };
     }
     row.flagged = needsDecision(row) || !!same || t.confidence === 'low'; // stays in "To check" after it's decided, so it doesn't vanish mid-review
@@ -161,6 +182,12 @@ export async function prepareReview(parsed, fileName) {
     monthEnds: (parsed.month_end_balances || []).map(b => ({ month: b.month, balance: toCents(b.balance) })),
     warnings: parsed.warnings || [], rows,
   };
+}
+
+// The company of a new provider, unless it only repeats the provider's name
+export function distinctCompany(name, company) {
+  const c = (company || '').trim();
+  return c && c.toLowerCase() !== (name || '').trim().toLowerCase() ? c : '';
 }
 
 // A row needs a decision when the model wasn't sure or couldn't link it
@@ -229,7 +256,7 @@ export async function saveReview(review, { replaceImportIds = [] } = {}) {
   for (const id of replaceImportIds) await deleteImport(id);
 
   // Notes the model made while reading (unreadable parts and the like) are kept with the import's discrepancies
-  const readingNotes = review.warnings.map(w => ({ severity: 'warning', title: 'Note from reading the statement', detail: w, fromReading: true }));
+  const readingNotes = review.warnings.map(w => ({ type: 'mismatch', severity: 'warning', title: 'Note from reading the statement', detail: w, fromReading: true }));
   const res = await execute(`INSERT INTO statement_imports (account_id, file_name, period_start, period_end, currency,
     opening_balance, closing_balance, transaction_count, discrepancies, read_by) VALUES (?,?,?,?,?,?,?,?,?,?)`,
     [account.id, review.fileName, review.periodStart, review.periodEnd, account.currency, review.opening, review.closing,
@@ -245,16 +272,22 @@ export async function saveReview(review, { replaceImportIds = [] } = {}) {
       const ins = await execute(`INSERT INTO expense_items (name, alias, company, charge_label, category_id, recurrence, renewal_day, start_month, notes)
         VALUES (?,?,?,?,?,?,?,?,?)`,
         [r.newProvider.name.trim(), await uniqueAlias(r.newProvider.name), r.newProvider.company || null, r.description,
-         r.newProvider.category_id, r.newProvider.recurrence || 'monthly', Number(r.date.slice(8, 10)) || null, r.month,
+         r.newProvider.category_id, r.newProvider.recurrence || 'one_time', Number(r.date.slice(8, 10)) || null, r.month,
          `Added from bank statement ${review.fileName}`]);
       newIds[key] = ins.lastInsertRowid;
+      if (r.newProvider.subcategory_id) {
+        await execute('UPDATE expense_items SET subcategory_id = ? WHERE id = ?', [r.newProvider.subcategory_id, newIds[key]]);
+      }
     }
     r.expense_item_id = newIds[key];
   }
-  // Existing providers picked by hand: keep the bank's wording so the next statement matches on its own
+  // Providers and people picked by hand: keep the bank's wording so the next statement matches on its own
   for (const r of review.rows) {
-    if (r.saveLabel && r.expense_item_id) {
+    if (!r.saveLabel) continue;
+    if (['expense', 'refund'].includes(r.kind) && r.expense_item_id) {
       await execute('UPDATE expense_items SET charge_label = ? WHERE id = ?', [r.description, r.expense_item_id]);
+    } else if (r.kind === 'salary' && r.employee_id) {
+      await execute('UPDATE employees SET charge_label = ? WHERE id = ?', [r.description, r.employee_id]);
     }
   }
 
@@ -323,7 +356,34 @@ export async function recomputeRunRate(itemIds, months, baseId) {
 }
 
 // --- Discrepancies --------------------------------------------------------------------------------------------
-// Each: { severity: 'warning'|'info', title, detail, fix?: { label, action, args } }
+// Each: { type, severity: 'warning'|'info', title, detail, fixes?: [{ label, action, args }] }
+// type: 'mismatch' (the bank and Vintana disagree), 'missing' (something expected was not found)
+// or 'suggestion' (nothing wrong; a step that would help). Older imports stored `fix` instead of `fixes`.
+export const discrepancyType = d => d.type
+  || (d.severity === 'warning' ? 'mismatch' : d.fix?.action === 'set_actuals_through' ? 'suggestion' : 'missing');
+export const discrepancyFixes = d => d.fixes || (d.fix ? [d.fix] : []);
+
+const NAMES = { monthly: 'monthly', quarterly: 'quarterly', annual: 'annual' };
+// Fixes that switch an expense to a longer recurrence, charged `charge` (reporting cents) from `month`
+const longerRecurrences = (it, month, charge) => ['quarterly', 'annual']
+  .filter(r => RECURRENCE_MONTHS[r] > (RECURRENCE_MONTHS[it.recurrence] || 1))
+  .map(r => ({ label: `Make ${it.name} ${NAMES[r]} (${formatCents(charge)} from ${monthLabelFull(month)})`, action: 'set_recurrence',
+    args: { itemId: it.id, recurrence: r, month, charge } }));
+
+// Days between a charge and the nearest renewal day (in its month or the one before or after), signed:
+// positive when the charge came later than the renewal day
+export function chargeDayOffset(date, renewalDay) {
+  const actual = new Date(date + 'T00:00:00');
+  let best = null;
+  for (const k of [-1, 0, 1]) {
+    const y = actual.getFullYear(), m = actual.getMonth() + k;
+    const expected = new Date(y, m, Math.min(renewalDay, new Date(y, m + 1, 0).getDate()));
+    const off = Math.round((actual - expected) / 864e5);
+    if (best === null || Math.abs(off) < Math.abs(best)) best = off;
+  }
+  return best;
+}
+const DAY_TOLERANCE = 3; // banks often post a charge a few days late (weekends, processing)
 
 const fullMonthsIn = (start, end) => generateMonthRange(start.slice(0, 7), end.slice(0, 7))
   .filter(m => start <= `${m}-01` && end >= monthEnd(m));
@@ -342,7 +402,7 @@ export async function findDiscrepancies(importId, settings) {
   const sum = lines.reduce((s, l) => s + l.amount, 0);
   const gap = imp.opening_balance + sum - imp.closing_balance;
   if (Math.abs(gap) > 1) {
-    out.push({ severity: 'warning', title: 'The lines don\'t add up to the closing balance',
+    out.push({ type: 'mismatch', severity: 'warning', title: 'The lines don\'t add up to the closing balance',
       detail: `Opening ${money(imp.opening_balance)} plus the lines read (${money(sum)}) gives ${money(imp.opening_balance + sum)}, but the statement closes at ${money(imp.closing_balance)}: a gap of ${money(gap)}. A line may have been misread or left out. Compare with the PDF, then delete this import and read it again.` });
   }
 
@@ -351,9 +411,9 @@ export async function findDiscrepancies(importId, settings) {
   const startsOnFirst = imp.period_start.endsWith('-01');
   const prevBal = (await query('SELECT balance, source FROM bank_balances WHERE account_id = ? AND month = ?', [imp.account_id, prev]))[0];
   if (startsOnFirst && prevBal && Math.abs(prevBal.balance - imp.opening_balance) > 1) {
-    out.push({ severity: 'warning', title: `Opening balance differs from the end of ${monthLabelFull(prev)}`,
+    out.push({ type: 'mismatch', severity: 'warning', title: `Opening balance differs from the end of ${monthLabelFull(prev)}`,
       detail: `This statement opens at ${money(imp.opening_balance)}, but ${monthLabelFull(prev)} ended at ${money(prevBal.balance)}${prevBal.source === 'manual' ? ' (entered by hand)' : ''}. If the earlier figure was typed in, correct it; otherwise a statement may be missing or misread.`,
-      fix: { label: `Set end of ${monthLabelFull(prev)} to ${money(imp.opening_balance)}`, action: 'set_balance', args: { accountId: imp.account_id, month: prev, balance: imp.opening_balance } } });
+      fixes: [{ label: `Set end of ${monthLabelFull(prev)} to ${money(imp.opening_balance)}`, action: 'set_balance', args: { accountId: imp.account_id, month: prev, balance: imp.opening_balance } }] });
   }
 
   // 3. Months with no statement for this account, between the first one imported and this one
@@ -363,7 +423,7 @@ export async function findDiscrepancies(importId, settings) {
   const last = all[all.length - 1]?.period_end.slice(0, 7);
   const gaps = first ? generateMonthRange(first, last).filter(m => !covered.has(m)) : [];
   if (gaps.length) {
-    out.push({ severity: 'info', title: `No statement yet for ${gaps.map(monthLabelFull).join(', ')}`,
+    out.push({ type: 'missing', severity: 'info', title: `No statement yet for ${gaps.map(monthLabelFull).join(', ')}`,
       detail: `${accountLabel(account)} has statements before and after ${gaps.length > 1 ? 'these months' : 'this month'}. Import ${gaps.length > 1 ? 'them' : 'it'} so cash flow and actuals are complete.` });
   }
 
@@ -373,29 +433,76 @@ export async function findDiscrepancies(importId, settings) {
   // 4. Charges: expected but not seen, different from the forecast, or charged twice
   const items = await query('SELECT * FROM expense_items WHERE visible = 1');
   const seen = await query(`SELECT expense_item_id AS id, month, COUNT(*) AS n, -SUM(amount_reporting) AS total,
-      MIN(amount) AS min_a, MAX(amount) AS max_a
+      MIN(amount) AS min_a, MAX(amount) AS max_a, MIN(date) AS first_date
     FROM bank_transactions WHERE kind = 'expense' AND expense_item_id IS NOT NULL GROUP BY expense_item_id, month`);
   const seenMap = new Map(seen.map(s => [`${s.id}:${s.month}`, s]));
   const forecastAfter = async (itemId, month) => (await query(`SELECT month, amount FROM expense_values WHERE expense_item_id = ? AND scenario_id = ?
       AND is_actual = 0 AND month > ? ORDER BY month LIMIT 1`, [itemId, baseId, month]))[0];
   const rmoney = c => formatCents(c);
+  const longDate = iso => new Date(iso + 'T00:00:00').toLocaleDateString('en-GB', { day: 'numeric', month: 'long' });
+
+  // Quarterly and annual charges that came in another month than expected: matched to the nearest expected month
+  // (up to 2 months away) that has no charge of its own. One "charged in another month" card replaces that month's
+  // "not charged" card.
+  const shiftedTo = new Set();     // `${id}:${expected month}`
+  const shiftedFrom = new Map();   // `${id}:${month charged}` -> expected month
+  for (const s of seen) {
+    const it = items.find(i => i.id === s.id);
+    if (!it || it.formula || !['quarterly', 'annual'].includes(it.recurrence) || !it.start_month) continue;
+    if (isChargeMonth(it.recurrence, it.start_month, s.month)) continue;
+    for (const k of [-1, 1, -2, 2]) {
+      const e = addMonths(s.month, k);
+      if (isChargeMonth(it.recurrence, it.start_month, e) && !seenMap.has(`${it.id}:${e}`) && !shiftedTo.has(`${it.id}:${e}`)) {
+        shiftedTo.add(`${it.id}:${e}`);
+        shiftedFrom.set(`${it.id}:${s.month}`, e);
+        break;
+      }
+    }
+  }
 
   for (const m of fullMonths) {
     for (const it of items) {
+      const s = seenMap.get(`${it.id}:${m}`);
+      const expectedIn = shiftedFrom.get(`${it.id}:${m}`);
+      if (s && expectedIn) {
+        const day = Number(s.first_date.slice(8, 10));
+        const span = RECURRENCE_MONTHS[it.recurrence];
+        out.push({ type: 'mismatch', severity: 'info', itemId: it.id,
+          title: `${it.name} charged in ${monthLabelFull(m)}, expected in ${monthLabelFull(expectedIn)}`,
+          detail: `This ${NAMES[it.recurrence]} charge came on ${longDate(s.first_date)}, but its renewal was expected in ${monthLabelFull(expectedIn)}${it.renewal_day ? ` on the ${ordinalDay(it.renewal_day)}` : ''}. If the renewal date has moved, move it so the next charges are expected at the right time.`,
+          fixes: [{ label: `Renew every ${span} months from ${monthLabelFull(m)}, on the ${ordinalDay(day)}`, action: 'move_renewal', args: { itemId: it.id, month: m, day } }] });
+      }
       const active = (!it.start_month || it.start_month <= m) && (!it.end_month || it.end_month >= m);
       if (!active || it.formula) continue;
       const due = it.recurrence === 'one_time' ? it.start_month === m
         : it.recurrence === 'monthly' ? true : (it.start_month && isChargeMonth(it.recurrence, it.start_month, m));
-      const s = seenMap.get(`${it.id}:${m}`);
+      if (due && !s && shiftedTo.has(`${it.id}:${m}`)) continue; // charged in a nearby month: reported above
       if (due && !s) {
-        // Only when the charge was due in a month this statement fully covers, and no imported account shows it
-        out.push({ severity: 'info', title: `${it.name} not charged in ${monthLabelFull(m)}`,
-          detail: `It was expected in ${monthLabelFull(m)} but appears in no imported statement. If it's paid from an account you haven't imported yet, import that statement. If it has ended, set an end month.`,
-          fix: { label: `End ${it.name} in ${monthLabelFull(prevMonth(m))}`, action: 'end_expense', args: { itemId: it.id, month: prevMonth(m) } } });
+        // Only when the charge was due in a month this statement fully covers, and no imported account shows it.
+        // If it was charged before, it may renew less often than recorded: offer the longer recurrences that
+        // would not expect it this month, anchored on the last charge.
+        const last = seen.filter(x => x.id === it.id && x.month < m).sort((a, b) => b.month.localeCompare(a.month))[0];
+        const longer = last && it.recurrence !== 'one_time'
+          ? longerRecurrences(it, last.month, last.total).filter(f => !isChargeMonth(f.args.recurrence, last.month, m))
+          : [];
+        out.push({ type: 'missing', severity: 'info', itemId: it.id, title: `${it.name} not charged in ${monthLabelFull(m)}`,
+          detail: `It was expected in ${monthLabelFull(m)} but appears in no imported statement.${last ? ` It was last charged ${formatCents(last.total)} in ${monthLabelFull(last.month)}; if it renews less often, change its recurrence.` : ''} If it's paid from an account you haven't imported yet, import that statement. If it has ended, set an end month.`,
+          fixes: [...longer, { label: `End ${it.name} in ${monthLabelFull(prevMonth(m))}`, action: 'end_expense', args: { itemId: it.id, month: prevMonth(m) } }] });
       }
       if (!s) continue;
+      // Charged on another day than the renewal day (one charge in the month; a moved renewal is reported above)
+      if (it.renewal_day && s.n === 1 && !expectedIn) {
+        const off = chargeDayOffset(s.first_date, it.renewal_day);
+        if (Math.abs(off) > DAY_TOLERANCE) {
+          const day = Number(s.first_date.slice(8, 10));
+          out.push({ type: 'mismatch', severity: 'info', itemId: it.id,
+            title: `${it.name} charged on the ${ordinalDay(day)}, renewal day is the ${ordinalDay(it.renewal_day)}`,
+            detail: `The ${monthLabelFull(m)} charge came on ${longDate(s.first_date)}, ${Math.abs(off)} days ${off > 0 ? 'later' : 'earlier'} than expected. If the billing date has changed, update the renewal day so Upcoming Charges show the right date.`,
+            fixes: [{ label: `Set the renewal day to the ${ordinalDay(day)}`, action: 'set_renewal_day', args: { itemId: it.id, day } }] });
+        }
+      }
       if (it.recurrence === 'monthly' && s.n > 1 && s.min_a === s.max_a) {
-        out.push({ severity: 'warning', title: `${it.name} charged ${s.n} times in ${monthLabelFull(m)}`,
+        out.push({ type: 'mismatch', severity: 'warning', itemId: it.id, title: `${it.name} charged ${s.n} times in ${monthLabelFull(m)}`,
           detail: `${s.n} identical charges of ${money(-s.max_a)}. Check with the supplier for double billing.` });
       }
       const next = await forecastAfter(it.id, m);
@@ -406,9 +513,12 @@ export async function findDiscrepancies(importId, settings) {
         if (expected > 0 && Math.abs(diff) > Math.max(100, expected * 0.05)) {
           const pct = Math.round((diff / expected) * 100);
           const newMonthly = Math.round(s.total / span);
-          out.push({ severity: 'info', title: `${it.name} cost ${rmoney(s.total)} in ${monthLabelFull(m)}, ${pct > 0 ? '+' : ''}${pct}% vs forecast`,
-            detail: `The forecast expects ${rmoney(expected)} per charge. If the new price will last, update the forecast from ${monthLabelFull(next.month)} onwards.`,
-            fix: { label: `Use ${rmoney(newMonthly)} a month from ${monthLabelFull(next.month)}`, action: 'update_forecast', args: { itemId: it.id, from: next.month, amount: newMonthly } } });
+          // Much more than expected: often a quarterly or annual charge recorded as monthly
+          const muchLarger = s.total >= expected * 2.5 && s.n === 1;
+          const longer = muchLarger ? longerRecurrences(it, m, s.total) : [];
+          out.push({ type: 'mismatch', severity: 'info', itemId: it.id, title: `${it.name} cost ${rmoney(s.total)} in ${monthLabelFull(m)}, ${pct > 0 ? '+' : ''}${pct}% vs forecast`,
+            detail: `The forecast expects ${rmoney(expected)} per charge. ${longer.length ? `A charge this much larger may cover several months: if it renews ${longer.map(f => NAMES[f.args.recurrence]).join(' or ')}, change its recurrence. ` : ''}If the new price will last, update the forecast from ${monthLabelFull(next.month)} onwards.`,
+            fixes: [...longer, { label: `Use ${rmoney(newMonthly)} a month from ${monthLabelFull(next.month)}`, action: 'update_forecast', args: { itemId: it.id, from: next.month, amount: newMonthly } }] });
         }
       }
     }
@@ -425,7 +535,7 @@ export async function findDiscrepancies(importId, settings) {
       const expected = employeeCost(e);
       if (!p) {
         if (lines.some(l => l.month === m)) {
-          out.push({ severity: 'info', title: `No salary payment to ${e.name} in ${monthLabelFull(m)}`,
+          out.push({ type: 'missing', severity: 'info', title: `No salary payment to ${e.name} in ${monthLabelFull(m)}`,
             detail: `Payroll expects ${rmoney(expected)}. If ${e.name} is paid from another account, import that statement. If ${e.name} has left, set an end date on the Payroll page.` });
         }
         continue;
@@ -434,9 +544,9 @@ export async function findDiscrepancies(importId, settings) {
         const fix = (e.tax_pct || 0) === 0
           ? { label: `Set ${e.name}'s monthly salary to ${rmoney(p.total)}`, action: 'update_salary', args: { employeeId: e.id, salary: p.total } }
           : undefined;
-        out.push({ severity: 'info', title: `${e.name} was paid ${rmoney(p.total)} in ${monthLabelFull(m)}`,
+        out.push({ type: 'mismatch', severity: 'info', title: `${e.name} was paid ${rmoney(p.total)} in ${monthLabelFull(m)}`,
           detail: `Payroll expects ${rmoney(expected)}. The payment is recorded as the actual for ${monthLabelFull(m)}. If the change is lasting (a raise, a new rate), update the salary${fix ? '' : ' on the Payroll page'}; if it's a one-off (bonus, partial month), nothing to do.`,
-          fix });
+          fixes: fix ? [fix] : [] });
       }
     }
   }
@@ -450,12 +560,12 @@ export async function findDiscrepancies(importId, settings) {
     }));
     const at = settings?.actuals_through;
     if (allCovered.every(Boolean) && (!at || at < latestFull) && latestFull < currentMonth()) {
-      out.push({ severity: 'info', title: `Every account now has a statement for ${monthLabelFull(latestFull)}`,
+      out.push({ type: 'suggestion', severity: 'info', title: `Every account now has a statement for ${monthLabelFull(latestFull)}`,
         detail: `"Actuals through" is ${at ? monthLabelFull(at) : 'not set'}. Move it to ${monthLabelFull(latestFull)} so reports treat that month as actual.`,
-        fix: { label: `Set actuals through ${monthLabelFull(latestFull)}`, action: 'set_actuals_through', args: { month: latestFull } } });
+        fixes: [{ label: `Set actuals through ${monthLabelFull(latestFull)}`, action: 'set_actuals_through', args: { month: latestFull } }] });
     } else if (!allCovered.every(Boolean) && accounts.length > 1) {
       const missing = accounts.filter((a, i) => !allCovered[i]).map(accountLabel);
-      out.push({ severity: 'info', title: `Total cash for ${monthLabelFull(latestFull)} is incomplete`,
+      out.push({ type: 'missing', severity: 'info', title: `Total cash for ${monthLabelFull(latestFull)} is incomplete`,
         detail: `No statement covers ${monthLabelFull(latestFull)} yet for ${missing.join(', ')}. Import ${missing.length > 1 ? 'them' : 'it'} to complete cash and actuals for that month.` });
     }
   }
@@ -480,6 +590,23 @@ export async function applyFix(fix) {
       await execute('UPDATE expense_values SET amount = ? WHERE expense_item_id = ? AND scenario_id = ? AND is_actual = 0 AND month >= ?', [a.amount, a.itemId, baseId, a.from]);
       return 'Forecast updated';
     }
+    case 'set_recurrence': {
+      // The charge month becomes the anchor of the new recurrence; its charge is spread over the months it covers,
+      // and the forecast from then on uses the same charge
+      const baseId = await baseScenarioId();
+      const item = (await query('SELECT end_month FROM expense_items WHERE id = ?', [a.itemId]))[0];
+      await execute('UPDATE expense_items SET recurrence = ?, start_month = ? WHERE id = ?', [a.recurrence, a.month, a.itemId]);
+      await recomputeRunRate([a.itemId], [a.month], baseId);
+      await respreadExpense(a.itemId, baseId, a.charge, a.recurrence, a.month, item?.end_month || null);
+      return `Recurrence changed to ${NAMES[a.recurrence]}`;
+    }
+    case 'set_renewal_day':
+      await execute('UPDATE expense_items SET renewal_day = ? WHERE id = ?', [a.day, a.itemId]);
+      return 'Renewal day updated';
+    case 'move_renewal':
+      // The month charged becomes the anchor: later renewals are expected every 3 or 12 months from it
+      await execute('UPDATE expense_items SET start_month = ?, renewal_day = ? WHERE id = ?', [a.month, a.day, a.itemId]);
+      return 'Renewal moved';
     case 'update_salary':
       await execute('UPDATE employees SET salary_monthly = ? WHERE id = ?', [a.salary, a.employeeId]);
       return 'Salary updated';

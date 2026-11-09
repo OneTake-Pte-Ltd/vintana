@@ -194,8 +194,11 @@ const STATEMENT_SCHEMA = {
           kind: { type: 'string', enum: KINDS },
           expense_item_id: nullable({ type: 'integer' }),
           suggested_provider: nullable({
-            type: 'object', additionalProperties: false, required: ['name', 'company', 'category'],
-            properties: { name: { type: 'string' }, company: nullable({ type: 'string' }), category: { type: 'string' } },
+            type: 'object', additionalProperties: false, required: ['name', 'company', 'category', 'recurrence'],
+            properties: {
+              name: { type: 'string' }, company: nullable({ type: 'string' }), category: { type: 'string' },
+              recurrence: { type: 'string', enum: ['monthly', 'quarterly', 'annual', 'one_time'] },
+            },
           }),
           employee_id: nullable({ type: 'integer' }),
           investor_name: nullable({ type: 'string' }),
@@ -224,8 +227,12 @@ Balances:
 Account: matched_account_id is the id of the Vintana account (in <vintana_context>) with the same bank and currency, or null if none clearly fits.
 
 For each transaction, choose kind:
-- expense: money paid to a supplier or service, including bank fees and payments to IRAS (tax). Set expense_item_id to the matching provider in <vintana_context> when the name, company or charge label clearly matches the description. If none matches, set expense_item_id to null and suggest a provider: a short name, the company, and one of the category names given.
-- salary: a payment to a person listed in employees (employees and contractors). Set employee_id. A payment to a person who is not listed is an expense with a suggested provider.
+- expense: money paid to a supplier or service, including bank fees and payments to IRAS (tax). Set expense_item_id to the matching provider in <vintana_context> when the name, company or charge label clearly matches the description. If none matches, set expense_item_id to null and suggest a provider:
+  - name: a short name for the provider, such as "Hotel Mercure".
+  - company: the company behind it only when it differs from the name, such as "Accor" for "Hotel Mercure"; otherwise null. Never repeat the name.
+  - category: one of the category names given.
+  - recurrence: how often this charge comes back. one_time for hotels, flights, trains, taxis, meals, events, equipment and other one-off purchases; monthly only for subscriptions and services billed every month; quarterly or annual when the description or amount clearly shows it. When unsure, one_time.
+- salary: a payment to a person listed in employees (employees and contractors). Match on the name or on the person's charge_label, which is how earlier statements described payments to them. Set employee_id. A payment to a person who is not listed is an expense with a suggested provider.
 - funding: an incoming wire from an investor; descriptions read "SAFE INVESTOR" followed by the investor's name. Set investor_name. If a planned funding event in <vintana_context> is for the same investor, set funding_event_id.
 - revenue: money from customers, including payouts from payment processors such as Stripe, Paddle or PayPal.
 - refund: money back from a supplier; set expense_item_id when the provider is known.
