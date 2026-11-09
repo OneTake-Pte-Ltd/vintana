@@ -197,7 +197,7 @@ const STATEMENT_SCHEMA = {
             type: 'object', additionalProperties: false, required: ['name', 'company', 'category', 'recurrence'],
             properties: {
               name: { type: 'string' }, company: nullable({ type: 'string' }), category: { type: 'string' },
-              recurrence: { type: 'string', enum: ['monthly', 'quarterly', 'annual', 'one_time'] },
+              recurrence: { type: 'string', enum: ['weekly', 'monthly', 'quarterly', 'annual', 'one_time'] },
             },
           }),
           employee_id: nullable({ type: 'integer' }),
@@ -231,7 +231,7 @@ For each transaction, choose kind:
   - name: a short name for the provider, such as "Hotel Mercure".
   - company: the company behind it only when it differs from the name, such as "Accor" for "Hotel Mercure"; otherwise null. Never repeat the name.
   - category: one of the category names given.
-  - recurrence: how often this charge comes back. one_time for hotels, flights, trains, taxis, meals, events, equipment and other one-off purchases; monthly only for subscriptions and services billed every month; quarterly or annual when the description or amount clearly shows it. When unsure, one_time.
+  - recurrence: how often this charge comes back. one_time for hotels, flights, trains, taxis, meals, events, equipment and other one-off purchases; weekly for ad platforms such as Facebook/Meta or Google Ads when they bill every week; monthly only for subscriptions and services billed every month; quarterly or annual when the description or amount clearly shows it. When unsure, one_time.
 - salary: a payment to a person listed in employees (employees and contractors). Match on the name or on the person's charge_label, which is how earlier statements described payments to them. Set employee_id. A payment to a person who is not listed is an expense with a suggested provider.
 - funding: an incoming wire from an investor; descriptions read "SAFE INVESTOR" followed by the investor's name. Set investor_name. If a planned funding event in <vintana_context> is for the same investor, set funding_event_id.
 - revenue: money from customers, including payouts from payment processors such as Stripe, Paddle or PayPal.

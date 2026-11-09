@@ -1,6 +1,6 @@
 import { query, execute } from '../db.js';
 import { getBaseScenarioId } from '../schema.js';
-import { formatCents, monthLabel, generateMonthRange, currentMonth, ordinalDay } from '../utils.js';
+import { formatCents, monthLabel, generateMonthRange, currentMonth, ordinalDay, weeklyAnchor } from '../utils.js';
 import {
   loadCategoryLookups, categoryOptions, subcategoryOptions, RECURRENCE_OPTIONS, recurrenceLabel, updateExpenseField,
 } from '../expenses.js';
@@ -128,7 +128,7 @@ export default {
       subcategory: r => subName(r).toLowerCase(),
       budget: r => r.cur_amount || 0,
       renewal: r => r.renewal_day,
-      recurrence: r => ({ monthly: 1, quarterly: 2, annual: 3, one_time: 4 }[r.recurrence] || 9),
+      recurrence: r => ({ weekly: 0, monthly: 1, quarterly: 2, annual: 3, one_time: 4 }[r.recurrence] || 9),
       period: r => r.start_month || '',
     };
     const toggleSort = (col) => {
@@ -214,6 +214,12 @@ export default {
       'Total Expenses',
     ));
 
+    // A weekly expense is charged on the weekday of its first charge
+    const weeklyDay = row => {
+      const d = weeklyAnchor(row);
+      return d ? 'Every ' + d.toLocaleDateString('en-GB', { weekday: 'short' }) : '';
+    };
+
     // --- Expense form and inline edits ---
     const openAdd = () => { modalItemId.value = null; modalOpen.value = true; };
     const openEdit = (item) => { modalItemId.value = item.id; modalOpen.value = true; };
@@ -264,7 +270,7 @@ export default {
       includePayroll, currentPayroll, monthlyTotal, categoryDonut, expensesTrend,
       showAll, hiddenCount, columns, sortCol, sortAsc, toggleSort,
       openAdd, openEdit, confirmDelete, saveField, catOptions, subOptionsFor, subName, hasSubcategories,
-      RECURRENCE_OPTIONS, recurrenceLabel, formatCents, monthLabel, ordinalDay,
+      RECURRENCE_OPTIONS, recurrenceLabel, formatCents, monthLabel, ordinalDay, weeklyDay,
     };
   },
   template: `
@@ -366,7 +372,7 @@ export default {
                     {{ formatCents(row.cur_amount) }}
                   </span>
                 </td>
-                <td class="px-4 py-3 text-gray-600">{{ ordinalDay(row.renewal_day) }}</td>
+                <td class="px-4 py-3 text-gray-600">{{ row.recurrence === 'weekly' ? weeklyDay(row) : ordinalDay(row.renewal_day) }}</td>
                 <td class="px-4 py-3 text-gray-600 whitespace-nowrap">
                   <inline-edit :value="row.recurrence" :options="RECURRENCE_OPTIONS" :display="recurrenceLabel(row.recurrence)" @save="v => saveField(row, 'recurrence', v)"/>
                 </td>

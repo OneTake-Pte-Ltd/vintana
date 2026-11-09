@@ -2,6 +2,7 @@ import { query, execute } from './db.js';
 import { currentMonth, expenseMonthlyValues, forecastEnd, chargeFromMonthly } from './utils.js';
 
 export const RECURRENCE_OPTIONS = [
+  { value: 'weekly', label: 'Weekly' },
   { value: 'monthly', label: 'Monthly' },
   { value: 'quarterly', label: 'Quarterly' },
   { value: 'annual', label: 'Annual' },
@@ -59,10 +60,13 @@ const NUMERIC = ['category_id', 'subcategory_id'];
 // Saves one field of an expense. Moving an expense to another category clears a sub-category that
 // belongs to the old one. Changing the recurrence keeps the amount of each charge (a 688.99 monthly
 // charge becomes a 688.99 quarterly charge) by rewriting the scenario's forecast from this month on.
+// Switching to or from weekly keeps the monthly cost instead: a 2,000 monthly budget becomes about 461.54 a week,
+// not 2,000 a week, since a weekly and a monthly bill of the same amount are very different budgets.
 export async function updateExpenseField(item, field, value, subcategories = [], scenarioId = null) {
   if (!EDITABLE.includes(field)) throw new Error(`Field ${field} can't be edited here`);
   const v = NUMERIC.includes(field) ? (value === null || value === '' ? null : Number(value)) : value;
-  if (field === 'recurrence' && scenarioId && v !== item.recurrence && !item.formula) {
+  const weeklySwitch = field === 'recurrence' && (v === 'weekly' || item.recurrence === 'weekly');
+  if (field === 'recurrence' && scenarioId && v !== item.recurrence && !item.formula && !weeklySwitch) {
     const charge = await currentChargeAmount(item, scenarioId);
     await execute('UPDATE expense_items SET recurrence = ? WHERE id = ?', [v, item.id]);
     if (charge) await respreadExpense(item.id, scenarioId, charge, v, item.start_month, item.end_month);

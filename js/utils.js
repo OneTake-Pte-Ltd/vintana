@@ -114,12 +114,50 @@ export function departmentToKey(name) {
 // Number of months one charge covers; quarterly and annual charges are spread evenly over them
 export const RECURRENCE_MONTHS = { monthly: 1, quarterly: 3, annual: 12 };
 
+// Weekly charges: 52 a year, so a month holds 52/12 of them on average. The monthly value of a weekly expense is
+// that average; a month actually has 4 or 5 charge dates (see weeklyChargeDates).
+export const WEEKS_PER_MONTH = 52 / 12;
+
 export function monthlyShare(chargeCents, recurrence) {
+  if (recurrence === 'weekly') return Math.round(chargeCents * WEEKS_PER_MONTH);
   return Math.round(chargeCents / (RECURRENCE_MONTHS[recurrence] || 1));
 }
 
 export function chargeFromMonthly(monthlyCents, recurrence) {
+  if (recurrence === 'weekly') return Math.round(monthlyCents / WEEKS_PER_MONTH);
   return monthlyCents * (RECURRENCE_MONTHS[recurrence] || 1);
+}
+
+const isoDate = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
+// Date of the charge that anchors a weekly expense: its start month and renewal day, or null when either is missing
+export function weeklyAnchor(item) {
+  if (!item.start_month || !item.renewal_day) return null;
+  const [y, m] = item.start_month.split('-').map(Number);
+  return new Date(y, m - 1, Math.min(item.renewal_day, new Date(y, m, 0).getDate()));
+}
+
+// Charge dates of a weekly expense between `from` and `to` (Dates, inclusive): the anchor date (its first charge)
+// and every 7 days after it
+export function weeklyChargeDates(anchor, from, to) {
+  if (!anchor) return [];
+  const DAY = 864e5;
+  const day = new Date(from.getFullYear(), from.getMonth(), from.getDate());
+  const start = day > anchor ? day : anchor;
+  const offset = Math.round((start - anchor) / DAY);
+  let d = new Date(anchor.getFullYear(), anchor.getMonth(), anchor.getDate() + Math.ceil(offset / 7) * 7);
+  const out = [];
+  while (d <= to) {
+    out.push(d);
+    d = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 7);
+  }
+  return out;
+}
+
+// Charge dates of a weekly expense in a month (YYYY-MM), as ISO dates
+export function weeklyChargeDatesIn(anchor, month) {
+  const [y, m] = month.split('-').map(Number);
+  return weeklyChargeDates(anchor, new Date(y, m - 1, 1), new Date(y, m, 0)).map(isoDate);
 }
 
 // Forecast horizon for expenses without an end month: the visible range or two years out, whichever is later
@@ -135,8 +173,10 @@ export function expenseMonthlyValues(chargeCents, recurrence, startMonth, endMon
   return generateMonthRange(startMonth, endMonth).map(month => ({ month, amount }));
 }
 
-// True when a renewal falls in `month`: every month, every 3 months or every 12 months from the start month
+// True when a renewal falls in `month`: every month (monthly and weekly), every 3 months or every 12 months
+// from the start month
 export function isChargeMonth(recurrence, startMonth, month) {
+  if (recurrence === 'weekly') return true;
   const every = RECURRENCE_MONTHS[recurrence];
   if (!every) return false;
   if (!startMonth || every === 1) return true;

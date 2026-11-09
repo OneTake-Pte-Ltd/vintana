@@ -12,6 +12,7 @@ import { query, execute, batch, getCredentials } from './db.js';
 import { getBaseScenarioId } from './schema.js';
 import {
   getReportingCurrency, addMonths, currentMonth, generateMonthRange, prevMonth, RECURRENCE_MONTHS, formatCents, monthLabelFull, isChargeMonth, ordinalDay,
+  weeklyAnchor, weeklyChargeDatesIn, chargeFromMonthly, monthlyShare,
 } from './utils.js';
 import { loadScenarioEmployees, employeeCost, isEmployedIn } from './payroll.js';
 import { respreadExpense } from './expenses.js';
@@ -144,7 +145,7 @@ export async function prepareReview(parsed, fileName) {
   const catId = name => categories.find(c => c.name.toLowerCase() === (name || '').toLowerCase())?.id
     || categories.find(c => c.name.startsWith('Uncategorized'))?.id || categories[0]?.id;
   const known = id => providers.some(p => p.id === id);
-  const RECURRENCES = ['monthly', 'quarterly', 'annual', 'one_time'];
+  const RECURRENCES = ['weekly', 'monthly', 'quarterly', 'annual', 'one_time'];
 
   const rows = (parsed.transactions || []).map((t, i) => {
     const amount = toCents(t.amount);
@@ -385,6 +386,14 @@ export function chargeDayOffset(date, renewalDay) {
 }
 const DAY_TOLERANCE = 3; // banks often post a charge a few days late (weekends, processing)
 
+// Days between a charge and the nearest date of a weekly schedule anchored on `anchor`, signed, from -3 to 3
+export function weeklyDayOffset(date, anchor) {
+  const diff = Math.round((new Date(date + 'T00:00:00') - anchor) / 864e5);
+  const r = ((diff % 7) + 7) % 7;
+  return r > 3 ? r - 7 : r;
+}
+const weekday = iso => new Date(iso + 'T00:00:00').toLocaleDateString('en-GB', { weekday: 'long' });
+
 const fullMonthsIn = (start, end) => generateMonthRange(start.slice(0, 7), end.slice(0, 7))
   .filter(m => start <= `${m}-01` && end >= monthEnd(m));
 
@@ -477,6 +486,10 @@ export async function findDiscrepancies(importId, settings) {
       const due = it.recurrence === 'one_time' ? it.start_month === m
         : it.recurrence === 'monthly' ? true : (it.start_month && isChargeMonth(it.recurrence, it.start_month, m));
       if (due && !s && shiftedTo.has(`${it.id}:${m}`)) continue; // charged in a nearby month: reported above
+      if (it.recurrence === 'weekly') {
+        out.push(...await weeklyDiscrepancies(it, m, s, { forecastAfter, longDate, rmoney }));
+        continue;
+      }
       if (due && !s) {
         // Only when the charge was due in a month this statement fully covers, and no imported account shows it.
         // If it was charged before, it may renew less often than recorded: offer the longer recurrences that
@@ -575,6 +588,52 @@ export async function findDiscrepancies(importId, settings) {
   return out;
 }
 
+// A weekly expense in one month: charges missing, on another weekday, or a different amount. The forecast's
+// monthly value is the yearly average, so the expected amount is the weekly charge times the charge dates in
+// the month (4 or 5), not the monthly value.
+async function weeklyDiscrepancies(it, m, s, { forecastAfter, longDate, rmoney }) {
+  const out = [];
+  const anchor = weeklyAnchor(it);
+  const expectedDates = weeklyChargeDatesIn(anchor, m);
+  if (!expectedDates.length) return out; // no first charge date yet, or it starts later in the month
+  const dates = s ? (await query(`SELECT date FROM bank_transactions WHERE kind = 'expense' AND expense_item_id = ? AND month = ?
+    ORDER BY date`, [it.id, m])).map(r => r.date) : [];
+  const n = dates.length, want = expectedDates.length;
+
+  if (n < want) {
+    out.push({ type: 'missing', severity: 'info', itemId: it.id,
+      title: n ? `${n} of ${want} weekly ${it.name} charges found in ${monthLabelFull(m)}` : `${it.name} not charged in ${monthLabelFull(m)}`,
+      detail: `Weekly charges were expected on ${expectedDates.map(longDate).join(', ')}${n ? `; the statements show ${dates.map(longDate).join(', ')}` : ''}. If ${n ? 'some are' : "it's"} paid from an account you haven't imported yet, import that statement.${n ? '' : ' If it has ended, set an end month.'}`,
+      fixes: n ? [] : [{ label: `End ${it.name} in ${monthLabelFull(prevMonth(m))}`, action: 'end_expense', args: { itemId: it.id, month: prevMonth(m) } }] });
+  }
+
+  // Another weekday: most charges at least 2 days from the schedule (a 1-day posting delay is normal)
+  const off = dates.filter(d => Math.abs(weeklyDayOffset(d, anchor)) >= 2);
+  if (n && off.length * 2 > n) {
+    const first = off[0];
+    out.push({ type: 'mismatch', severity: 'info', itemId: it.id,
+      title: `${it.name} charged on ${weekday(first)}s, expected on ${weekday(expectedDates[0])}s`,
+      detail: `In ${monthLabelFull(m)} the weekly charges came on ${dates.map(longDate).join(', ')}. If the billing day has changed, move the weekly schedule so Upcoming Charges show the right dates.`,
+      fixes: [{ label: `Charge weekly from ${longDate(first)}`, action: 'move_renewal', args: { itemId: it.id, month: first.slice(0, 7), day: Number(first.slice(8, 10)) } }] });
+  }
+
+  const next = n ? await forecastAfter(it.id, m) : null;
+  if (next) {
+    const weekly = chargeFromMonthly(next.amount, 'weekly');
+    const expected = weekly * n; // compare charge for charge; missing charges are reported above
+    const diff = s.total - expected;
+    if (expected > 0 && Math.abs(diff) > Math.max(100, expected * 0.05)) {
+      const pct = Math.round((diff / expected) * 100);
+      const average = Math.round(s.total / n);
+      out.push({ type: 'mismatch', severity: 'info', itemId: it.id,
+        title: `${it.name} cost ${rmoney(s.total)} in ${monthLabelFull(m)}, ${pct > 0 ? '+' : ''}${pct}% vs forecast`,
+        detail: `${n} weekly charge${n !== 1 ? 's' : ''} averaging ${rmoney(average)}, where the forecast expects ${rmoney(weekly)} a week. If the new amount will last, update the forecast from ${monthLabelFull(next.month)} onwards.`,
+        fixes: [{ label: `Use ${rmoney(average)} a week from ${monthLabelFull(next.month)}`, action: 'update_forecast', args: { itemId: it.id, from: next.month, amount: monthlyShare(average, 'weekly') } }] });
+    }
+  }
+  return out;
+}
+
 // Applies a suggested fix. Returns a short confirmation.
 export async function applyFix(fix) {
   const a = fix.args;
@@ -604,7 +663,7 @@ export async function applyFix(fix) {
       await execute('UPDATE expense_items SET renewal_day = ? WHERE id = ?', [a.day, a.itemId]);
       return 'Renewal day updated';
     case 'move_renewal':
-      // The month charged becomes the anchor: later renewals are expected every 3 or 12 months from it
+      // The month charged becomes the anchor: later renewals are expected every 3 or 12 months (or 7 days) from it
       await execute('UPDATE expense_items SET start_month = ?, renewal_day = ? WHERE id = ?', [a.month, a.day, a.itemId]);
       return 'Renewal moved';
     case 'update_salary':

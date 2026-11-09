@@ -1,7 +1,7 @@
 import { query, execute } from '../js/db.js';
 import { getBaseScenarioId } from '../js/schema.js';
 import {
-  monthLabel, generateMonthRange, currentMonth, chargeFromMonthly, expenseMonthlyValues, forecastEnd,
+  monthLabel, generateMonthRange, currentMonth, chargeFromMonthly, monthlyShare, expenseMonthlyValues, forecastEnd,
 } from '../js/utils.js';
 import { subcategoryOptions, respreadExpense } from '../js/expenses.js';
 
@@ -18,7 +18,7 @@ export default {
   },
   emits: ['close', 'saved'],
   setup(props, { emit }) {
-    const { ref, computed, inject, onMounted } = Vue;
+    const { ref, computed, inject, onMounted, watch } = Vue;
     const scenarioId = inject('scenarioId');
     const dateRange = inject('dateRange');
     const toast = inject('toast');
@@ -37,6 +37,16 @@ export default {
       start_month: dateRange.value?.start || '', end_month: '', notes: '',
     });
     const form = ref(blankForm());
+    // Switching to or from weekly converts the amount so the monthly cost stays the same (2,000 a month is about
+    // 461.54 a week); between the other recurrences the amount per charge stays as typed
+    // (a form loaded or reset, a new object, is not a change made by the person)
+    watch(() => [form.value, form.value.recurrence], ([f, now], [prevForm, before]) => {
+      if (f !== prevForm) return;
+      if (!before || now === before || (now !== 'weekly' && before !== 'weekly')) return;
+      if (f.amount === '' || f.amount == null || Number.isNaN(parseFloat(f.amount))) return;
+      const monthly = before === 'one_time' ? Math.round(parseFloat(f.amount) * 100) : monthlyShare(Math.round(parseFloat(f.amount) * 100), before);
+      f.amount = ((now === 'one_time' ? monthly : chargeFromMonthly(monthly, now)) / 100).toFixed(2);
+    });
     const subOptions = computed(() => subcategoryOptions(props.subcategories, form.value.category_id));
     const hasSubcategories = computed(() => props.subcategories.length > 0);
 
@@ -197,6 +207,7 @@ export default {
             <div>
               <label class="block text-xs font-medium text-gray-500 mb-1">Recurrence</label>
               <select v-model="form.recurrence" :class="INPUT">
+                <option value="weekly">Weekly</option>
                 <option value="monthly">Monthly</option>
                 <option value="quarterly">Quarterly</option>
                 <option value="annual">Annual</option>
@@ -226,6 +237,7 @@ export default {
               <label class="block text-xs font-medium text-gray-500 mb-1">Start Month</label>
               <input v-model="form.start_month" type="month" :class="INPUT"/>
               <p v-if="form.recurrence === 'annual' || form.recurrence === 'quarterly'" class="text-[11px] text-gray-400 mt-1">The month of the first charge; renewals follow every {{ form.recurrence === 'annual' ? '12' : '3' }} months.</p>
+              <p v-else-if="form.recurrence === 'weekly'" class="text-[11px] text-gray-400 mt-1">With the renewal day, the date of the first charge; the next ones follow every 7 days.</p>
             </div>
             <div>
               <label class="block text-xs font-medium text-gray-500 mb-1">End Month</label>
