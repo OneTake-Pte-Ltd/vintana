@@ -7,12 +7,14 @@ import { getBaseScenarioId } from './schema.js';
 import { parseCsv, toCsv, parseAmountToCents, parseMonth } from './csv.js';
 import { currentMonth, chargeFromMonthly, expenseMonthlyValues, forecastEnd } from './utils.js';
 
-export const EXPENSE_COLUMNS = ['name', 'company', 'category', 'subcategory', 'amount', 'recurrence', 'renewal_day', 'start_month', 'end_month', 'notes'];
+// amount: per charge (monthly spend for threshold billing). billing_threshold: only for threshold billing, optional on import.
+export const EXPENSE_COLUMNS = ['name', 'company', 'category', 'subcategory', 'amount', 'recurrence', 'renewal_day', 'billing_threshold', 'start_month', 'end_month', 'notes'];
 export const PAYROLL_COLUMNS = ['name', 'role', 'department', 'monthly_salary', 'employer_tax_pct', 'start_month', 'end_month', 'notes'];
 
 const DEFAULT_CATEGORY = 'Uncategorized / Other';
 const RECURRENCE_ALIASES = {
   weekly: 'weekly', week: 'weekly',
+  threshold: 'threshold', billed_at_a_threshold: 'threshold', usage: 'threshold',
   monthly: 'monthly', month: 'monthly',
   quarterly: 'quarterly', quarter: 'quarterly',
   annual: 'annual', annually: 'annual', yearly: 'annual', year: 'annual',
@@ -82,6 +84,7 @@ export async function exportExpensesCsv() {
       name: item.name, company: item.company, category: item.category,
       subcategory: subNames[item.subcategory_id] || '', amount,
       recurrence: item.recurrence, renewal_day: item.renewal_day,
+      billing_threshold: item.billing_threshold ? centsToPlain(item.billing_threshold) : '',
       start_month: item.start_month, end_month: item.end_month, notes: item.notes,
     };
   });
@@ -102,7 +105,7 @@ export async function importExpensesCsv(text, dateRange) {
     if (!name) rowErrors.push('name is empty');
 
     const recurrence = RECURRENCE_ALIASES[(r.recurrence || 'monthly').toLowerCase().replace(/[\s-]+/g, '_')];
-    if (!recurrence) rowErrors.push(`recurrence "${r.recurrence}" must be weekly, monthly, quarterly, annual or one_time`);
+    if (!recurrence) rowErrors.push(`recurrence "${r.recurrence}" must be weekly, threshold, monthly, quarterly, annual or one_time`);
 
     let amount = null;
     if (r.amount !== '') {
@@ -129,12 +132,20 @@ export async function importExpensesCsv(text, dateRange) {
       }
     }
 
+    // undefined: the file has no billing_threshold column, so the expense keeps its threshold
+    let threshold;
+    if (r.billing_threshold !== undefined) {
+      threshold = r.billing_threshold ? parseAmountToCents(r.billing_threshold) : null;
+      if (Number.isNaN(threshold) || threshold < 0) rowErrors.push(`billing_threshold "${r.billing_threshold}" is not a valid number`);
+      else if (recurrence === 'threshold' && !threshold) rowErrors.push('billing_threshold is needed for an expense billed at a threshold');
+    }
+
     rowErrors.forEach(e => errors.push(`Row ${line}: ${e}`));
     return {
       line, name, company: r.company || null, category: r.category || DEFAULT_CATEGORY,
       // undefined: the file has no subcategory column, so the expense keeps its sub-category
       subcategory: r.subcategory === undefined ? undefined : (r.subcategory || '').trim(),
-      amount, recurrence, renewalDay, startMonth, endMonth, notes: r.notes || null,
+      amount, recurrence, renewalDay, startMonth, endMonth, notes: r.notes || null, threshold,
     };
   });
   checkDuplicateNames(parsed.filter(p => p.name), errors);
@@ -204,6 +215,9 @@ export async function importExpensesCsv(text, dateRange) {
         start_month, end_month, notes, alias) VALUES (?,?,?,?,?,?,?,?,?)`, [...fields, uniqueAlias(p.name)]);
       itemId = res.lastInsertRowid;
       created++;
+    }
+    if (p.threshold !== undefined) {
+      await execute('UPDATE expense_items SET billing_threshold = ? WHERE id = ?', [p.recurrence === 'threshold' ? p.threshold : null, itemId]);
     }
     if (subId && p.subcategory !== undefined) {
       await execute('UPDATE expense_items SET subcategory_id = ? WHERE id = ?', [subId.lookup(p), itemId]);

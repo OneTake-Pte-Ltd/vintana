@@ -173,10 +173,36 @@ export function expenseMonthlyValues(chargeCents, recurrence, startMonth, endMon
   return generateMonthRange(startMonth, endMonth).map(month => ({ month, amount }));
 }
 
-// True when a renewal falls in `month`: every month (monthly and weekly), every 3 months or every 12 months
-// from the start month
+// Expenses whose monthly value is a running cost billed in several charges a month (weekly, or each time spend
+// reaches a threshold): changing to or from these keeps the monthly cost rather than the amount per charge
+export const MULTI_CHARGE = ['weekly', 'threshold'];
+
+// Charges of an expense billed each time spend reaches `item.billing_threshold`, from `start` (a Date: the last
+// charge, when nothing had built up yet) to `until`. Spend builds up day by day at the month's value / days in
+// the month, so a bigger budget means more frequent charges. `monthlyValue(month)` gives the month's value in
+// cents (0 outside the expense's period). Each charge is the threshold amount. Returns [{ date, month, amount }].
+export function thresholdCharges(item, monthlyValue, start, until) {
+  const threshold = item.billing_threshold;
+  if (!threshold || threshold <= 0) return [];
+  const out = [];
+  let accrued = 0;
+  let d = new Date(start.getFullYear(), start.getMonth(), start.getDate() + 1);
+  while (d <= until && out.length < 400) {
+    const month = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+    accrued += (monthlyValue(month) || 0) / new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
+    while (accrued >= threshold && out.length < 400) {
+      out.push({ date: d, month, amount: threshold });
+      accrued -= threshold;
+    }
+    d = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1);
+  }
+  return out;
+}
+
+// True when a renewal falls in `month`: every month (monthly, weekly and threshold billing), every 3 months or
+// every 12 months from the start month
 export function isChargeMonth(recurrence, startMonth, month) {
-  if (recurrence === 'weekly') return true;
+  if (MULTI_CHARGE.includes(recurrence)) return true;
   const every = RECURRENCE_MONTHS[recurrence];
   if (!every) return false;
   if (!startMonth || every === 1) return true;

@@ -145,7 +145,7 @@ export async function prepareReview(parsed, fileName) {
   const catId = name => categories.find(c => c.name.toLowerCase() === (name || '').toLowerCase())?.id
     || categories.find(c => c.name.startsWith('Uncategorized'))?.id || categories[0]?.id;
   const known = id => providers.some(p => p.id === id);
-  const RECURRENCES = ['weekly', 'monthly', 'quarterly', 'annual', 'one_time'];
+  const RECURRENCES = ['weekly', 'threshold', 'monthly', 'quarterly', 'annual', 'one_time'];
 
   const rows = (parsed.transactions || []).map((t, i) => {
     const amount = toCents(t.amount);
@@ -276,6 +276,10 @@ export async function saveReview(review, { replaceImportIds = [] } = {}) {
          r.newProvider.category_id, r.newProvider.recurrence || 'one_time', Number(r.date.slice(8, 10)) || null, r.month,
          `Added from bank statement ${review.fileName}`]);
       newIds[key] = ins.lastInsertRowid;
+      const threshold = Math.round(parseFloat(r.newProvider.billing_threshold) * 100);
+      if (r.newProvider.recurrence === 'threshold' && threshold > 0) {
+        await execute('UPDATE expense_items SET billing_threshold = ? WHERE id = ?', [threshold, newIds[key]]);
+      }
       if (r.newProvider.subcategory_id) {
         await execute('UPDATE expense_items SET subcategory_id = ? WHERE id = ?', [r.newProvider.subcategory_id, newIds[key]]);
       }
@@ -495,7 +499,7 @@ export async function findDiscrepancies(importId, settings) {
         // If it was charged before, it may renew less often than recorded: offer the longer recurrences that
         // would not expect it this month, anchored on the last charge.
         const last = seen.filter(x => x.id === it.id && x.month < m).sort((a, b) => b.month.localeCompare(a.month))[0];
-        const longer = last && it.recurrence !== 'one_time'
+        const longer = last && !['one_time', 'threshold'].includes(it.recurrence)
           ? longerRecurrences(it, last.month, last.total).filter(f => !isChargeMonth(f.args.recurrence, last.month, m))
           : [];
         out.push({ type: 'missing', severity: 'info', itemId: it.id, title: `${it.name} not charged in ${monthLabelFull(m)}`,
@@ -504,7 +508,7 @@ export async function findDiscrepancies(importId, settings) {
       }
       if (!s) continue;
       // Charged on another day than the renewal day (one charge in the month; a moved renewal is reported above)
-      if (it.renewal_day && s.n === 1 && !expectedIn) {
+      if (it.renewal_day && s.n === 1 && !expectedIn && it.recurrence !== 'threshold') {
         const off = chargeDayOffset(s.first_date, it.renewal_day);
         if (Math.abs(off) > DAY_TOLERANCE) {
           const day = Number(s.first_date.slice(8, 10));
@@ -518,6 +522,20 @@ export async function findDiscrepancies(importId, settings) {
         out.push({ type: 'mismatch', severity: 'warning', itemId: it.id, title: `${it.name} charged ${s.n} times in ${monthLabelFull(m)}`,
           detail: `${s.n} identical charges of ${money(-s.max_a)}. Check with the supplier for double billing.` });
       }
+      // Billed at a threshold: most charges should be about the threshold; if not, the threshold has changed
+      if (it.recurrence === 'threshold' && it.billing_threshold > 0) {
+        const amounts = (await query(`SELECT -amount_reporting AS a FROM bank_transactions
+          WHERE kind = 'expense' AND expense_item_id = ? AND month = ? ORDER BY -amount_reporting`, [it.id, m]))
+          .map(r => r.a).filter(a => a > 0);
+        const off = amounts.filter(a => Math.abs(a - it.billing_threshold) > it.billing_threshold * 0.1);
+        if (amounts.length && off.length * 2 > amounts.length) {
+          const median = amounts[Math.floor(amounts.length / 2)];
+          out.push({ type: 'mismatch', severity: 'info', itemId: it.id,
+            title: `${it.name} billed in steps of about ${rmoney(median)}, threshold is ${rmoney(it.billing_threshold)}`,
+            detail: `In ${monthLabelFull(m)} it was billed ${amounts.length} time${amounts.length !== 1 ? 's' : ''}: ${amounts.map(rmoney).join(', ')}. If the provider changed its billing threshold, update it so Upcoming Charges estimate the right amounts and dates.`,
+            fixes: [{ label: `Set the threshold to ${rmoney(median)}`, action: 'set_threshold', args: { itemId: it.id, amount: median } }] });
+        }
+      }
       const next = await forecastAfter(it.id, m);
       if (next) {
         const span = it.recurrence === 'one_time' ? 1 : (RECURRENCE_MONTHS[it.recurrence] || 1);
@@ -527,10 +545,10 @@ export async function findDiscrepancies(importId, settings) {
           const pct = Math.round((diff / expected) * 100);
           const newMonthly = Math.round(s.total / span);
           // Much more than expected: often a quarterly or annual charge recorded as monthly
-          const muchLarger = s.total >= expected * 2.5 && s.n === 1;
+          const muchLarger = s.total >= expected * 2.5 && s.n === 1 && it.recurrence !== 'threshold';
           const longer = muchLarger ? longerRecurrences(it, m, s.total) : [];
           out.push({ type: 'mismatch', severity: 'info', itemId: it.id, title: `${it.name} cost ${rmoney(s.total)} in ${monthLabelFull(m)}, ${pct > 0 ? '+' : ''}${pct}% vs forecast`,
-            detail: `The forecast expects ${rmoney(expected)} per charge. ${longer.length ? `A charge this much larger may cover several months: if it renews ${longer.map(f => NAMES[f.args.recurrence]).join(' or ')}, change its recurrence. ` : ''}If the new price will last, update the forecast from ${monthLabelFull(next.month)} onwards.`,
+            detail: `The forecast expects ${rmoney(expected)} ${it.recurrence === 'threshold' ? 'a month' : 'per charge'}. ${longer.length ? `A charge this much larger may cover several months: if it renews ${longer.map(f => NAMES[f.args.recurrence]).join(' or ')}, change its recurrence. ` : ''}If the new price will last, update the forecast from ${monthLabelFull(next.month)} onwards.`,
             fixes: [...longer, { label: `Use ${rmoney(newMonthly)} a month from ${monthLabelFull(next.month)}`, action: 'update_forecast', args: { itemId: it.id, from: next.month, amount: newMonthly } }] });
         }
       }
@@ -659,6 +677,9 @@ export async function applyFix(fix) {
       await respreadExpense(a.itemId, baseId, a.charge, a.recurrence, a.month, item?.end_month || null);
       return `Recurrence changed to ${NAMES[a.recurrence]}`;
     }
+    case 'set_threshold':
+      await execute('UPDATE expense_items SET billing_threshold = ? WHERE id = ?', [a.amount, a.itemId]);
+      return 'Threshold updated';
     case 'set_renewal_day':
       await execute('UPDATE expense_items SET renewal_day = ? WHERE id = ?', [a.day, a.itemId]);
       return 'Renewal day updated';
