@@ -9,7 +9,12 @@ import {
 } from '../expenses.js';
 import ExpenseModal from '../../components/ExpenseModal.js';
 
-const WINDOWS = [30, 60, 90];
+// 'month' = the rest of the current month; numbers are days from today
+const WINDOWS = ['month', 30, 60, 90];
+const windowDays = (w, now = new Date()) => w === 'month'
+  ? new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate() - now.getDate()
+  : w;
+const readWindow = v => (v === 'month' ? v : WINDOWS.includes(Number(v)) ? Number(v) : 30);
 const pref = (key, fallback) => { try { return localStorage.getItem(key) ?? fallback; } catch { return fallback; } };
 const savePref = (key, v) => { try { localStorage.setItem(key, String(v)); } catch { /* storage unavailable */ } };
 
@@ -23,9 +28,12 @@ export default {
     const settings = inject('settings');
     const toast = inject('toast');
 
-    const days = ref(WINDOWS.includes(Number(pref('vintana_upcoming_days'))) ? Number(pref('vintana_upcoming_days')) : 30);
+    const win = ref(readWindow(pref('vintana_upcoming_days')));
+    const days = computed(() => windowDays(win.value));
+    const windowLabel = w => (w === 'month' ? 'This month' : `${w} days`);
+    const periodLabel = computed(() => (win.value === 'month' ? 'rest of this month' : `next ${win.value} days`));
     const includePayroll = ref(pref('vintana_upcoming_payroll', '1') !== '0');
-    watch(days, d => savePref('vintana_upcoming_days', d));
+    watch(win, w => savePref('vintana_upcoming_days', w));
     watch(includePayroll, v => savePref('vintana_upcoming_payroll', v ? '1' : '0'));
 
     const items = ref([]);
@@ -45,7 +53,7 @@ export default {
             SELECT ei.*, ec.name AS category_name
             FROM expense_items ei JOIN expense_categories ec ON ec.id = ei.category_id
             WHERE ei.visible = 1`),
-          loadExpenseValues(scenarioId.value, currentMonth(), horizonMonth(Math.max(...WINDOWS))),
+          loadExpenseValues(scenarioId.value, currentMonth(), horizonMonth(Math.max(...WINDOWS.map(w => windowDays(w))))),
           loadScenarioEmployees(scenarioId.value),
           loadCategoryLookups(),
         ]);
@@ -132,7 +140,7 @@ export default {
       const item = items.value.find(i => i.id === c.id);
       if (!item) return;
       try {
-        await updateExpenseField(item, field, value, subcategories.value);
+        await updateExpenseField(item, field, value, subcategories.value, scenarioId.value);
         await load();
         toast('Saved', 'success');
       } catch (e) {
@@ -158,7 +166,7 @@ export default {
     ];
 
     return {
-      WINDOWS, days, includePayroll, loading, charges, groups, total, payrollTotal, largest, nextCharge, undated,
+      WINDOWS, win, days, windowLabel, periodLabel, includePayroll, loading, charges, groups, total, payrollTotal, largest, nextCharge, undated,
       columns, sortCol, sortAsc, toggleSort, modalItemId, categories, subcategories, catOptions, subOptionsFor, subName,
       open, saveField, load, RECURRENCE_OPTIONS, formatCents, monthLabelFull, fmtDate, daysAway, kindLabel, recurrenceLabel,
     };
@@ -175,9 +183,9 @@ export default {
             Include payroll
           </button>
           <div class="inline-flex rounded-lg border border-gray-200 bg-white p-0.5" role="group" aria-label="Time window">
-            <button v-for="w in WINDOWS" :key="w" @click="days = w" :aria-pressed="days === w"
-              :class="['px-3 py-1.5 text-sm rounded-md transition-colors', days === w ? 'bg-indigo-600 text-white' : 'text-gray-600 hover:bg-gray-50']">
-              {{ w }} days
+            <button v-for="w in WINDOWS" :key="w" @click="win = w" :aria-pressed="win === w"
+              :class="['px-3 py-1.5 text-sm rounded-md transition-colors', win === w ? 'bg-indigo-600 text-white' : 'text-gray-600 hover:bg-gray-50']">
+              {{ windowLabel(w) }}
             </button>
           </div>
         </div>
@@ -188,7 +196,7 @@ export default {
       <template v-else>
         <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div class="bg-white rounded-xl border border-gray-200 p-5">
-            <span class="text-xs font-medium text-gray-500 uppercase tracking-wider">Total (next {{ days }} days)</span>
+            <span class="text-xs font-medium text-gray-500 uppercase tracking-wider">Total ({{ periodLabel }})</span>
             <div class="text-2xl font-bold text-gray-900 mt-2">{{ formatCents(total) }}</div>
             <div class="text-xs text-gray-400 mt-1">{{ charges.length }} charge{{ charges.length !== 1 ? 's' : '' }}<template v-if="includePayroll">, incl. {{ formatCents(payrollTotal) }} payroll</template></div>
           </div>
@@ -268,7 +276,7 @@ export default {
                 </tr>
               </template>
               <tr v-if="!charges.length">
-                <td colspan="7" class="px-4 py-8 text-center text-gray-400">No charges in the next {{ days }} days</td>
+                <td colspan="7" class="px-4 py-8 text-center text-gray-400">No charges in the {{ periodLabel }}</td>
               </tr>
             </tbody>
             <tfoot v-if="charges.length">
