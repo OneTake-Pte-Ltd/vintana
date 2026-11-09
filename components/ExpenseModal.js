@@ -1,7 +1,7 @@
 import { query, execute } from '../js/db.js';
 import { getBaseScenarioId } from '../js/schema.js';
 import {
-  monthLabel, generateMonthRange, currentMonth, chargeFromMonthly, monthlyShare, expenseMonthlyValues, forecastEnd,
+  monthLabel, generateMonthRange, currentMonth, chargeFromMonthly, monthlyShare, expenseMonthlyValues, forecastEnd, MULTI_CHARGE,
 } from '../js/utils.js';
 import { subcategoryOptions, respreadExpense } from '../js/expenses.js';
 
@@ -33,16 +33,16 @@ export default {
       name: '', alias: '', company: '', charge_label: '',
       category_id: props.categories[0]?.id || null, subcategory_id: null,
       formula: '', entryMode: 'manual', amount: '',
-      recurrence: 'monthly', renewal_day: null,
+      recurrence: 'monthly', renewal_day: null, billing_threshold: '',
       start_month: dateRange.value?.start || '', end_month: '', notes: '',
     });
     const form = ref(blankForm());
-    // Switching to or from weekly converts the amount so the monthly cost stays the same (2,000 a month is about
+    // Switching to or from weekly or threshold billing converts the amount so the monthly cost stays the same (2,000 a month is about
     // 461.54 a week); between the other recurrences the amount per charge stays as typed
     // (a form loaded or reset, a new object, is not a change made by the person)
     watch(() => [form.value, form.value.recurrence], ([f, now], [prevForm, before]) => {
       if (f !== prevForm) return;
-      if (!before || now === before || (now !== 'weekly' && before !== 'weekly')) return;
+      if (!before || now === before || (!MULTI_CHARGE.includes(now) && !MULTI_CHARGE.includes(before))) return;
       if (f.amount === '' || f.amount == null || Number.isNaN(parseFloat(f.amount))) return;
       const monthly = before === 'one_time' ? Math.round(parseFloat(f.amount) * 100) : monthlyShare(Math.round(parseFloat(f.amount) * 100), before);
       f.amount = ((now === 'one_time' ? monthly : chargeFromMonthly(monthly, now)) / 100).toFixed(2);
@@ -75,6 +75,7 @@ export default {
           formula: item.formula || '', entryMode: item.formula ? 'formula' : 'manual',
           amount: item.cur_amount ? (chargeFromMonthly(item.cur_amount, item.recurrence) / 100).toFixed(2) : '',
           recurrence: item.recurrence, renewal_day: item.renewal_day,
+          billing_threshold: item.billing_threshold ? (item.billing_threshold / 100).toFixed(2) : '',
           start_month: item.start_month || '', end_month: item.end_month || '',
           notes: item.notes || '',
         };
@@ -102,9 +103,16 @@ export default {
       if (!subOptions.value.some(o => o.value === form.value.subcategory_id)) form.value.subcategory_id = null;
     };
 
+    // Threshold in cents, only for an expense billed at a threshold
+    const thresholdCents = f => {
+      const c = Math.round(parseFloat(f.billing_threshold) * 100);
+      return f.recurrence === 'threshold' && c > 0 ? c : null;
+    };
+
     const save = async () => {
       const f = form.value;
       if (!f.name || !f.category_id) { toast('Name and category are required', 'error'); return; }
+      if (f.recurrence === 'threshold' && !thresholdCents(f)) { toast('Enter the amount at which this provider bills you', 'error'); return; }
       saving.value = true;
       try {
         const formulaVal = f.entryMode === 'formula' ? f.formula : null;
@@ -115,6 +123,7 @@ export default {
             [f.name, f.alias, f.company || null, f.charge_label || null, f.category_id,
              formulaVal, f.recurrence, f.renewal_day || null, f.start_month || null, f.end_month || null, f.notes || null, props.itemId]);
           if (hasSubcategories.value) await execute('UPDATE expense_items SET subcategory_id=? WHERE id=?', [sub, props.itemId]);
+          await execute('UPDATE expense_items SET billing_threshold=? WHERE id=?', [thresholdCents(f), props.itemId]);
           // A new amount or recurrence rewrites the forecast from this month on, keeping past months and actuals
           const toCents = a => (a === '' || a == null ? null : Math.round(parseFloat(a) * 100));
           const cents = toCents(f.amount);
@@ -132,6 +141,7 @@ export default {
              formulaVal, f.recurrence, f.renewal_day || null, f.start_month || null, f.end_month || null, f.notes || null]);
           const itemId = res.lastInsertRowid;
           if (itemId && sub) await execute('UPDATE expense_items SET subcategory_id=? WHERE id=?', [sub, itemId]);
+          if (itemId && thresholdCents(f)) await execute('UPDATE expense_items SET billing_threshold=? WHERE id=?', [thresholdCents(f), itemId]);
           // For manual entry, seed values across the date range
           if (itemId && f.entryMode === 'manual' && f.amount) {
             const cents = Math.round(parseFloat(f.amount) * 100);
@@ -208,13 +218,19 @@ export default {
               <label class="block text-xs font-medium text-gray-500 mb-1">Recurrence</label>
               <select v-model="form.recurrence" :class="INPUT">
                 <option value="weekly">Weekly</option>
+                <option value="threshold">Billed at a threshold</option>
                 <option value="monthly">Monthly</option>
                 <option value="quarterly">Quarterly</option>
                 <option value="annual">Annual</option>
                 <option value="one_time">One-time</option>
               </select>
             </div>
-            <div>
+            <div v-if="form.recurrence === 'threshold'">
+              <label class="block text-xs font-medium text-gray-500 mb-1">Billed each time spend reaches</label>
+              <input v-model="form.billing_threshold" type="number" step="0.01" min="0" placeholder="e.g. 200" :class="INPUT"/>
+              <p class="text-[11px] text-gray-400 mt-1">Charge dates are estimated from the monthly spend: a bigger budget means more frequent charges.</p>
+            </div>
+            <div v-else>
               <label class="block text-xs font-medium text-gray-500 mb-1">Renewal Day</label>
               <input v-model.number="form.renewal_day" type="number" min="1" max="31" :class="INPUT"/>
             </div>
@@ -226,7 +242,7 @@ export default {
               </div>
             </div>
             <div v-if="form.entryMode === 'manual'">
-              <label class="block text-xs font-medium text-gray-500 mb-1">Amount per charge</label>
+              <label class="block text-xs font-medium text-gray-500 mb-1">{{ form.recurrence === 'threshold' ? 'Monthly spend' : 'Amount per charge' }}</label>
               <input v-model="form.amount" type="number" step="0.01" placeholder="0.00" :class="INPUT"/>
             </div>
             <div v-if="form.entryMode === 'formula'">

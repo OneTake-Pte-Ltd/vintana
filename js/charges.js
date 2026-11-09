@@ -1,7 +1,7 @@
 import { query } from './db.js';
 import { getBaseScenarioId } from './schema.js';
 import { employeeCost, isEmployedIn, payrollCategory } from './payroll.js';
-import { chargeFromMonthly, generateMonthRange, isChargeMonth, weeklyAnchor, weeklyChargeDates } from './utils.js';
+import { chargeFromMonthly, generateMonthRange, isChargeMonth, weeklyAnchor, weeklyChargeDates, thresholdCharges } from './utils.js';
 
 const pad = n => String(n).padStart(2, '0');
 export const monthOf = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}`;
@@ -25,7 +25,8 @@ export async function loadExpenseValues(scenarioId, startMonth, endMonth) {
 // Charges falling between today and today + `days` (inclusive), soonest first.
 // Recurring expenses need a renewal day to have a date, and quarterly or annual ones also need a start month
 // (their first charge); weekly ones are charged every 7 days from their start month and renewal day (their first
-// charge); one-time expenses are charged in their start month
+// charge); threshold-billed ones are estimated from their spending rate (estimated: true), starting from their last
+// charge in an imported statement (`last_charge_date`) or from today; one-time expenses are charged in their start month
 // (on their renewal day, or the 1st when none is set). The amount is one full charge, not the monthly share.
 export function computeUpcomingCharges(items, values, days, now = new Date()) {
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
@@ -36,6 +37,22 @@ export function computeUpcomingCharges(items, values, days, now = new Date()) {
 
   for (const item of items) {
     const inPeriod = m => (!item.start_month || m >= item.start_month) && (!item.end_month || m <= item.end_month);
+    if (item.recurrence === 'threshold') {
+      // Billed each time spend reaches the threshold: the dates follow the monthly spend
+      const last = item.last_charge_date ? new Date(item.last_charge_date + 'T00:00:00') : null;
+      const start = last && last < today ? last : new Date(today.getTime() - 864e5);
+      // Months before this one (since the last charge) are not loaded: they spend at this month's rate
+      const value = month => (!inPeriod(month) ? 0
+        : values[`${item.id}:${month < monthOf(today) ? monthOf(today) : month}`] || 0);
+      for (const c of thresholdCharges(item, value, start, until)) {
+        if (c.date < today) continue; // due before today: not upcoming any more
+        const n = charges.filter(x => x.id === item.id && x.date - c.date === 0).length;
+        const day = String(c.date.getDate()).padStart(2, '0');
+        charges.push({ ...item, kind: 'expense', key: `e:${item.id}:${c.month}-${day}${n ? '-' + n : ''}`,
+          date: c.date, month: c.month, amount: c.amount, estimated: true });
+      }
+      continue;
+    }
     if (item.recurrence === 'weekly') {
       // One charge a week: the weekly amount, from the month's value (the monthly average)
       for (const date of weeklyChargeDates(weeklyAnchor(item), today, until)) {
@@ -78,6 +95,7 @@ export function horizonMonth(days, now = new Date()) {
 export function undatedReason(item, now = new Date()) {
   if (item.end_month && item.end_month < monthOf(now)) return null; // finished: nothing to schedule
   if (item.recurrence === 'one_time') return item.start_month ? null : 'no month';
+  if (item.recurrence === 'threshold') return item.billing_threshold > 0 ? null : 'no threshold';
   if (!item.renewal_day) return 'no renewal day';
   if (item.recurrence !== 'monthly' && !item.start_month) return 'no start month';
   return null;

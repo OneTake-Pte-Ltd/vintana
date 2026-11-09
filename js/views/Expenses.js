@@ -128,7 +128,7 @@ export default {
       subcategory: r => subName(r).toLowerCase(),
       budget: r => r.cur_amount || 0,
       renewal: r => r.renewal_day,
-      recurrence: r => ({ weekly: 0, monthly: 1, quarterly: 2, annual: 3, one_time: 4 }[r.recurrence] || 9),
+      recurrence: r => ({ weekly: 0, threshold: 0.5, monthly: 1, quarterly: 2, annual: 3, one_time: 4 }[r.recurrence] || 9),
       period: r => r.start_month || '',
     };
     const toggleSort = (col) => {
@@ -372,7 +372,7 @@ export default {
                     {{ formatCents(row.cur_amount) }}
                   </span>
                 </td>
-                <td class="px-4 py-3 text-gray-600">{{ row.recurrence === 'weekly' ? weeklyDay(row) : ordinalDay(row.renewal_day) }}</td>
+                <td class="px-4 py-3 text-gray-600">{{ row.recurrence === 'weekly' ? weeklyDay(row) : row.recurrence === 'threshold' ? (row.billing_threshold ? 'Each ' + formatCents(row.billing_threshold) : '') : ordinalDay(row.renewal_day) }}</td>
                 <td class="px-4 py-3 text-gray-600 whitespace-nowrap">
                   <inline-edit :value="row.recurrence" :options="RECURRENCE_OPTIONS" :display="recurrenceLabel(row.recurrence)" @save="v => saveField(row, 'recurrence', v)"/>
                 </td>

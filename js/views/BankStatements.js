@@ -170,6 +170,12 @@ export default {
     });
 
     // Changing a line's type or provider keeps the other fields consistent
+    // Billed at a threshold: the line's amount is usually the threshold itself
+    const onNewRecurrence = r => {
+      if (r.newProvider.recurrence === 'threshold' && !r.newProvider.billing_threshold) {
+        r.newProvider.billing_threshold = (Math.abs(r.amount) / 100).toFixed(2);
+      }
+    };
     const blankProvider = row => ({
       name: row.counterparty || row.description, company: '', subcategory_id: null, recurrence: 'one_time',
       category_id: categories.value.find(c => c.name.startsWith('Uncategorized'))?.id || categories.value[0]?.id,
@@ -311,7 +317,7 @@ export default {
 
     return {
       SELECT, INPUT, KIND_OPTIONS, accounts, providers, providerGroups, categories, employees, planned, history, queue,
-      discrepancies, checking, dStyle, sessionImportsCount, discrepancyFixes, elapsed, progressText, employeeName, subOptionsFor, onNewCategory, subcategories,
+      discrepancies, checking, dStyle, sessionImportsCount, discrepancyFixes, elapsed, progressText, employeeName, subOptionsFor, onNewCategory, onNewRecurrence, subcategories,
       dragging, filter, fileInput, openHistory, active, review, reviewAccount, currencyMismatch, rowsShown, toDecide, flaggedCount, totals,
       canSave, confirmDelete, statusLabel,
       onPick, onDrop, onAccountChange, setKind, providerChoice, setProvider, setEmployee, setFunding, save, discard,
@@ -479,10 +485,15 @@ export default {
                         :title="subcategories.length ? '' : 'Sub-categories are not set up on this database yet'">
                         <option v-for="o in subOptionsFor(r.newProvider)" :key="String(o.value)" :value="o.value">{{ o.value === null ? 'No sub-category' : o.label }}</option>
                       </select>
-                      <select v-model="r.newProvider.recurrence" :class="SELECT" aria-label="Recurrence">
-                        <option value="weekly">Weekly</option><option value="monthly">Monthly</option><option value="quarterly">Quarterly</option>
+                      <select v-model="r.newProvider.recurrence" @change="onNewRecurrence(r)" :class="SELECT" aria-label="Recurrence">
+                        <option value="weekly">Weekly</option><option value="threshold">Billed at a threshold</option>
+                        <option value="monthly">Monthly</option><option value="quarterly">Quarterly</option>
                         <option value="annual">Annual</option><option value="one_time">One-time</option>
                       </select>
+                      <label v-if="r.newProvider.recurrence === 'threshold'" class="col-span-2 flex items-center gap-2 text-xs text-gray-500">
+                        Billed each time spend reaches
+                        <input v-model="r.newProvider.billing_threshold" type="number" step="0.01" min="0" :class="INPUT + ' w-28'" aria-label="Billing threshold"/>
+                      </label>
                     </div>
                     <label v-if="r.expense_item_id" class="mt-1.5 flex items-center gap-1.5 text-xs text-gray-500">
                       <input type="checkbox" v-model="r.saveLabel"/> Save this bank wording as the provider's charge label

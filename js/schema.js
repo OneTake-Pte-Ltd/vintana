@@ -306,6 +306,7 @@ const ADDED_COLUMNS = {
   },
   expense_items: {
     subcategory_id: 'INTEGER REFERENCES expense_subcategories(id)',
+    billing_threshold: 'INTEGER', // cents: for expenses billed each time spend reaches this amount
   },
   employees: {
     charge_label: 'TEXT',

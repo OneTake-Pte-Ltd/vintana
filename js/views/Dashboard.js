@@ -68,7 +68,7 @@ export default {
             loadMrrSeries(sid, prev, month),
             query(`SELECT ec.name AS category, COALESCE(SUM(ev.amount), 0) AS total FROM expense_values ev JOIN expense_items ei ON ev.expense_item_id = ei.id JOIN expense_categories ec ON ei.category_id = ec.id WHERE ev.scenario_id = ? AND ev.month = ? GROUP BY ec.name ORDER BY total DESC`, [sid, month]),
             query(`SELECT name, department FROM employees WHERE start_date <= ? AND (end_date IS NULL OR end_date >= ?)`, [month + '-31', month + '-01']),
-            query(`SELECT * FROM expense_items WHERE visible = 1`),
+            query(`SELECT ei.*, (SELECT MAX(bt.date) FROM bank_transactions bt WHERE bt.expense_item_id = ei.id AND bt.kind = 'expense') AS last_charge_date FROM expense_items ei WHERE ei.visible = 1`),
             loadExpenseValues(sid, month, horizonMonth(RENEWAL_DAYS)),
           ]);
         if (run !== loadSeq) return;
@@ -235,7 +235,7 @@ export default {
             <td class="sticky-col py-2.5 pr-3 text-gray-900">{{ r.name }}</td>
             <td class="py-2.5 text-gray-500">{{ r.company || '—' }}</td>
             <td class="py-2.5 text-right text-gray-900">{{ formatCents(r.amount) }}</td>
-            <td class="py-2.5 text-right text-gray-500">{{ formatRenewalDate(r) }}</td>
+            <td class="py-2.5 text-right text-gray-500" :title="r.estimated ? 'Estimated from the monthly spend' : ''">{{ r.estimated ? '≈ ' : '' }}{{ formatRenewalDate(r) }}</td>
           </tr>
         </tbody>
       </table>

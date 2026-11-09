@@ -50,7 +50,8 @@ export default {
       try {
         const [rows, vals, emp, lookups] = await Promise.all([
           query(`
-            SELECT ei.*, ec.name AS category_name
+            SELECT ei.*, ec.name AS category_name,
+              (SELECT MAX(bt.date) FROM bank_transactions bt WHERE bt.expense_item_id = ei.id AND bt.kind = 'expense') AS last_charge_date
             FROM expense_items ei JOIN expense_categories ec ON ec.id = ei.category_id
             WHERE ei.visible = 1`),
           loadExpenseValues(scenarioId.value, currentMonth(), horizonMonth(Math.max(...WINDOWS.map(w => windowDays(w))))),
@@ -86,7 +87,7 @@ export default {
       name: c => (c.name || '').toLowerCase(),
       category: c => (c.category_name || '').toLowerCase(),
       subcategory: c => subName(c).toLowerCase(),
-      recurrence: c => ({ weekly: 0, monthly: 1, quarterly: 2, annual: 3, one_time: 4, payroll: 5 }[c.recurrence] || 9),
+      recurrence: c => ({ weekly: 0, threshold: 0.5, monthly: 1, quarterly: 2, annual: 3, one_time: 4, payroll: 5 }[c.recurrence] || 9),
       amount: c => c.amount,
     };
     const toggleSort = col => {
@@ -123,7 +124,7 @@ export default {
     const nextCharge = computed(() => [...allCharges.value].sort((a, b) => a.date - b.date)[0] || null);
 
     const undated = computed(() => {
-      const r = { 'no renewal day': 0, 'no start month': 0, 'no month': 0 };
+      const r = { 'no renewal day': 0, 'no start month': 0, 'no month': 0, 'no threshold': 0 };
       items.value.forEach(i => { const why = undatedReason(i); if (why) r[why]++; });
       return r;
     });
@@ -244,6 +245,8 @@ export default {
                   <td class="sticky-col px-4 py-3 whitespace-nowrap">
                     <div class="text-gray-900">{{ fmtDate(c.date) }}</div>
                     <div class="text-xs text-gray-400">{{ daysAway(c.date) }}</div>
+                    <span v-if="c.estimated" class="inline-block mt-0.5 px-1.5 py-0.5 rounded text-[11px] bg-gray-100 text-gray-600"
+                      title="Billed each time spend reaches the threshold: the date is estimated from the monthly spend">Estimated</span>
                   </td>
                   <td class="px-4 py-3 min-w-[10rem] md:min-w-[15rem]">
                     <div class="flex items-center gap-2 flex-wrap">
@@ -289,10 +292,11 @@ export default {
           </table>
         </div>
 
-        <div v-if="undated['no renewal day'] || undated['no start month'] || undated['no month']" class="text-xs text-gray-500 space-y-0.5">
+        <div v-if="undated['no renewal day'] || undated['no start month'] || undated['no month'] || undated['no threshold']" class="text-xs text-gray-500 space-y-0.5">
           <p>Some expenses are not listed because their charge date is unknown. Open them on the Expenses page to complete them:</p>
           <p v-if="undated['no renewal day']">{{ undated['no renewal day'] }} recurring expense{{ undated['no renewal day'] !== 1 ? 's have' : ' has' }} no renewal day.</p>
           <p v-if="undated['no start month']">{{ undated['no start month'] }} weekly, quarterly or annual expense{{ undated['no start month'] !== 1 ? 's have' : ' has' }} no start month (the month of the first charge).</p>
+          <p v-if="undated['no threshold']">{{ undated['no threshold'] }} expense{{ undated['no threshold'] !== 1 ? 's' : '' }} billed at a threshold {{ undated['no threshold'] !== 1 ? 'have' : 'has' }} no threshold amount.</p>
           <p v-if="undated['no month']">{{ undated['no month'] }} one-time expense{{ undated['no month'] !== 1 ? 's have' : ' has' }} no month.</p>
         </div>
       </template>
