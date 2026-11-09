@@ -8,6 +8,7 @@ import {
   saveReview, findDiscrepancies, applyFix, deleteImport, discrepancyType, discrepancyFixes, distinctCompany,
 } from '../statements.js';
 import { loadCategoryLookups, subcategoryOptions } from '../expenses.js';
+import ExpenseModal from '../../components/ExpenseModal.js';
 
 // Colour and tag of each kind of discrepancy
 const D_STYLE = {
@@ -22,6 +23,7 @@ let nextId = 1;
 
 export default {
   name: 'BankStatementsView',
+  components: { ExpenseModal },
   setup() {
     const { ref, reactive, computed, onMounted, onBeforeUnmount, inject, watch } = Vue;
     const settings = inject('settings');
@@ -275,6 +277,18 @@ export default {
         toast('Checked again', 'success');
       } catch (e) { toast('Check failed: ' + e.message, 'error'); }
     };
+    // Edit the expense behind a discrepancy in the usual window; the discrepancies are checked again when it closes
+    const editing = ref(null); // { itemId, history }
+    const editExpense = (d, h) => { editing.value = { itemId: d.itemId, history: h, changed: false }; };
+    const onEditClose = async () => {
+      const e = editing.value;
+      editing.value = null;
+      if (!e?.changed) return;
+      await loadLookups();
+      if (e.history) await recheck(e.history);
+      if (sessionImports.value.length) await refreshDiscrepancies();
+    };
+
     const confirmDelete = ref(null);
     const doDelete = async () => {
       const h = confirmDelete.value;
@@ -301,7 +315,7 @@ export default {
       dragging, filter, fileInput, openHistory, active, review, reviewAccount, currencyMismatch, rowsShown, toDecide, flaggedCount, totals,
       canSave, confirmDelete, statusLabel,
       onPick, onDrop, onAccountChange, setKind, providerChoice, setProvider, setEmployee, setFunding, save, discard,
-      removeFromList, fix, recheck, doDelete, issues, openIssues, needsDecision, kindLabel, accountLabel,
+      removeFromList, fix, recheck, editing, editExpense, onEditClose, doDelete, issues, openIssues, needsDecision, kindLabel, accountLabel,
       money, formatCents, monthLabelFull, fmtDate, fmtShort,
     };
   },
@@ -365,8 +379,9 @@ export default {
                         <div class="min-w-0">
                           <div class="font-medium text-gray-900">{{ d.title }}</div>
                           <div class="text-gray-600 text-xs mt-0.5">{{ d.detail }}</div>
-                          <div v-if="!d.applied && discrepancyFixes(d).length" class="mt-1.5 flex flex-wrap gap-1.5">
+                          <div v-if="!d.applied && (discrepancyFixes(d).length || d.itemId)" class="mt-1.5 flex flex-wrap gap-1.5">
                             <button v-for="f in discrepancyFixes(d)" :key="f.label" @click="fix(d, f, d.importId)" class="px-2.5 py-1 text-xs rounded-md bg-white border border-gray-200 hover:bg-gray-50">{{ f.label }}</button>
+                            <button v-if="d.itemId" @click="editExpense(d, null)" class="px-2.5 py-1 text-xs rounded-md text-indigo-600 hover:text-indigo-800 hover:bg-white">Edit expense...</button>
                           </div>
                         </div>
                       </div>
@@ -551,8 +566,9 @@ export default {
                         <div class="min-w-0">
                           <div class="font-medium text-gray-900">{{ d.title }}</div>
                           <div class="text-gray-600 text-xs mt-0.5">{{ d.detail }}</div>
-                          <div v-if="!d.applied && discrepancyFixes(d).length" class="mt-1.5 flex flex-wrap gap-1.5">
+                          <div v-if="!d.applied && (discrepancyFixes(d).length || d.itemId)" class="mt-1.5 flex flex-wrap gap-1.5">
                             <button v-for="f in discrepancyFixes(d)" :key="f.label" @click="fix(d, f, h.id)" class="px-2.5 py-1 text-xs rounded-md bg-white border border-gray-200 hover:bg-gray-50">{{ f.label }}</button>
+                            <button v-if="d.itemId" @click="editExpense(d, h)" class="px-2.5 py-1 text-xs rounded-md text-indigo-600 hover:text-indigo-800 hover:bg-white">Edit expense...</button>
                           </div>
                         </div>
                       </div>
@@ -567,6 +583,9 @@ export default {
           </table>
         </div>
       </div>
+
+      <expense-modal v-if="editing" :item-id="editing.itemId" :categories="categories" :subcategories="subcategories"
+        @saved="editing.changed = true" @close="onEditClose"/>
 
       <div v-if="confirmDelete" class="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
         <div class="bg-white rounded-xl p-6 max-w-sm" role="dialog" aria-modal="true">

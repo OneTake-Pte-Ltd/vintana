@@ -11,7 +11,7 @@
 import { query, execute, batch, getCredentials } from './db.js';
 import { getBaseScenarioId } from './schema.js';
 import {
-  getReportingCurrency, addMonths, currentMonth, generateMonthRange, prevMonth, RECURRENCE_MONTHS, formatCents, monthLabelFull, isChargeMonth,
+  getReportingCurrency, addMonths, currentMonth, generateMonthRange, prevMonth, RECURRENCE_MONTHS, formatCents, monthLabelFull, isChargeMonth, ordinalDay,
 } from './utils.js';
 import { loadScenarioEmployees, employeeCost, isEmployedIn } from './payroll.js';
 import { respreadExpense } from './expenses.js';
@@ -370,6 +370,21 @@ const longerRecurrences = (it, month, charge) => ['quarterly', 'annual']
   .map(r => ({ label: `Make ${it.name} ${NAMES[r]} (${formatCents(charge)} from ${monthLabelFull(month)})`, action: 'set_recurrence',
     args: { itemId: it.id, recurrence: r, month, charge } }));
 
+// Days between a charge and the nearest renewal day (in its month or the one before or after), signed:
+// positive when the charge came later than the renewal day
+export function chargeDayOffset(date, renewalDay) {
+  const actual = new Date(date + 'T00:00:00');
+  let best = null;
+  for (const k of [-1, 0, 1]) {
+    const y = actual.getFullYear(), m = actual.getMonth() + k;
+    const expected = new Date(y, m, Math.min(renewalDay, new Date(y, m + 1, 0).getDate()));
+    const off = Math.round((actual - expected) / 864e5);
+    if (best === null || Math.abs(off) < Math.abs(best)) best = off;
+  }
+  return best;
+}
+const DAY_TOLERANCE = 3; // banks often post a charge a few days late (weekends, processing)
+
 const fullMonthsIn = (start, end) => generateMonthRange(start.slice(0, 7), end.slice(0, 7))
   .filter(m => start <= `${m}-01` && end >= monthEnd(m));
 
@@ -418,20 +433,50 @@ export async function findDiscrepancies(importId, settings) {
   // 4. Charges: expected but not seen, different from the forecast, or charged twice
   const items = await query('SELECT * FROM expense_items WHERE visible = 1');
   const seen = await query(`SELECT expense_item_id AS id, month, COUNT(*) AS n, -SUM(amount_reporting) AS total,
-      MIN(amount) AS min_a, MAX(amount) AS max_a
+      MIN(amount) AS min_a, MAX(amount) AS max_a, MIN(date) AS first_date
     FROM bank_transactions WHERE kind = 'expense' AND expense_item_id IS NOT NULL GROUP BY expense_item_id, month`);
   const seenMap = new Map(seen.map(s => [`${s.id}:${s.month}`, s]));
   const forecastAfter = async (itemId, month) => (await query(`SELECT month, amount FROM expense_values WHERE expense_item_id = ? AND scenario_id = ?
       AND is_actual = 0 AND month > ? ORDER BY month LIMIT 1`, [itemId, baseId, month]))[0];
   const rmoney = c => formatCents(c);
+  const longDate = iso => new Date(iso + 'T00:00:00').toLocaleDateString('en-GB', { day: 'numeric', month: 'long' });
+
+  // Quarterly and annual charges that came in another month than expected: matched to the nearest expected month
+  // (up to 2 months away) that has no charge of its own. One "charged in another month" card replaces that month's
+  // "not charged" card.
+  const shiftedTo = new Set();     // `${id}:${expected month}`
+  const shiftedFrom = new Map();   // `${id}:${month charged}` -> expected month
+  for (const s of seen) {
+    const it = items.find(i => i.id === s.id);
+    if (!it || it.formula || !['quarterly', 'annual'].includes(it.recurrence) || !it.start_month) continue;
+    if (isChargeMonth(it.recurrence, it.start_month, s.month)) continue;
+    for (const k of [-1, 1, -2, 2]) {
+      const e = addMonths(s.month, k);
+      if (isChargeMonth(it.recurrence, it.start_month, e) && !seenMap.has(`${it.id}:${e}`) && !shiftedTo.has(`${it.id}:${e}`)) {
+        shiftedTo.add(`${it.id}:${e}`);
+        shiftedFrom.set(`${it.id}:${s.month}`, e);
+        break;
+      }
+    }
+  }
 
   for (const m of fullMonths) {
     for (const it of items) {
+      const s = seenMap.get(`${it.id}:${m}`);
+      const expectedIn = shiftedFrom.get(`${it.id}:${m}`);
+      if (s && expectedIn) {
+        const day = Number(s.first_date.slice(8, 10));
+        const span = RECURRENCE_MONTHS[it.recurrence];
+        out.push({ type: 'mismatch', severity: 'info', itemId: it.id,
+          title: `${it.name} charged in ${monthLabelFull(m)}, expected in ${monthLabelFull(expectedIn)}`,
+          detail: `This ${NAMES[it.recurrence]} charge came on ${longDate(s.first_date)}, but its renewal was expected in ${monthLabelFull(expectedIn)}${it.renewal_day ? ` on the ${ordinalDay(it.renewal_day)}` : ''}. If the renewal date has moved, move it so the next charges are expected at the right time.`,
+          fixes: [{ label: `Renew every ${span} months from ${monthLabelFull(m)}, on the ${ordinalDay(day)}`, action: 'move_renewal', args: { itemId: it.id, month: m, day } }] });
+      }
       const active = (!it.start_month || it.start_month <= m) && (!it.end_month || it.end_month >= m);
       if (!active || it.formula) continue;
       const due = it.recurrence === 'one_time' ? it.start_month === m
         : it.recurrence === 'monthly' ? true : (it.start_month && isChargeMonth(it.recurrence, it.start_month, m));
-      const s = seenMap.get(`${it.id}:${m}`);
+      if (due && !s && shiftedTo.has(`${it.id}:${m}`)) continue; // charged in a nearby month: reported above
       if (due && !s) {
         // Only when the charge was due in a month this statement fully covers, and no imported account shows it.
         // If it was charged before, it may renew less often than recorded: offer the longer recurrences that
@@ -440,13 +485,24 @@ export async function findDiscrepancies(importId, settings) {
         const longer = last && it.recurrence !== 'one_time'
           ? longerRecurrences(it, last.month, last.total).filter(f => !isChargeMonth(f.args.recurrence, last.month, m))
           : [];
-        out.push({ type: 'missing', severity: 'info', title: `${it.name} not charged in ${monthLabelFull(m)}`,
+        out.push({ type: 'missing', severity: 'info', itemId: it.id, title: `${it.name} not charged in ${monthLabelFull(m)}`,
           detail: `It was expected in ${monthLabelFull(m)} but appears in no imported statement.${last ? ` It was last charged ${formatCents(last.total)} in ${monthLabelFull(last.month)}; if it renews less often, change its recurrence.` : ''} If it's paid from an account you haven't imported yet, import that statement. If it has ended, set an end month.`,
           fixes: [...longer, { label: `End ${it.name} in ${monthLabelFull(prevMonth(m))}`, action: 'end_expense', args: { itemId: it.id, month: prevMonth(m) } }] });
       }
       if (!s) continue;
+      // Charged on another day than the renewal day (one charge in the month; a moved renewal is reported above)
+      if (it.renewal_day && s.n === 1 && !expectedIn) {
+        const off = chargeDayOffset(s.first_date, it.renewal_day);
+        if (Math.abs(off) > DAY_TOLERANCE) {
+          const day = Number(s.first_date.slice(8, 10));
+          out.push({ type: 'mismatch', severity: 'info', itemId: it.id,
+            title: `${it.name} charged on the ${ordinalDay(day)}, renewal day is the ${ordinalDay(it.renewal_day)}`,
+            detail: `The ${monthLabelFull(m)} charge came on ${longDate(s.first_date)}, ${Math.abs(off)} days ${off > 0 ? 'later' : 'earlier'} than expected. If the billing date has changed, update the renewal day so Upcoming Charges show the right date.`,
+            fixes: [{ label: `Set the renewal day to the ${ordinalDay(day)}`, action: 'set_renewal_day', args: { itemId: it.id, day } }] });
+        }
+      }
       if (it.recurrence === 'monthly' && s.n > 1 && s.min_a === s.max_a) {
-        out.push({ type: 'mismatch', severity: 'warning', title: `${it.name} charged ${s.n} times in ${monthLabelFull(m)}`,
+        out.push({ type: 'mismatch', severity: 'warning', itemId: it.id, title: `${it.name} charged ${s.n} times in ${monthLabelFull(m)}`,
           detail: `${s.n} identical charges of ${money(-s.max_a)}. Check with the supplier for double billing.` });
       }
       const next = await forecastAfter(it.id, m);
@@ -460,7 +516,7 @@ export async function findDiscrepancies(importId, settings) {
           // Much more than expected: often a quarterly or annual charge recorded as monthly
           const muchLarger = s.total >= expected * 2.5 && s.n === 1;
           const longer = muchLarger ? longerRecurrences(it, m, s.total) : [];
-          out.push({ type: 'mismatch', severity: 'info', title: `${it.name} cost ${rmoney(s.total)} in ${monthLabelFull(m)}, ${pct > 0 ? '+' : ''}${pct}% vs forecast`,
+          out.push({ type: 'mismatch', severity: 'info', itemId: it.id, title: `${it.name} cost ${rmoney(s.total)} in ${monthLabelFull(m)}, ${pct > 0 ? '+' : ''}${pct}% vs forecast`,
             detail: `The forecast expects ${rmoney(expected)} per charge. ${longer.length ? `A charge this much larger may cover several months: if it renews ${longer.map(f => NAMES[f.args.recurrence]).join(' or ')}, change its recurrence. ` : ''}If the new price will last, update the forecast from ${monthLabelFull(next.month)} onwards.`,
             fixes: [...longer, { label: `Use ${rmoney(newMonthly)} a month from ${monthLabelFull(next.month)}`, action: 'update_forecast', args: { itemId: it.id, from: next.month, amount: newMonthly } }] });
         }
@@ -544,6 +600,13 @@ export async function applyFix(fix) {
       await respreadExpense(a.itemId, baseId, a.charge, a.recurrence, a.month, item?.end_month || null);
       return `Recurrence changed to ${NAMES[a.recurrence]}`;
     }
+    case 'set_renewal_day':
+      await execute('UPDATE expense_items SET renewal_day = ? WHERE id = ?', [a.day, a.itemId]);
+      return 'Renewal day updated';
+    case 'move_renewal':
+      // The month charged becomes the anchor: later renewals are expected every 3 or 12 months from it
+      await execute('UPDATE expense_items SET start_month = ?, renewal_day = ? WHERE id = ?', [a.month, a.day, a.itemId]);
+      return 'Renewal moved';
     case 'update_salary':
       await execute('UPDATE employees SET salary_monthly = ? WHERE id = ?', [a.salary, a.employeeId]);
       return 'Salary updated';
