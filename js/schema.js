@@ -307,6 +307,9 @@ const ADDED_COLUMNS = {
   expense_items: {
     subcategory_id: 'INTEGER REFERENCES expense_subcategories(id)',
   },
+  employees: {
+    charge_label: 'TEXT',
+  },
   funding_events: {
     is_actual: 'INTEGER NOT NULL DEFAULT 0',
   },

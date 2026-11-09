@@ -207,7 +207,7 @@ export default {
             <div class="text-3xl font-bold text-gray-900">{{ headcount }}</div>
             <div class="text-xs text-gray-400">active employees</div>
           </div>
-          <div v-if="deptBreakdown.length > 0" class="flex-1" style="height:140px">
+          <div v-if="deptBreakdown.length > 0" class="flex-1 min-w-0 relative" style="height:140px">
             <canvas ref="teamCanvasRef"></canvas>
           </div>
           <div v-else class="text-sm text-gray-400">No employees found</div>

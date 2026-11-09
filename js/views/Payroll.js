@@ -31,7 +31,7 @@ export default {
     const lineCanvas = ref(null);
     let donutChart = null, lineChart = null;
 
-    const blankForm = () => ({ name:'', role:'', department:'', salary_eur:'', tax_pct:0, start_date:'', end_date:'', notes:'' });
+    const blankForm = () => ({ name:'', role:'', department:'', salary_eur:'', tax_pct:0, start_date:'', end_date:'', notes:'', charge_label:'' });
     const form = ref(blankForm());
 
     // Salaries actually paid, from bank statements: the latest month for each employee
@@ -125,7 +125,7 @@ export default {
       editingEmployee.value = emp;
       form.value = { name: emp.name, role: emp.role||'', department: emp.department||'',
         salary_eur: (emp.salary_monthly/100).toFixed(2), tax_pct: emp.tax_pct||0,
-        start_date: emp.start_date, end_date: emp.end_date||'', notes: emp.notes||'' };
+        start_date: emp.start_date, end_date: emp.end_date||'', notes: emp.notes||'', charge_label: emp.charge_label||'' };
       showModal.value = true;
     }
     async function saveEmployee() {
@@ -143,15 +143,17 @@ export default {
           } else if (!scenarioIsBase.value) {
             await execute('INSERT OR REPLACE INTO employee_overrides (employee_id,scenario_id,salary_monthly,tax_pct,start_date,end_date) VALUES (?,?,?,?,?,?)',
               [emp.id, scenarioId.value, cents, f.tax_pct, f.start_date, end]);
+            // The charge label is how bank statements name the person: the same in every scenario
+            await execute('UPDATE employees SET charge_label=? WHERE id=?', [f.charge_label || null, emp.id]);
           } else {
-            await execute('UPDATE employees SET name=?,role=?,department=?,salary_monthly=?,tax_pct=?,start_date=?,end_date=?,notes=? WHERE id=?',
-              [f.name, f.role, f.department, cents, f.tax_pct, f.start_date, end, f.notes, emp.id]);
+            await execute('UPDATE employees SET name=?,role=?,department=?,salary_monthly=?,tax_pct=?,start_date=?,end_date=?,notes=?,charge_label=? WHERE id=?',
+              [f.name, f.role, f.department, cents, f.tax_pct, f.start_date, end, f.notes, f.charge_label || null, emp.id]);
           }
           toast('Employee updated', 'success');
         } else {
           if (scenarioIsBase.value) {
-            await execute('INSERT INTO employees (name,role,department,salary_monthly,tax_pct,start_date,end_date,notes) VALUES (?,?,?,?,?,?,?,?)',
-              [f.name, f.role, f.department, cents, f.tax_pct, f.start_date, end, f.notes]);
+            await execute('INSERT INTO employees (name,role,department,salary_monthly,tax_pct,start_date,end_date,notes,charge_label) VALUES (?,?,?,?,?,?,?,?,?)',
+              [f.name, f.role, f.department, cents, f.tax_pct, f.start_date, end, f.notes, f.charge_label || null]);
           } else {
             await execute('INSERT INTO scenario_employees (scenario_id,name,role,department,salary_monthly,tax_pct,start_date,end_date,notes) VALUES (?,?,?,?,?,?,?,?,?)',
               [scenarioId.value, f.name, f.role, f.department, cents, f.tax_pct, f.start_date, end, f.notes]);
@@ -299,6 +301,11 @@ export default {
         <div class="grid grid-cols-2 gap-4">
           <div><label class="block text-xs font-medium text-gray-500 mb-1">Start Date *</label><input v-model="form.start_date" type="month" :class="INPUT"/></div>
           <div><label class="block text-xs font-medium text-gray-500 mb-1">End Date</label><input v-model="form.end_date" type="month" :class="INPUT"/></div>
+        </div>
+        <div v-if="editingEmployee ? editingEmployee._source !== 'scenario' : scenarioIsBase">
+          <label class="block text-xs font-medium text-gray-500 mb-1">Charge label</label>
+          <input v-model="form.charge_label" :class="INPUT" placeholder="As payments to this person appear on the bank statement"/>
+          <p class="text-[11px] text-gray-400 mt-1">Used to recognise payments to this person when reading bank statements.</p>
         </div>
         <div><label class="block text-xs font-medium text-gray-500 mb-1">Notes</label><textarea v-model="form.notes" rows="2" :class="INPUT"></textarea></div>
       </div>
