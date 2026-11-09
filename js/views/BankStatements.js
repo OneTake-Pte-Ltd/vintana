@@ -480,7 +480,7 @@ export default {
                         <option v-for="o in subOptionsFor(r.newProvider)" :key="String(o.value)" :value="o.value">{{ o.value === null ? 'No sub-category' : o.label }}</option>
                       </select>
                       <select v-model="r.newProvider.recurrence" :class="SELECT" aria-label="Recurrence">
-                        <option value="monthly">Monthly</option><option value="quarterly">Quarterly</option>
+                        <option value="weekly">Weekly</option><option value="monthly">Monthly</option><option value="quarterly">Quarterly</option>
                         <option value="annual">Annual</option><option value="one_time">One-time</option>
                       </select>
                     </div>

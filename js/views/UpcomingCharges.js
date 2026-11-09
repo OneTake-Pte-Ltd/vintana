@@ -86,7 +86,7 @@ export default {
       name: c => (c.name || '').toLowerCase(),
       category: c => (c.category_name || '').toLowerCase(),
       subcategory: c => subName(c).toLowerCase(),
-      recurrence: c => ({ monthly: 1, quarterly: 2, annual: 3, one_time: 4, payroll: 5 }[c.recurrence] || 9),
+      recurrence: c => ({ weekly: 0, monthly: 1, quarterly: 2, annual: 3, one_time: 4, payroll: 5 }[c.recurrence] || 9),
       amount: c => c.amount,
     };
     const toggleSort = col => {
@@ -292,7 +292,7 @@ export default {
         <div v-if="undated['no renewal day'] || undated['no start month'] || undated['no month']" class="text-xs text-gray-500 space-y-0.5">
           <p>Some expenses are not listed because their charge date is unknown. Open them on the Expenses page to complete them:</p>
           <p v-if="undated['no renewal day']">{{ undated['no renewal day'] }} recurring expense{{ undated['no renewal day'] !== 1 ? 's have' : ' has' }} no renewal day.</p>
-          <p v-if="undated['no start month']">{{ undated['no start month'] }} quarterly or annual expense{{ undated['no start month'] !== 1 ? 's have' : ' has' }} no start month (the month of the first charge).</p>
+          <p v-if="undated['no start month']">{{ undated['no start month'] }} weekly, quarterly or annual expense{{ undated['no start month'] !== 1 ? 's have' : ' has' }} no start month (the month of the first charge).</p>
           <p v-if="undated['no month']">{{ undated['no month'] }} one-time expense{{ undated['no month'] !== 1 ? 's have' : ' has' }} no month.</p>
         </div>
       </template>

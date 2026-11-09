@@ -12,6 +12,7 @@ export const PAYROLL_COLUMNS = ['name', 'role', 'department', 'monthly_salary', 
 
 const DEFAULT_CATEGORY = 'Uncategorized / Other';
 const RECURRENCE_ALIASES = {
+  weekly: 'weekly', week: 'weekly',
   monthly: 'monthly', month: 'monthly',
   quarterly: 'quarterly', quarter: 'quarterly',
   annual: 'annual', annually: 'annual', yearly: 'annual', year: 'annual',
@@ -101,7 +102,7 @@ export async function importExpensesCsv(text, dateRange) {
     if (!name) rowErrors.push('name is empty');
 
     const recurrence = RECURRENCE_ALIASES[(r.recurrence || 'monthly').toLowerCase().replace(/[\s-]+/g, '_')];
-    if (!recurrence) rowErrors.push(`recurrence "${r.recurrence}" must be monthly, quarterly, annual or one_time`);
+    if (!recurrence) rowErrors.push(`recurrence "${r.recurrence}" must be weekly, monthly, quarterly, annual or one_time`);
 
     let amount = null;
     if (r.amount !== '') {

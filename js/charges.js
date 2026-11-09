@@ -1,7 +1,7 @@
 import { query } from './db.js';
 import { getBaseScenarioId } from './schema.js';
 import { employeeCost, isEmployedIn, payrollCategory } from './payroll.js';
-import { chargeFromMonthly, generateMonthRange, isChargeMonth } from './utils.js';
+import { chargeFromMonthly, generateMonthRange, isChargeMonth, weeklyAnchor, weeklyChargeDates } from './utils.js';
 
 const pad = n => String(n).padStart(2, '0');
 export const monthOf = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}`;
@@ -24,7 +24,8 @@ export async function loadExpenseValues(scenarioId, startMonth, endMonth) {
 
 // Charges falling between today and today + `days` (inclusive), soonest first.
 // Recurring expenses need a renewal day to have a date, and quarterly or annual ones also need a start month
-// (their first charge); one-time expenses are charged in their start month
+// (their first charge); weekly ones are charged every 7 days from their start month and renewal day (their first
+// charge); one-time expenses are charged in their start month
 // (on their renewal day, or the 1st when none is set). The amount is one full charge, not the monthly share.
 export function computeUpcomingCharges(items, values, days, now = new Date()) {
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
@@ -35,6 +36,18 @@ export function computeUpcomingCharges(items, values, days, now = new Date()) {
 
   for (const item of items) {
     const inPeriod = m => (!item.start_month || m >= item.start_month) && (!item.end_month || m <= item.end_month);
+    if (item.recurrence === 'weekly') {
+      // One charge a week: the weekly amount, from the month's value (the monthly average)
+      for (const date of weeklyChargeDates(weeklyAnchor(item), today, until)) {
+        const month = monthOf(date);
+        if (!inPeriod(month)) continue;
+        const amount = chargeFromMonthly(values[`${item.id}:${month}`] || 0, 'weekly');
+        if (!amount) continue;
+        const day = String(date.getDate()).padStart(2, '0');
+        charges.push({ ...item, kind: 'expense', key: `e:${item.id}:${month}-${day}`, date, month, amount });
+      }
+      continue;
+    }
     let candidates = [];
     if (item.recurrence === 'one_time') {
       if (item.start_month && months.includes(item.start_month)) candidates = [item.start_month];
