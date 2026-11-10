@@ -186,6 +186,16 @@ const DDL = [
     created_at        TEXT DEFAULT (datetime('now'))
   )`,
 
+  // Statements read but not saved yet, so a page reload doesn't lose them. review: the review being prepared (JSON),
+  // i.e. what the model read; the PDF itself is never stored. Deleted when the statement is saved or discarded.
+  `CREATE TABLE IF NOT EXISTS statement_drafts (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_name   TEXT,
+    file_size   INTEGER,
+    review      TEXT NOT NULL,
+    created_at  TEXT DEFAULT (datetime('now'))
+  )`,
+
   // Statement lines. amount: account currency, signed (money in > 0); amount_reporting: converted at the month-end rate.
   `CREATE TABLE IF NOT EXISTS bank_transactions (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -316,7 +326,7 @@ const ADDED_COLUMNS = {
   },
 };
 
-const ADDED_TABLES = ['expense_subcategories', 'bank_accounts', 'bank_balances', 'statement_imports', 'bank_transactions', 'fx_rates',
+const ADDED_TABLES = ['expense_subcategories', 'bank_accounts', 'bank_balances', 'statement_imports', 'statement_drafts', 'bank_transactions', 'fx_rates',
   'product_families', 'product_lines', 'pw_plans', 'pw_mrr', 'line_growth'];
 
 // Changes whenever the lists above change, so new upgrades run once on every database, then never again
