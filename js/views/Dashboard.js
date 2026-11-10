@@ -1,15 +1,17 @@
 import { query } from '../db.js';
 import { cashPosition } from '../bank.js';
-import { loadMrrSeries, mrrChartDatasets } from '../profitwell.js';
+import { loadMrrSeries, mrrChartDatasets, mrrRevenueLine } from '../profitwell.js';
+import { loadScenarioEmployees, employeeCost, isEmployedIn } from '../payroll.js';
 import {
   formatCents, formatPct, formatDelta, monthLabel,
   currentMonth, prevMonth, ordinalDay,
 } from '../utils.js';
-import { loadExpenseValues, computeUpcomingCharges, horizonMonth } from '../charges.js';
+import { loadExpenseValues, computeUpcomingCharges, computePayrollCharges, horizonMonth } from '../charges.js';
 
 const RENEWAL_DAYS = 7;
 
 const COLORS = ['#6366f1', '#f59e0b', '#10b981', '#ef4444', '#8b5cf6'];
+const REVENUE_LINE = '_revenue'; // hidden dataset the expenses line shades against (not in legend or tooltip)
 
 function centsTooltip(ctx) { return formatCents(Math.round(ctx.raw * 100)); }
 function centsTick(v) { return formatCents(Math.round(v * 100)); }
@@ -28,9 +30,27 @@ export default {
     const cashBalance = ref(null);
     const totalExpenses = ref(0), totalPayroll = ref(0);
     const mrrSeries = ref(null), expensesByCat = ref([]);
-    const employees = ref([]), renewals = ref([]);
+    const employees = ref([]), renewals = ref([]), payrollDue = ref([]);
+    const expensesByMonth = ref({}); // cents, expenses + payroll, for the chart's months
     const mrrCanvasRef = ref(null), expenseCanvasRef = ref(null), teamCanvasRef = ref(null);
     let charts = [];
+
+    const hasMrr = computed(() => !!mrrSeries.value && mrrSeries.value.months.some(m => mrrSeries.value.totals[m]));
+
+    // Next 7 days: what the listed charges add up to, and payroll falling in the same days
+    const sumOf = list => list.reduce((s, c) => s + c.amount, 0);
+    const renewalsTotal = computed(() => sumOf(renewals.value));
+    const payrollTotal = computed(() => sumOf(payrollDue.value));
+    const grandTotal = computed(() => renewalsTotal.value + payrollTotal.value);
+    const payrollLabel = computed(() => {
+      const list = payrollDue.value;
+      if (!list.length) return '';
+      const people = new Set(list.map(c => c.key.split(':')[1])).size;
+      const days = [...new Set(list.map(c => c.date.getTime()))];
+      const when = days.length === 1
+        ? ' · ' + list[0].date.toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short' }) : '';
+      return `${people} ${people === 1 ? 'person' : 'people'}${when}`;
+    });
 
     const mrr = computed(() => revenueNow.value);
     const mrrDelta = computed(() => formatDelta(revenueNow.value, revenuePrev.value));
@@ -59,17 +79,19 @@ export default {
       const range = dateRange.value;
       try {
         const start = range?.start || month, end = range?.end || month;
-        const [series, cash, expenses, payroll, mrrAround, expCat, empRows, renewItems, renewValues] =
+        const [series, cash, expenses, scenarioEmp, mrrAround, expCat, empRows, renewItems, renewValues, expMonths] =
           await Promise.all([
             loadMrrSeries(sid, start, end),
             cashPosition().catch(() => null),
             query(`SELECT COALESCE(SUM(amount), 0) AS v FROM expense_values WHERE scenario_id = ? AND month = ?`, [sid, month]),
-            query(`SELECT salary_monthly, tax_pct FROM employees WHERE start_date <= ? AND (end_date IS NULL OR end_date >= ?)`, [month + '-31', month + '-01']),
+            loadScenarioEmployees(sid),
             loadMrrSeries(sid, prev, month),
             query(`SELECT ec.name AS category, COALESCE(SUM(ev.amount), 0) AS total FROM expense_values ev JOIN expense_items ei ON ev.expense_item_id = ei.id JOIN expense_categories ec ON ei.category_id = ec.id WHERE ev.scenario_id = ? AND ev.month = ? GROUP BY ec.name ORDER BY total DESC`, [sid, month]),
             query(`SELECT name, department FROM employees WHERE start_date <= ? AND (end_date IS NULL OR end_date >= ?)`, [month + '-31', month + '-01']),
             query(`SELECT ei.*, (SELECT MAX(bt.date) FROM bank_transactions bt WHERE bt.expense_item_id = ei.id AND bt.kind = 'expense') AS last_charge_date FROM expense_items ei WHERE ei.visible = 1`),
             loadExpenseValues(sid, month, horizonMonth(RENEWAL_DAYS)),
+            query(`SELECT month, COALESCE(SUM(amount), 0) AS total FROM expense_values
+                   WHERE scenario_id = ? AND month >= ? AND month <= ? GROUP BY month`, [sid, start, end]),
           ]);
         if (run !== loadSeq) return;
 
@@ -77,14 +99,20 @@ export default {
         revenuePrev.value = mrrAround.totals[prev] || 0;
         cashBalance.value = cash ? cash.total : null;
         totalExpenses.value = expenses[0]?.v || 0;
-        totalPayroll.value = payroll.reduce((s, e) => s + Math.round(e.salary_monthly * (1 + (e.tax_pct || 0) / 100)), 0);
+        // The scenario's people (base employees with its changes, plus its own hires), as on the Payroll page
+        const people = scenarioEmp.employees;
+        const payrollIn = m => people.filter(e => isEmployedIn(e, m)).reduce((s, e) => s + employeeCost(e), 0);
+        totalPayroll.value = payrollIn(month);
 
-        mrrSeries.value = series.months.some(m => series.totals[m]) ? series : null;
+        mrrSeries.value = series;
+        const expMap = Object.fromEntries(expMonths.map(r => [r.month, r.total]));
+        expensesByMonth.value = Object.fromEntries(series.months.map(m => [m, (expMap[m] || 0) + payrollIn(m)]));
         expensesByCat.value = expCat;
         employees.value = empRows;
 
         // Same charges as the Upcoming Charges page, soonest first
         renewals.value = computeUpcomingCharges(renewItems, renewValues, RENEWAL_DAYS);
+        payrollDue.value = computePayrollCharges(people, RENEWAL_DAYS, settings.value?.payroll_pay_day, settings.value?.dept_mapping);
       } catch (e) { console.error('Dashboard load error:', e); }
       finally { if (run === loadSeq) { loading.value = false; await nextTick(); renderCharts(); } }
     }
@@ -99,16 +127,44 @@ export default {
 
     function renderCharts() {
       destroyCharts();
-      // MRR line chart
-      if (mrrSeries.value) {
-        const s = mrrSeries.value;
+      // Path to profitability: MRR and expenses (incl. payroll); the gap is shaded red where expenses are higher
+      // (burn) and green where MRR is higher (profit)
+      const s = mrrSeries.value;
+      if (s && s.months.length) {
+        const expenses = s.months.map(m => (expensesByMonth.value[m] || 0) / 100);
+        const revenue = mrrRevenueLine(s);
+        const datasets = [];
+        if (hasMrr.value) {
+          datasets.push(...mrrChartDatasets(s).map(d => ({ ...d, fill: false })));
+          datasets.push({ label: REVENUE_LINE, data: revenue, borderColor: 'transparent', backgroundColor: 'transparent',
+            borderWidth: 0, pointRadius: 0, pointHoverRadius: 0, pointHitRadius: 0, fill: false, tension: 0.3 });
+        }
+        datasets.push({
+          label: 'Expenses (inc. payroll)', data: expenses, borderColor: '#ef4444', backgroundColor: '#ef4444',
+          tension: 0.3, pointRadius: 2, borderWidth: 2,
+          fill: hasMrr.value
+            ? { target: datasets.length - 1, above: 'rgba(239,68,68,0.15)', below: 'rgba(16,185,129,0.18)' }
+            : false,
+        });
         makeChart(mrrCanvasRef, {
           type: 'line',
-          data: { labels: s.months.map(monthLabel), datasets: mrrChartDatasets(s) },
+          data: { labels: s.months.map(monthLabel), datasets },
           options: { responsive: true, maintainAspectRatio: false,
+            interaction: { mode: 'index', intersect: false },
             plugins: {
-              legend: { display: s.months.some(m => !s.isActual(m)), position: 'bottom', labels: { usePointStyle: true, boxWidth: 8 } },
-              tooltip: { callbacks: { label: c => `${c.dataset.label}: ${centsTooltip(c)}` } },
+              legend: { position: 'bottom', labels: { usePointStyle: true, boxWidth: 8, filter: i => i.text !== REVENUE_LINE } },
+              tooltip: {
+                filter: i => i.dataset.label !== REVENUE_LINE && i.raw !== null,
+                callbacks: {
+                  label: c => `${c.dataset.label}: ${centsTooltip(c)}`,
+                  footer: items => {
+                    if (!hasMrr.value || !items.length) return '';
+                    const i = items[0].dataIndex;
+                    const gap = Math.round((expenses[i] - revenue[i]) * 100);
+                    return gap > 0 ? `Burn: ${formatCents(gap)}` : `Profit: ${formatCents(-gap)}`;
+                  },
+                },
+              },
             },
             scales: { y: { beginAtZero: true, ticks: { callback: centsTick, maxTicksLimit: 6 }, grid: { color: '#f3f4f6' } }, x: { grid: { display: false } } },
           },
@@ -149,7 +205,7 @@ export default {
 
     return {
       loading, mrr, mrrDelta, arr, arrDelta, cashBalance, burnRate, runway,
-      headcount, deptBreakdown, mrrSeries, expensesByCat, renewals,
+      headcount, deptBreakdown, mrrSeries, hasMrr, expensesByCat, renewals, payrollDue, renewalsTotal, payrollTotal, grandTotal, payrollLabel,
       mrrCanvasRef, expenseCanvasRef, teamCanvasRef, formatCents, formatRenewalDate, RENEWAL_DAYS,
     };
   },
@@ -168,9 +224,9 @@ export default {
     <!-- Row 2: Charts -->
     <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
       <div class="bg-white rounded-xl border border-gray-200 p-5">
-        <h2 class="text-sm font-semibold text-gray-700 mb-4">MRR Over Time</h2>
-        <div style="height:280px"><canvas ref="mrrCanvasRef"></canvas></div>
-        <p v-if="!mrrSeries" class="text-sm text-gray-400 text-center py-8">No MRR for this period. Sync ProfitWell in Settings.</p>
+        <h2 class="text-sm font-semibold text-gray-700 mb-4">Path to profitability <span class="font-normal text-gray-400">MRR vs expenses incl. payroll</span></h2>
+        <div style="height:280px"><canvas ref="mrrCanvasRef" role="img" aria-label="MRR and expenses including payroll by month; the gap is shaded red where expenses are higher and green where MRR is higher"></canvas></div>
+        <p v-if="!hasMrr" class="text-xs text-gray-400 text-center mt-2">No MRR for this period. Sync ProfitWell in Settings.</p>
       </div>
       <div class="bg-white rounded-xl border border-gray-200 p-5">
         <h2 class="text-sm font-semibold text-gray-700 mb-4">Expenses by Category</h2>
@@ -220,7 +276,7 @@ export default {
         <h2 class="text-sm font-semibold text-gray-700">Upcoming Renewals <span class="font-normal text-gray-400">(next {{ RENEWAL_DAYS }} days)</span></h2>
         <router-link to="/upcoming" class="text-xs text-indigo-600 hover:text-indigo-800">See all upcoming charges</router-link>
       </div>
-      <div v-if="renewals.length > 0" class="overflow-x-auto">
+      <div v-if="renewals.length || payrollDue.length" class="overflow-x-auto">
       <table class="w-full text-sm whitespace-nowrap">
         <thead>
           <tr class="text-left text-xs text-gray-500 uppercase tracking-wider border-b border-gray-100">
@@ -237,10 +293,28 @@ export default {
             <td class="py-2.5 text-right text-gray-900">{{ formatCents(r.amount) }}</td>
             <td class="py-2.5 text-right text-gray-500" :title="r.estimated ? 'Estimated from the monthly spend' : ''">{{ r.estimated ? '≈ ' : '' }}{{ formatRenewalDate(r) }}</td>
           </tr>
+          <tr v-if="!renewals.length"><td colspan="4" class="py-2.5 text-gray-400">No renewals</td></tr>
         </tbody>
+        <tfoot class="text-sm">
+          <tr v-if="renewals.length" class="border-t border-gray-200">
+            <td colspan="2" class="sticky-col pt-2.5 pr-3 text-gray-700">Total renewals</td>
+            <td class="pt-2.5 text-right text-gray-900 tabular-nums">{{ formatCents(renewalsTotal) }}</td>
+            <td></td>
+          </tr>
+          <tr v-if="payrollDue.length">
+            <td colspan="2" class="sticky-col pt-2 pr-3 text-gray-700">Payroll due <span class="text-gray-400">{{ payrollLabel }}</span></td>
+            <td class="pt-2 text-right text-gray-900 tabular-nums">{{ formatCents(payrollTotal) }}</td>
+            <td></td>
+          </tr>
+          <tr v-if="renewals.length && payrollDue.length">
+            <td colspan="2" class="sticky-col pt-2 pr-3 font-semibold text-gray-900">Total</td>
+            <td class="pt-2 text-right font-semibold text-gray-900 tabular-nums">{{ formatCents(grandTotal) }}</td>
+            <td></td>
+          </tr>
+        </tfoot>
       </table>
       </div>
-      <p v-else class="text-sm text-gray-400 py-4 text-center">No renewals in the next {{ RENEWAL_DAYS }} days</p>
+      <p v-else class="text-sm text-gray-400 py-4 text-center">No renewals or payroll in the next {{ RENEWAL_DAYS }} days</p>
     </div>
   </div>
 </div>

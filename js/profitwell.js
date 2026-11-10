@@ -256,6 +256,11 @@ export async function autoSync(settings, toast) {
 
 // Chart.js datasets for a total MRR line: ProfitWell actuals solid, planned growth dashed, trend dotted. The two
 // projections start from the last actual month so the lines join. Values are in currency units, not cents.
+// MRR as one continuous line in currency units: actual months, then the plan after the last actual one
+export function mrrRevenueLine(series) {
+  return series.months.map(m => (series.totals[m] || 0) / 100);
+}
+
 export function mrrChartDatasets(series) {
   const { months, totals, trendTotals, isActual, lastActual } = series;
   const joins = m => isActual(m) ? (m === lastActual ? totals[m] / 100 : null) : undefined;
