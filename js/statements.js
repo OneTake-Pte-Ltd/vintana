@@ -160,7 +160,7 @@ export async function prepareReview(parsed, fileName) {
       newProvider: null, saveLabel: false,
     };
     // A suggested "new" provider that already exists by name is that provider: link it instead of duplicating it
-    const same = t.suggested_provider && providers.find(p => p.name.trim().toLowerCase() === t.suggested_provider.name.trim().toLowerCase());
+    const same = t.suggested_provider && providers.find(p => providerKey(p.name) === providerKey(t.suggested_provider.name));
     if (row.kind === 'expense' && !row.expense_item_id && same) { row.expense_item_id = same.id; row.saveLabel = true; }
     if (row.kind === 'expense' && !row.expense_item_id) {
       const sp = t.suggested_provider;
@@ -231,6 +231,22 @@ export async function deleteImport(importId) {
   await batch(stmts);
 }
 
+// Provider names match ignoring case and spacing
+export const providerKey = name => (name || '').trim().replace(/\s+/g, ' ').toLowerCase();
+
+// Links lines that would create a provider to one that exists now under the same name (created by another
+// statement since this one was read). `providers`: [{ id, name }]. Returns how many lines were linked.
+export function relinkReview(review, providers) {
+  const byKey = new Map(providers.map(p => [providerKey(p.name), p.id]));
+  let n = 0;
+  for (const r of review.rows) {
+    if (r.kind !== 'expense' || r.expense_item_id || !r.newProvider) continue;
+    const id = byKey.get(providerKey(r.newProvider.name));
+    if (id) { r.expense_item_id = id; r.saveLabel = true; n++; }
+  }
+  return n;
+}
+
 const uniqueAlias = async (name) => {
   const base = name.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '') || 'expense';
   const used = new Set((await query('SELECT alias FROM expense_items WHERE alias IS NOT NULL')).map(r => r.alias));
@@ -264,11 +280,15 @@ export async function saveReview(review, { replaceImportIds = [] } = {}) {
      review.rows.length, JSON.stringify(readingNotes), review.readBy]);
   const importId = res.lastInsertRowid;
 
-  // New providers (one per distinct name, so two lines from the same new supplier share it)
-  const newIds = {};
+  // New providers (one per distinct name, so two lines from the same new supplier share it). A provider created
+  // since this statement was read (by another statement of the batch) is linked, not created again.
+  const newIds = Object.fromEntries((await query('SELECT id, name FROM expense_items WHERE visible = 1'))
+    .map(p => [providerKey(p.name), p.id]));
+  const existed = new Set(Object.keys(newIds));
   for (const r of review.rows) {
     if (r.kind !== 'expense' || r.expense_item_id || !r.newProvider) continue;
-    const key = r.newProvider.name.trim().toLowerCase();
+    const key = providerKey(r.newProvider.name);
+    if (existed.has(key)) r.saveLabel = true; // the bank wording becomes its charge label, as when picked by hand
     if (!newIds[key]) {
       const ins = await execute(`INSERT INTO expense_items (name, alias, company, charge_label, category_id, recurrence, renewal_day, start_month, notes)
         VALUES (?,?,?,?,?,?,?,?,?)`,

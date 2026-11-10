@@ -5,7 +5,7 @@ import { loadAccounts, accountLabel } from '../bank.js';
 import { loadScenarioEmployees } from '../payroll.js';
 import {
   MAX_PDF_BYTES, KIND_OPTIONS, kindLabel, buildContext, readStatement, prepareReview, needsDecision, findOverlaps,
-  saveReview, findDiscrepancies, applyFix, deleteImport, discrepancyType, discrepancyFixes, distinctCompany,
+  saveReview, findDiscrepancies, applyFix, deleteImport, discrepancyType, discrepancyFixes, relinkReview,
 } from '../statements.js';
 import { loadCategoryLookups, subcategoryOptions } from '../expenses.js';
 import ExpenseModal from '../../components/ExpenseModal.js';
@@ -20,6 +20,8 @@ const D_STYLE = {
 const SELECT = 'max-w-full px-2 py-1 text-sm border border-gray-200 rounded-md bg-white focus:outline-none focus:ring-2 focus:ring-indigo-500';
 const INPUT = 'w-full px-2 py-1 text-sm border border-gray-200 rounded-md focus:outline-none focus:ring-2 focus:ring-indigo-500';
 let nextId = 1;
+// Names of files dropped but not read yet, kept in this browser so a reload can say which to drop again
+const UNREAD_KEY = 'vintana_unread_statements';
 
 export default {
   name: 'BankStatementsView',
@@ -64,25 +66,90 @@ export default {
         toast('Failed to load: ' + e.message, 'error');
       }
     };
+    const importedNames = ref(new Set()); // file names of every statement saved so far
     const loadHistory = async () => {
       try {
-        history.value = await query(`SELECT si.*, ba.bank_name, ba.label FROM statement_imports si
-          LEFT JOIN bank_accounts ba ON ba.id = si.account_id ORDER BY si.created_at DESC, si.id DESC LIMIT 100`);
+        const [rows, names] = await Promise.all([
+          query(`SELECT si.*, ba.bank_name, ba.label FROM statement_imports si
+            LEFT JOIN bank_accounts ba ON ba.id = si.account_id ORDER BY si.created_at DESC, si.id DESC LIMIT 100`),
+          query('SELECT DISTINCT file_name FROM statement_imports WHERE file_name IS NOT NULL'),
+        ]);
+        history.value = rows;
+        importedNames.value = new Set(names.map(n => n.file_name));
       } catch { history.value = []; }
     };
-    onMounted(() => Promise.all([loadLookups(), loadHistory()]));
+
+    // Files dropped before a reload that were never read: the PDFs are gone, so the person drops them again
+    const unreadNotice = ref([]);
+    try { unreadNotice.value = JSON.parse(localStorage.getItem(UNREAD_KEY) || '[]'); } catch { unreadNotice.value = []; }
+    watch(() => queue.filter(i => i.status === 'queued' || i.status === 'reading').map(i => i.name), names => {
+      try { localStorage.setItem(UNREAD_KEY, JSON.stringify(names)); } catch { /* storage unavailable */ }
+    });
+
+    // --- Drafts: statements read but not saved are kept in the database (never the PDF), so a reload keeps them ---
+    const saveDraft = async item => {
+      try {
+        const json = JSON.stringify(item.review);
+        if (item.draftId) await execute('UPDATE statement_drafts SET review = ? WHERE id = ?', [json, item.draftId]);
+        else item.draftId = (await execute('INSERT INTO statement_drafts (file_name, file_size, review) VALUES (?,?,?)',
+          [item.name, item.size, json])).lastInsertRowid;
+      } catch { /* a convenience: reading and saving work without it */ }
+    };
+    const dropDraft = async item => {
+      if (!item.draftId) return;
+      try { await execute('DELETE FROM statement_drafts WHERE id = ?', [item.draftId]); } catch { /* left for the next visit */ }
+      item.draftId = null;
+    };
+
+    const newItem = (name, size) => reactive({ id: nextId++, name, size, file: null, status: 'queued', error: '', review: null,
+      overlaps: [], importId: null, draftId: null, bulk: false, progress: { phase: 'sending', lines: 0 }, startedAt: null });
+
+    // Statements read before a reload come back ready to review
+    const restoreDrafts = async () => {
+      let rows = [];
+      try { rows = await query('SELECT id, file_name, file_size, review FROM statement_drafts ORDER BY id'); } catch { return; }
+      for (const d of rows) {
+        let rv;
+        try { rv = JSON.parse(d.review); } catch { continue; }
+        const item = newItem(d.file_name, d.file_size);
+        item.status = 'review';
+        item.review = reactive(rv);
+        item.draftId = d.id;
+        queue.push(item);
+        try { item.overlaps = await findOverlaps(rv.accountId, rv.periodStart, rv.periodEnd); } catch { /* checked again when opened */ }
+      }
+      unreadNotice.value = unreadNotice.value.filter(n => !rows.some(d => d.file_name === n));
+      relinkAll();
+    };
+    onMounted(async () => {
+      await Promise.all([loadLookups(), loadHistory()]);
+      await restoreDrafts();
+    });
 
     // --- Queue: one statement is read at a time; reviews wait their turn ---
+    // A file already read (waiting for review) or already imported is skipped; "Read anyway" reads it all the same
     const addFiles = (files) => {
       for (const f of files) {
         const isPdf = f.type === 'application/pdf' || /\.pdf$/i.test(f.name);
-        const item = reactive({ id: nextId++, name: f.name, size: f.size, file: f, status: 'queued', error: '', review: null, overlaps: [], importId: null,
-          progress: { phase: 'sending', lines: 0 }, startedAt: null });
+        const item = newItem(f.name, f.size);
+        item.file = f;
+        const same = queue.find(i => i.name === f.name && i.size === f.size && ['queued', 'reading', 'review', 'saving', 'done'].includes(i.status));
         if (!isPdf) { item.file = null; item.status = 'failed'; item.error = 'Not a PDF file.'; }
         else if (f.size > MAX_PDF_BYTES) { item.file = null; item.status = 'failed'; item.error = 'Larger than 24 MB. Split the statement into shorter periods.'; }
+        else if (same) { item.status = 'skipped'; item.error = same.status === 'done' ? 'Already imported in this visit.' : same.status === 'review' ? 'Already read, waiting for review.' : 'Already in the list.'; }
+        else if (importedNames.value.has(f.name)) { item.status = 'skipped'; item.error = 'Already imported: a statement with this file name was saved before.'; }
         queue.push(item);
       }
+      unreadNotice.value = unreadNotice.value.filter(n => !files.some(f => f.name === n));
       pump();
+    };
+    const dismissUnread = () => {
+      unreadNotice.value = [];
+      try { localStorage.setItem(UNREAD_KEY, JSON.stringify(queue.filter(i => i.status === 'queued' || i.status === 'reading').map(i => i.name))); } catch { /* storage unavailable */ }
+    };
+    const readAnyway = item => { item.status = 'queued'; item.error = ''; pump(); };
+    const clearFinished = () => {
+      for (let i = queue.length - 1; i >= 0; i--) if (['done', 'failed', 'discarded', 'skipped'].includes(queue[i].status)) queue.splice(i, 1);
     };
     const onPick = e => { addFiles([...e.target.files]); e.target.value = ''; };
     const onDrop = e => { dragging.value = false; addFiles([...e.dataTransfer.files]); };
@@ -116,8 +183,10 @@ export default {
       try {
         const parsed = await readStatement(file, settings.value, await buildContext(), undefined, p => { item.progress = p; });
         item.review = reactive(await prepareReview(parsed, item.name));
+        relinkReview(item.review, providers.value);
         item.overlaps = await findOverlaps(item.review.accountId, item.review.periodStart, item.review.periodEnd);
         item.status = 'review';
+        await saveDraft(item);
       } catch (e) {
         item.status = 'failed';
         item.error = e.message;
@@ -127,7 +196,19 @@ export default {
       }
     }
 
-    const active = computed(() => queue.find(i => i.status === 'review' || i.status === 'saving') || null);
+    // The oldest statement first (by period): month-to-month checks are cleaner in date order. Statements being
+    // saved by "Save all" are not shown.
+    const byPeriod = (a, b) => (a.review?.periodStart || '').localeCompare(b.review?.periodStart || '') || a.id - b.id;
+    const active = computed(() => queue.find(i => i.status === 'saving' && !i.bulk)
+      || queue.filter(i => i.status === 'review').sort(byPeriod)[0] || null);
+
+    // Edits to the open review are kept in its draft (a second after the last change)
+    let draftTimer = null;
+    watch(() => active.value?.review, () => {
+      const item = active.value;
+      clearTimeout(draftTimer);
+      if (item?.status === 'review') draftTimer = setTimeout(() => { if (item.status === 'review') saveDraft(item); }, 1000);
+    }, { deep: true });
     const review = computed(() => active.value?.review || null);
 
     // Check for overlaps when a review opens: an earlier file in the same batch may have been saved since it was read
@@ -210,53 +291,142 @@ export default {
 
     const setFunding = (row, v) => { row.funding_event_id = v ? Number(v) : null; row.confidence = 'high'; };
 
-    const canSave = computed(() => review.value && review.value.accountId && !currencyMismatch.value
-      && review.value.rows.every(r => !(r.kind === 'expense' && !r.expense_item_id && !r.newProvider?.name?.trim()))
-      && review.value.rows.every(r => !(r.kind === 'salary' && !r.employee_id)));
+    // Ready to save: account chosen in the right currency, every expense has a provider and every salary a person
+    const savable = rv => {
+      const acc = accounts.value.find(a => a.id === rv.accountId);
+      return !!acc && !(rv.currency && acc.currency !== rv.currency)
+        && rv.rows.every(r => !(r.kind === 'expense' && !r.expense_item_id && !r.newProvider?.name?.trim()))
+        && rv.rows.every(r => !(r.kind === 'salary' && !r.employee_id));
+    };
+    const canSave = computed(() => !!review.value && savable(review.value) && !bulk.value);
+    // Nothing to check: savable, no line flagged "To check", no note from reading, no overlap with an earlier import
+    const isClean = item => item.status === 'review' && !!item.review && !item.overlaps.length
+      && !(item.review.warnings || []).length && !item.review.rows.some(r => r.flagged) && savable(item.review);
+    const cleanCount = computed(() => queue.filter(isClean).length);
+    const waitingCount = computed(() => queue.filter(i => i.status === 'review').length);
+
+    // A supplier created by one statement is linked, not created again, in the statements still waiting
+    const relinkAll = () => {
+      for (const i of queue) if (i.status === 'review' && i.review && relinkReview(i.review, providers.value)) saveDraft(i);
+    };
+
+    // Saves one reviewed statement; its draft goes. Returns the ids of the earlier imports it replaced.
+    const saveItem = async item => {
+      const replaced = item.overlaps.map(o => o.id);
+      item.importId = await saveReview(item.review, { replaceImportIds: replaced });
+      sessionImports.value = [...sessionImports.value.filter(id => !replaced.includes(id)), item.importId];
+      savesSinceCheck++;
+      await dropDraft(item);
+      item.status = 'done';
+      item.review = null;
+      return replaced;
+    };
+
+    // Saves every statement with nothing to check, oldest first; stops at the first error
+    const bulk = ref(null); // { done, total } while saving
+    const saveAllClean = async () => {
+      const items = queue.filter(isClean).sort(byPeriod);
+      if (!items.length || bulk.value) return;
+      bulk.value = { done: 0, total: items.length };
+      let saved = 0;
+      try {
+        for (const item of items) {
+          if (!isClean(item)) continue;
+          // Another statement of this batch may have been saved over the same period since this one was read
+          item.overlaps = await findOverlaps(item.review.accountId, item.review.periodStart, item.review.periodEnd);
+          if (item.overlaps.length) continue; // left for review: saving would replace an import
+          item.bulk = true;
+          item.status = 'saving';
+          try {
+            await saveItem(item);
+            saved++;
+          } catch (e) {
+            item.status = 'review';
+            toast(`${item.name} could not be saved: ${e.message}`, 'error');
+            break;
+          } finally {
+            item.bulk = false;
+            bulk.value.done++;
+          }
+        }
+      } finally {
+        bulk.value = null;
+        await loadSettings?.();
+        await Promise.all([loadLookups(), loadHistory()]);
+        relinkAll();
+        toast(`${saved} statement${saved !== 1 ? 's' : ''} saved`, 'success');
+        refreshDiscrepancies();
+      }
+    };
 
     const save = async () => {
       const item = active.value;
       if (!item || !canSave.value) return;
       item.status = 'saving';
       try {
-        const replaced = item.overlaps.map(o => o.id);
-        item.importId = await saveReview(item.review, { replaceImportIds: replaced });
-        sessionImports.value = [...sessionImports.value.filter(id => !replaced.includes(id)), item.importId];
-        await loadSettings?.();
-        await refreshDiscrepancies();
-        item.status = 'done';
-        item.review = null;
+        const replaced = await saveItem(item);
         toast(`${item.name} saved`, 'success');
+        await loadSettings?.();
         await Promise.all([loadLookups(), loadHistory()]);
+        relinkAll();
+        checkImport(item.importId, replaced);
       } catch (e) {
         item.status = 'review';
         toast('Save failed: ' + e.message, 'error');
       }
     };
-    const discard = () => { const item = active.value; if (!item) return; item.status = 'discarded'; item.review = null; };
+    const discard = () => {
+      const item = active.value;
+      if (!item) return;
+      item.status = 'discarded';
+      item.review = null;
+      dropDraft(item);
+    };
     const removeFromList = item => { const i = queue.indexOf(item); if (i >= 0) queue.splice(i, 1); };
 
-    // --- Discrepancies: one list for every statement saved in this visit, checked again after each save ---
+    // --- Discrepancies: one de-duplicated list for every statement saved in this visit ---
     // A later statement can settle an earlier one's discrepancy (a missing month, a charge paid from another
-    // account), and two statements can raise the same one, so the list is rebuilt and de-duplicated each time.
+    // account), so the whole list is checked again once the queue is done (and on demand). After each single save,
+    // only that statement is checked, which stays fast with hundreds of imports.
     const sessionImports = ref([]);
     const discrepancies = ref([]);
     const checking = ref(false);
+    let savesSinceCheck = 0;
+    const D_ORDER = { mismatch: 0, missing: 1, suggestion: 2 };
+    const sortD = list => list.sort((a, b) => D_ORDER[discrepancyType(a)] - D_ORDER[discrepancyType(b)]);
     const refreshDiscrepancies = async () => {
+      if (checking.value) return;
       checking.value = true;
+      savesSinceCheck = 0;
       try {
         const seen = new Map();
-        for (const id of sessionImports.value) {
+        for (const id of [...sessionImports.value]) {
           for (const d of await findDiscrepancies(id, settings.value)) seen.set(d.title + '|' + d.detail, { ...d, importId: id });
         }
-        const order = { mismatch: 0, missing: 1, suggestion: 2 };
-        discrepancies.value = [...seen.values()].sort((a, b) => order[discrepancyType(a)] - order[discrepancyType(b)]);
+        discrepancies.value = sortD([...seen.values()]);
       } catch (e) {
         toast('Could not check for discrepancies: ' + e.message, 'error');
       } finally {
         checking.value = false;
       }
     };
+    const checkImport = async (id, replaced = []) => {
+      try {
+        const found = await findDiscrepancies(id, settings.value);
+        const keep = discrepancies.value.filter(d => d.importId !== id && !replaced.includes(d.importId));
+        const keys = new Set(keep.map(d => d.title + '|' + d.detail));
+        for (const d of found) {
+          const k = d.title + '|' + d.detail;
+          if (!keys.has(k)) { keep.push({ ...d, importId: id }); keys.add(k); }
+        }
+        discrepancies.value = sortD(keep);
+      } catch (e) {
+        toast('Could not check for discrepancies: ' + e.message, 'error');
+      }
+    };
+    // Nothing left to read, review or save: check everything once
+    const idle = computed(() => !queue.some(i => ['queued', 'reading', 'review', 'saving'].includes(i.status)));
+    watch(idle, v => { if (v && savesSinceCheck && !bulk.value) refreshDiscrepancies(); });
     const dStyle = d => D_STYLE[discrepancyType(d)];
     const sessionImportsCount = computed(() => sessionImports.value.length);
 
@@ -310,7 +480,7 @@ export default {
 
     const statusLabel = {
       queued: 'Waiting', reading: 'Reading...', review: 'Ready to review', saving: 'Saving...',
-      done: 'Saved', failed: 'Failed', discarded: 'Discarded',
+      done: 'Saved', failed: 'Failed', discarded: 'Discarded', skipped: 'Skipped',
     };
     const fmtDate = iso => iso ? new Date(iso + 'T00:00:00').toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) : '';
     const fmtShort = iso => iso ? new Date(iso + 'T00:00:00').toLocaleDateString('en-GB', { day: 'numeric', month: 'short' }) : '';
@@ -319,7 +489,8 @@ export default {
       SELECT, INPUT, KIND_OPTIONS, accounts, providers, providerGroups, categories, employees, planned, history, queue,
       discrepancies, checking, dStyle, sessionImportsCount, discrepancyFixes, elapsed, progressText, employeeName, subOptionsFor, onNewCategory, onNewRecurrence, subcategories,
       dragging, filter, fileInput, openHistory, active, review, reviewAccount, currencyMismatch, rowsShown, toDecide, flaggedCount, totals,
-      canSave, confirmDelete, statusLabel,
+      canSave, confirmDelete, statusLabel, unreadNotice, dismissUnread, readAnyway, clearFinished, cleanCount, waitingCount, bulk, saveAllClean,
+      refreshDiscrepancies,
       onPick, onDrop, onAccountChange, setKind, providerChoice, setProvider, setEmployee, setFunding, save, discard,
       removeFromList, fix, recheck, editing, editExpense, onEditClose, doDelete, issues, openIssues, needsDecision, kindLabel, accountLabel,
       money, formatCents, monthLabelFull, fmtDate, fmtShort,
@@ -342,18 +513,39 @@ export default {
         <p v-if="accounts.length" class="text-xs text-gray-500 mt-3">Accounts: {{ accounts.map(a => accountLabel(a) + ' · ' + a.currency).join(', ') }}</p>
       </div>
 
+      <!-- Files dropped before a reload but never read -->
+      <div v-if="unreadNotice.length" class="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+        <div class="flex items-start justify-between gap-3">
+          <p>{{ unreadNotice.length }} file{{ unreadNotice.length !== 1 ? 's were' : ' was' }} not read before the page was closed. PDFs are never kept, so drop {{ unreadNotice.length !== 1 ? 'them' : 'it' }} again; statements already read or imported are skipped.</p>
+          <button @click="dismissUnread" class="shrink-0 text-xs text-amber-800 hover:text-amber-950">Dismiss</button>
+        </div>
+        <p class="text-xs text-amber-800 mt-1 break-words">{{ unreadNotice.join(', ') }}</p>
+      </div>
+
       <!-- Queue -->
       <div v-if="queue.length" class="bg-white rounded-xl border border-gray-200 divide-y divide-gray-100">
+        <div class="px-4 py-3 flex items-center gap-3 flex-wrap text-sm bg-gray-50/60 rounded-t-xl">
+          <span class="text-gray-600">
+            {{ queue.filter(i => i.status === 'queued' || i.status === 'reading').length }} to read ·
+            {{ waitingCount }} to review · {{ queue.filter(i => i.status === 'done').length }} saved
+          </span>
+          <span v-if="bulk" class="text-indigo-700" role="status" aria-live="polite">Saving {{ bulk.done + 1 > bulk.total ? bulk.total : bulk.done + 1 }} of {{ bulk.total }}...</span>
+          <button v-else-if="cleanCount" @click="saveAllClean" class="px-3 py-1.5 text-xs rounded-md bg-indigo-600 text-white hover:bg-indigo-700"
+            title="Saves, oldest first, every statement read with no line to check, no note from reading and no overlap with an earlier import">
+            Save {{ cleanCount }} statement{{ cleanCount !== 1 ? 's' : '' }} with nothing to check
+          </button>
+          <button v-if="queue.some(i => ['done','failed','discarded','skipped'].includes(i.status))" @click="clearFinished" class="ml-auto text-xs text-gray-400 hover:text-gray-700">Clear finished</button>
+        </div>
         <div v-for="item in queue" :key="item.id" class="px-4 py-3 text-sm">
           <div class="flex items-center gap-3">
             <span :class="['inline-flex px-2 py-0.5 rounded-full text-xs font-medium whitespace-nowrap',
               item.status === 'done' ? 'bg-emerald-50 text-emerald-700' : item.status === 'failed' ? 'bg-red-50 text-red-700'
-              : item.status === 'review' ? 'bg-amber-50 text-amber-700' : item.status === 'discarded' ? 'bg-gray-100 text-gray-500' : 'bg-indigo-50 text-indigo-700']">
+              : item.status === 'review' ? 'bg-amber-50 text-amber-700' : ['discarded', 'skipped'].includes(item.status) ? 'bg-gray-100 text-gray-500' : 'bg-indigo-50 text-indigo-700']">
               {{ statusLabel[item.status] }}
             </span>
             <span class="font-medium text-gray-900 truncate">{{ item.name }}</span>
             <span class="text-xs text-gray-400">{{ (item.size / 1048576).toFixed(1) }} MB</span>
-            <button v-if="['done','failed','discarded'].includes(item.status)" @click="removeFromList(item)" class="ml-auto text-xs text-gray-400 hover:text-gray-700">Remove from list</button>
+            <button v-if="['done','failed','discarded','skipped'].includes(item.status)" @click="removeFromList(item)" class="ml-auto text-xs text-gray-400 hover:text-gray-700">Remove from list</button>
           </div>
           <div v-if="item.status === 'reading'" class="mt-2" role="status" aria-live="polite">
             <div class="h-1.5 w-full rounded-full bg-indigo-100 overflow-hidden">
@@ -363,6 +555,8 @@ export default {
               <span>{{ progressText(item) }}</span><span class="tabular-nums">{{ elapsed(item) }}</span>
             </div>
           </div>
+          <p v-if="item.status === 'skipped'" class="text-xs text-gray-500 mt-1">{{ item.error }}
+            <button @click="readAnyway(item)" class="ml-1 text-indigo-600 hover:text-indigo-800">Read anyway</button></p>
           <p v-if="item.status === 'failed'" class="text-xs text-red-600 mt-1">{{ item.error }}<template v-if="/\.pdf$/i.test(item.name)"> The PDF was discarded; drop it again to retry.</template></p>
         </div>
       </div>
@@ -377,8 +571,12 @@ export default {
             <span class="inline-flex items-center gap-1"><span class="w-2.5 h-2.5 rounded-sm bg-emerald-400"></span>Suggestion</span>
           </div>
         </div>
-        <p v-if="checking" class="text-xs text-gray-400">Checking...</p>
-        <div v-else class="space-y-2">
+        <div class="flex items-center gap-3 mb-2 text-xs">
+          <span v-if="checking" class="text-gray-400" role="status">Checking every saved statement again...</span>
+          <button v-else @click="refreshDiscrepancies" class="text-indigo-600 hover:text-indigo-800"
+            title="A later statement can settle an earlier one's discrepancy. This also runs on its own once nothing is left to read or review.">Check all again</button>
+        </div>
+        <div class="space-y-2">
           <div v-for="d in discrepancies" :key="d.title + d.detail" :class="['rounded-lg border-l-4 px-3 py-2 text-sm', d.applied ? 'bg-gray-50 border-gray-200 text-gray-400' : dStyle(d).box]">
                       <div class="flex items-start gap-2">
                         <span :class="['shrink-0 mt-0.5 px-1.5 py-0.5 rounded text-[11px] font-medium', d.applied ? 'bg-gray-100 text-gray-400' : dStyle(d).tag]">{{ d.applied ? 'Done' : dStyle(d).label }}</span>
@@ -401,7 +599,7 @@ export default {
         <div class="p-5 border-b border-gray-100 space-y-3">
           <div class="flex items-start justify-between gap-4 flex-wrap">
             <div>
-              <div class="text-xs font-medium text-indigo-600 uppercase tracking-wider">Review before saving</div>
+              <div class="text-xs font-medium text-indigo-600 uppercase tracking-wider">Review before saving<span v-if="waitingCount > 1" class="normal-case font-normal text-gray-400 tracking-normal"> · {{ waitingCount - 1 }} more waiting, oldest first</span></div>
               <h2 class="text-lg font-semibold text-gray-900">{{ active.name }}</h2>
               <div class="text-sm text-gray-500">{{ review.parsed.bank_name }} · {{ review.currency }} · {{ fmtDate(review.periodStart) }} to {{ fmtDate(review.periodEnd) }}</div>
               <div v-if="review.readBy" class="text-xs text-gray-400 mt-0.5">Read by {{ review.readBy }}</div>
