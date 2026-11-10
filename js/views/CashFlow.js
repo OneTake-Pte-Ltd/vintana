@@ -3,6 +3,7 @@ import { formatCents, monthLabel, generateMonthRange, currentMonth, prevMonth, g
 import { payrollCategory } from '../payroll.js';
 import { loadAccounts, loadBalances, cashTotals, accountLabel, monthEnd, cashPosition, cashSourceText } from '../bank.js';
 import { loadLiveBalances } from '../liveBalances.js';
+import { loadRunway, formatRunway } from '../charges.js';
 import { loadMrrTotals } from '../profitwell.js';
 
 const CAT_ROWS = [
@@ -45,9 +46,21 @@ export default {
     const chartRef = ref(null);
     let chart = null;
 
-    const runwayMonths = computed(() => {
-      if (burnRate.value <= 0) return Infinity;
-      return currentCash.value / burnRate.value;
+    // How long today's cash covers the upcoming charges (days), else cash / monthly burn (weeks or months)
+    const runway = ref({ unit: 'none' });
+    const runwayText = computed(() => formatRunway(runway.value));
+    const runwayTone = computed(() => {
+      const r = runway.value;
+      if (r.unit === 'positive') return 'text-emerald-600';
+      if (r.unit === 'days') return r.value < 14 ? 'text-red-600' : 'text-amber-600';
+      return (r.months ?? 99) < 6 ? 'text-red-600' : 'text-gray-900';
+    });
+    const runwayWhen = computed(() => {
+      const r = runway.value;
+      if (r.unit !== 'days') return '';
+      const when = r.value === 0 ? 'today' : r.runsOutOn.toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short' });
+      const c = r.blockedBy;
+      return `Cash runs out ${when}${c ? ', before ' + (c.kind === 'payroll' ? `payroll (${c.name})` : c.name) : ''}`;
     });
 
     // Only the latest load may show its results: an earlier one can finish after it
@@ -177,6 +190,8 @@ export default {
           const totalExp = latest.cogs + latest.rd + latest.sm + latest.ga + latest.other;
           burnRate.value = totalExp - latest.revenue;
         }
+        runway.value = await loadRunway(sid, currentCash.value, burnRate.value, settings.value);
+        if (run !== loadSeq) return;
       } catch (e) {
         if (run === loadSeq) toast('Failed to load cash flow: ' + e.message, 'error');
       } finally {
@@ -309,7 +324,7 @@ export default {
     return {
       loading, waterfall, months, fundingEvents, accounts, balances, totalsByMonth, fxErrors, accountLabel,
       currency: computed(() => getReportingCurrency()),
-      currentCash, cashSource, burnRate, runwayMonths,
+      currentCash, cashSource, burnRate, runway, runwayText, runwayTone, runwayWhen,
       showModal, editingId, form, chartRef,
       openAdd, openEdit, saveFunding, deleteFunding,
       saveBalance, centsToInput,
@@ -337,9 +352,10 @@ export default {
       </div>
       <div class="bg-white rounded-xl border border-gray-200 p-5">
         <div class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-1">Runway</div>
-        <div class="text-2xl font-bold" :class="runwayMonths === Infinity ? 'text-emerald-600' : runwayMonths < 6 ? 'text-red-600' : 'text-gray-900'">
-          {{ runwayMonths === Infinity ? '\\u221E' : runwayMonths.toFixed(1) + ' months' }}
+        <div class="text-2xl font-bold" :class="runwayTone">
+          {{ runway.unit === 'positive' ? '\\u221E' : runway.unit === 'none' ? 'No data' : runwayText.value + ' ' + runwayText.unit }}
         </div>
+        <div v-if="runwayWhen" class="text-xs text-gray-500 mt-1">{{ runwayWhen }}</div>
       </div>
     </div>
 
