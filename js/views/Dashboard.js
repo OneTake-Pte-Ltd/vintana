@@ -1,5 +1,6 @@
 import { query } from '../db.js';
-import { cashPosition } from '../bank.js';
+import { cashPosition, cashSourceText } from '../bank.js';
+import { loadLiveBalances } from '../liveBalances.js';
 import { loadMrrSeries, mrrChartDatasets, mrrRevenueLine } from '../profitwell.js';
 import { loadScenarioEmployees, employeeCost, isEmployedIn } from '../payroll.js';
 import {
@@ -28,6 +29,7 @@ export default {
     const loading = ref(true);
     const revenueNow = ref(0), revenuePrev = ref(0);
     const cashBalance = ref(null);
+    const cashSource = ref(''); // where the cash figure comes from (live balances, statements)
     const totalExpenses = ref(0), totalPayroll = ref(0);
     const mrrSeries = ref(null), expensesByCat = ref([]);
     const employees = ref([]), renewals = ref([]), payrollDue = ref([]);
@@ -82,7 +84,8 @@ export default {
         const [series, cash, expenses, scenarioEmp, mrrAround, expCat, empRows, renewItems, renewValues, expMonths] =
           await Promise.all([
             loadMrrSeries(sid, start, end),
-            cashPosition().catch(() => null),
+            // Live balances are refreshed first when the cached ones are more than a day old
+            loadLiveBalances(settings.value).catch(() => null).then(() => cashPosition()).catch(() => null),
             query(`SELECT COALESCE(SUM(amount), 0) AS v FROM expense_values WHERE scenario_id = ? AND month = ?`, [sid, month]),
             loadScenarioEmployees(sid),
             loadMrrSeries(sid, prev, month),
@@ -98,6 +101,7 @@ export default {
         revenueNow.value = mrrAround.totals[month] || 0;
         revenuePrev.value = mrrAround.totals[prev] || 0;
         cashBalance.value = cash ? cash.total : null;
+        cashSource.value = cashSourceText(cash);
         totalExpenses.value = expenses[0]?.v || 0;
         // The scenario's people (base employees with its changes, plus its own hires), as on the Payroll page
         const people = scenarioEmp.employees;
@@ -204,7 +208,7 @@ export default {
     }
 
     return {
-      loading, mrr, mrrDelta, arr, arrDelta, cashBalance, burnRate, runway,
+      loading, mrr, mrrDelta, arr, arrDelta, cashBalance, cashSource, burnRate, runway,
       headcount, deptBreakdown, mrrSeries, hasMrr, expensesByCat, renewals, payrollDue, renewalsTotal, payrollTotal, grandTotal, payrollLabel,
       mrrCanvasRef, expenseCanvasRef, teamCanvasRef, formatCents, formatRenewalDate, RENEWAL_DAYS,
     };
@@ -218,7 +222,7 @@ export default {
     <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
       <kpi-card title="MRR" :value="mrr" :delta="mrrDelta" subtitle="Monthly Recurring Revenue" />
       <kpi-card title="ARR" :value="arr" :delta="arrDelta" subtitle="Annual Recurring Revenue" />
-      <kpi-card title="Cash Balance" :value="cashBalance !== null ? cashBalance : 'No data'" :format="cashBalance !== null ? 'currency' : 'text'" />
+      <kpi-card title="Cash Balance" :value="cashBalance !== null ? cashBalance : 'No data'" :format="cashBalance !== null ? 'currency' : 'text'" :subtitle="cashSource" />
       <kpi-card title="Monthly Burn Rate" :value="burnRate <= 0 ? 'Net Positive' : burnRate" :format="burnRate <= 0 ? 'text' : 'currency'" />
     </div>
     <!-- Row 2: Charts -->
@@ -296,20 +300,21 @@ export default {
           <tr v-if="!renewals.length"><td colspan="4" class="py-2.5 text-gray-400">No renewals</td></tr>
         </tbody>
         <tfoot class="text-sm">
-          <tr v-if="renewals.length" class="border-t border-gray-200">
-            <td colspan="2" class="sticky-col pt-2.5 pr-3 text-gray-700">Total renewals</td>
-            <td class="pt-2.5 text-right text-gray-900 tabular-nums">{{ formatCents(renewalsTotal) }}</td>
+          <!-- Sub-lines, muted, then the total: a heavier rule, a tinted band and a larger bold amount -->
+          <tr v-if="renewals.length" class="text-gray-500">
+            <td colspan="2" class="sticky-col pt-3 pr-3" style="box-shadow:none">Renewals</td>
+            <td class="pt-3 text-right tabular-nums">{{ formatCents(renewalsTotal) }}</td>
             <td></td>
           </tr>
-          <tr v-if="payrollDue.length">
-            <td colspan="2" class="sticky-col pt-2 pr-3 text-gray-700">Payroll due <span class="text-gray-400">{{ payrollLabel }}</span></td>
-            <td class="pt-2 text-right text-gray-900 tabular-nums">{{ formatCents(payrollTotal) }}</td>
+          <tr v-if="payrollDue.length" class="text-gray-500">
+            <td colspan="2" class="sticky-col pt-1 pr-3" style="box-shadow:none">Payroll due <span class="text-gray-400">{{ payrollLabel }}</span></td>
+            <td class="pt-1 text-right tabular-nums">{{ formatCents(payrollTotal) }}</td>
             <td></td>
           </tr>
-          <tr v-if="renewals.length && payrollDue.length">
-            <td colspan="2" class="sticky-col pt-2 pr-3 font-semibold text-gray-900">Total</td>
-            <td class="pt-2 text-right font-semibold text-gray-900 tabular-nums">{{ formatCents(grandTotal) }}</td>
-            <td></td>
+          <tr class="border-t-2 border-gray-300 bg-gray-50">
+            <td colspan="2" class="sticky-col py-3 pl-2 pr-3 font-semibold text-gray-900" style="background-color:#f9fafb;box-shadow:none">Total due in the next {{ RENEWAL_DAYS }} days</td>
+            <td class="py-3 text-right text-base font-bold text-gray-900 tabular-nums">{{ formatCents(grandTotal) }}</td>
+            <td class="bg-gray-50"></td>
           </tr>
         </tfoot>
       </table>

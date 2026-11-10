@@ -160,6 +160,19 @@ const DDL = [
     created_at TEXT DEFAULT (datetime('now'))
   )`,
 
+  // Balances read live from Wise and Airwallex through the relay, cached for a day. source: 'wise' | 'airwallex';
+  // ref: the provider's balance (Wise balance id, Airwallex currency). amount: cents, in the balance's currency.
+  `CREATE TABLE IF NOT EXISTS live_balances (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    source      TEXT NOT NULL,
+    ref         TEXT NOT NULL,
+    currency    TEXT NOT NULL,
+    amount      INTEGER NOT NULL,
+    name        TEXT,
+    fetched_at  TEXT NOT NULL,
+    UNIQUE(source, ref)
+  )`,
+
   `CREATE TABLE IF NOT EXISTS bank_balances (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     account_id INTEGER NOT NULL REFERENCES bank_accounts(id),
@@ -321,12 +334,15 @@ const ADDED_COLUMNS = {
   employees: {
     charge_label: 'TEXT',
   },
+  bank_accounts: {
+    live_source: 'TEXT', // null: matched automatically; 'none'; or 'wise:<ref>' / 'airwallex:<ref>'
+  },
   funding_events: {
     is_actual: 'INTEGER NOT NULL DEFAULT 0',
   },
 };
 
-const ADDED_TABLES = ['expense_subcategories', 'bank_accounts', 'bank_balances', 'statement_imports', 'statement_drafts', 'bank_transactions', 'fx_rates',
+const ADDED_TABLES = ['expense_subcategories', 'bank_accounts', 'bank_balances', 'statement_imports', 'statement_drafts', 'bank_transactions', 'fx_rates', 'live_balances',
   'product_families', 'product_lines', 'pw_plans', 'pw_mrr', 'line_growth'];
 
 // Changes whenever the lists above change, so new upgrades run once on every database, then never again

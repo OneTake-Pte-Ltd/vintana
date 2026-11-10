@@ -2,7 +2,8 @@
 // Total cash is always the sum of the accounts' balances, converted into the reporting currency at the
 // month-end rate.
 import { query, batch } from './db.js';
-import { getReportingCurrency } from './utils.js';
+import { getReportingCurrency, currentMonth } from './utils.js';
+import { cachedLiveBalances, matchLiveBalances } from './liveBalances.js';
 
 const FX_URL = 'https://api.frankfurter.dev/v1/';
 
@@ -124,13 +125,23 @@ export async function cashTotals(accounts, balances) {
   return totals;
 }
 
-// Current cash position: each account's latest balance, converted at that balance's month-end rate.
+// Current cash position: each account's live balance (Wise, Airwallex; cached, see liveBalances.js) converted at the
+// current rate, unless a statement gives a more recent month-end balance; otherwise its latest statement balance,
+// converted at that balance's month-end rate.
+// Returns { total, month (latest statement month used), perAccount, complete, liveCount, liveAt (oldest live fetch) }.
 export async function cashPosition() {
-  const [accounts, balances] = await Promise.all([loadAccounts(), loadBalances()]);
+  const [accounts, balances, liveRows] = await Promise.all([loadAccounts(), loadBalances(), cachedLiveBalances()]);
   const months = Object.keys(balances).sort().reverse();
-  if (!accounts.length || !months.length) return null;
+  const live = matchLiveBalances(accounts, liveRows);
+  if (!accounts.length || (!months.length && !Object.keys(live).length)) return null;
   const perAccount = await Promise.all(accounts.map(async a => {
     const month = months.find(m => a.id in balances[m]);
+    const b = live[a.id];
+    if (b && (!month || monthEnd(month) < b.fetched_at.slice(0, 10))) {
+      const rate = await getRate(currentMonth(), b.currency).catch(() => null);
+      return { account: a, month: null, balance: b.amount, converted: rate === null ? null : convert(b.amount, rate),
+        live: true, source: b.source, fetchedAt: b.fetched_at };
+    }
     if (!month) return { account: a, month: null, balance: null };
     const rate = await getRate(month, a.currency).catch(() => null);
     const converted = rate === null ? null : convert(balances[month][a.id], rate);
@@ -138,8 +149,27 @@ export async function cashPosition() {
   }));
   const total = perAccount.reduce((s, p) => s + (p.converted || 0), 0);
   const latestMonth = perAccount.reduce((m, p) => (p.month && (!m || p.month > m) ? p.month : m), null);
+  const liveOnes = perAccount.filter(p => p.live);
   return {
     total, month: latestMonth, perAccount,
-    complete: perAccount.every(p => p.month === latestMonth && p.converted !== null),
+    complete: perAccount.every(p => (p.live || p.month === latestMonth) && p.converted !== null),
+    liveCount: liveOnes.length,
+    liveAt: liveOnes.reduce((t, p) => (!t || p.fetchedAt < t ? p.fetchedAt : t), null),
   };
+}
+
+// One line saying where the cash figure comes from, e.g. "Live: Wise, Airwallex · 10 Nov 15:20 · others: Oct 2026 statements"
+export function cashSourceText(position) {
+  if (!position) return '';
+  const parts = [];
+  if (position.liveCount) {
+    const names = [...new Set(position.perAccount.filter(p => p.live).map(p => p.source === 'wise' ? 'Wise' : 'Airwallex'))];
+    const at = new Date(position.liveAt);
+    parts.push(`Live: ${names.join(', ')} · ${at.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })} ${at.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}`);
+  }
+  if (position.month) {
+    const label = new Date(position.month + '-01T00:00:00').toLocaleDateString('en-GB', { month: 'short', year: 'numeric' });
+    parts.push(`${position.liveCount ? 'others' : 'from'}: end of ${label} statements`);
+  }
+  return parts.join(' · ');
 }

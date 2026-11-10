@@ -9,6 +9,7 @@ import {
   exportExpensesCsv, importExpensesCsv, exportPayrollCsv, importPayrollCsv,
 } from '../csvTransfer.js';
 import { downloadCsv } from '../csv.js';
+import { cachedLiveBalances, loadLiveBalances, matchLiveBalances, liveBalanceLabel, LIVE_SOURCES } from '../liveBalances.js';
 import ProductsSettings from '../../components/ProductsSettings.js';
 
 // One collapsible block of the Settings page. The header shows a summary while it is closed.
@@ -103,7 +104,7 @@ export default {
           settings.value.company_context ||= '';
           settings.value.payroll_pay_day ??= null;
         }
-        await Promise.all([loadSubcategories(), loadBankAccounts(), loadProductsSummary()]);
+        await Promise.all([loadSubcategories(), loadBankAccounts(), loadProductsSummary(), loadLive()]);
         const mapping = settings.value?.dept_mapping || {};
         const entries = Object.keys(mapping).length > 0
           ? Object.entries(mapping)
@@ -422,6 +423,45 @@ export default {
         flashSaved('bank');
       } catch (e) { toast('Save failed: ' + e.message, 'error'); }
     };
+    // --- Live balances (Wise, Airwallex through the relay; cached for a day) ---
+    const liveRows = ref([]);
+    const liveConfigured = ref(null); // { wise, airwallex } from the relay's /health, null until known
+    const liveError = ref('');
+    const liveRefreshing = ref(false);
+    const loadLive = async () => {
+      liveRows.value = await cachedLiveBalances();
+      try {
+        const base = (settings.value?.assistant_relay_url || DEFAULT_RELAY_URL).replace(/\/+$/, '');
+        const h = await (await fetch(base + '/health')).json();
+        liveConfigured.value = { wise: !!h.wise, airwallex: !!h.airwallex };
+      } catch { liveConfigured.value = null; }
+    };
+    const refreshLive = async () => {
+      liveRefreshing.value = true;
+      const { rows, error } = await loadLiveBalances(settings.value, { force: true });
+      liveRows.value = rows;
+      liveError.value = error || '';
+      liveRefreshing.value = false;
+      if (!error) toast('Balances refreshed', 'success');
+    };
+    const liveMatched = computed(() => matchLiveBalances(bankAccounts.value, liveRows.value));
+    const liveLastFetch = computed(() => {
+      const t = liveRows.value.reduce((m, r) => (!m || r.fetched_at > m ? r.fetched_at : m), null);
+      return t ? new Date(t).toLocaleString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) : null;
+    });
+    const fmtLive = b => `${liveBalanceLabel(b)}: ${(b.amount / 100).toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    // Choices for an account: automatic (saying what it matched), each fetched balance, or none
+    const liveOptions = a => [
+      { value: '', label: a.live_source ? 'Automatic' : `Automatic${liveMatched.value[a.id] ? ': ' + fmtLive(liveMatched.value[a.id]) : ' (no match)'}` },
+      ...liveRows.value.map(b => ({ value: `${b.source}:${b.ref}`, label: fmtLive(b) })),
+      { value: 'none', label: 'None (use statements only)' },
+    ];
+    const liveDisplay = a => {
+      if (a.live_source === 'none') return 'Live balance: none';
+      const b = liveMatched.value[a.id];
+      return b ? 'Live: ' + fmtLive(b) : a.live_source ? 'Live: chosen balance not fetched yet' : 'Live balance: none matched';
+    };
+
     const deleteAccount = async (acc) => {
       if (bankAccounts.value.length <= 1) return;
       try {
@@ -570,7 +610,8 @@ export default {
       CURRENCIES, PROVIDERS, tokenHash,
       currentModel, currentModelName, picker, providerHealth, healthError, providerReady, setProvider,
       openPicker, closePicker, pickModel, filteredModels, modelMissing,
-      bankAccounts, accountUsage, newAccount, currencyOptions, addAccount, updateAccount, deleteAccount, showTokenHash, copyTokenHash,
+      bankAccounts, accountUsage, newAccount, currencyOptions, addAccount, updateAccount, deleteAccount,
+      liveRows, liveConfigured, liveError, liveRefreshing, refreshLive, liveLastFetch, liveOptions, liveDisplay, LIVE_SOURCES, showTokenHash, copyTokenHash,
       expCategories, subcategories, subUsage, newSub, expCategoryOptions, subsOf,
       addSubcategory, updateSubcategory, deleteSubcategory,
     };
@@ -635,10 +676,29 @@ export default {
               <inline-edit :value="a.currency" :options="currencyOptions" @save="v => updateAccount(a, 'currency', v)"
                 :disabled="!!accountUsage[a.id]" disabled-title="This account already has balances or statements in this currency"/>
               <span class="text-xs text-gray-400 whitespace-nowrap">{{ accountUsage[a.id] ? accountUsage[a.id] + ' balance' + (accountUsage[a.id] > 1 ? 's' : '') + ' or statements' : 'No data yet' }}</span>
+              <span class="text-xs text-gray-500 basis-full sm:basis-auto">
+                <inline-edit :value="a.live_source || ''" :options="liveOptions(a)" :display="liveDisplay(a)" @save="v => updateAccount(a, 'live_source', v)"/>
+              </span>
               <button v-if="bankAccounts.length > 1 && !accountUsage[a.id]" @click="deleteAccount(a)" class="text-gray-400 hover:text-red-500" :aria-label="'Remove ' + a.bank_name" title="Remove">
                 <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6L6 18M6 6l12 12"/></svg>
               </button>
             </div>
+          </div>
+          <div class="mt-4 rounded-lg border border-gray-100 bg-gray-50 px-3 py-3 text-sm">
+            <div class="flex items-center justify-between gap-3 flex-wrap">
+              <div>
+                <div class="font-medium text-gray-900">Live balances</div>
+                <div class="text-xs text-gray-500">
+                  <template v-if="liveConfigured">
+                    <span v-for="(label, s) in LIVE_SOURCES" :key="s" class="mr-3">{{ label }}: {{ liveConfigured[s] ? 'connected' : 'not set up' }}</span>
+                  </template>
+                  <span>{{ liveLastFetch ? 'Last refreshed ' + liveLastFetch : 'Never refreshed' }}. Refreshed automatically once a day.</span>
+                </div>
+              </div>
+              <button @click="refreshLive" :disabled="liveRefreshing" class="px-3 py-1.5 text-xs rounded-md bg-white border border-gray-200 hover:bg-gray-100 disabled:opacity-50">{{ liveRefreshing ? 'Refreshing...' : 'Refresh now' }}</button>
+            </div>
+            <p v-if="liveError" class="text-xs text-red-600 mt-2">{{ liveError }}</p>
+            <p class="text-xs text-gray-500 mt-2">Today's balances from Wise and Airwallex replace the last month-end balance for cash and runway (homepage, Cash Flow). An account whose bank name contains "Wise" or "Airwallex" is matched by currency; click "Live" under an account to choose another balance or none. To connect them, add these secrets to the relay (Bunny): <code>WISE_API_TOKEN</code> (a read-only API token from Wise), and <code>AIRWALLEX_CLIENT_ID</code> with <code>AIRWALLEX_API_KEY</code> (a key restricted to reading balances).</p>
           </div>
           <form @submit.prevent="addAccount" class="flex items-center gap-3 mt-4 flex-wrap">
             <input v-model="newAccount.bank_name" placeholder="Bank (e.g. DBS)" aria-label="Bank name" class="flex-1 min-w-[8rem] px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"/>

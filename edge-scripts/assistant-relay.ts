@@ -20,6 +20,11 @@
  *   At least one provider must be set up for the assistant and statement reading.
  *   PROFITWELL_API_TOKEN    optional: the ProfitWell *private* API token (ProfitWell > Account Settings >
  *                           Integrations > ProfitWell API). Needed for /v1/profitwell.
+ *   WISE_API_TOKEN          optional: a Wise *read only* personal API token (Wise > Settings > Developer tools >
+ *                           API tokens). Gives /v1/balances the Wise balances.
+ *   WISE_PROFILE_ID         optional: the Wise profile to read; without it, the business profile is used.
+ *   AIRWALLEX_CLIENT_ID     } optional: an Airwallex API key restricted to reading balances (Airwallex >
+ *   AIRWALLEX_API_KEY       } Developer > API keys). Gives /v1/balances the Airwallex balances.
  *   DB_TOKEN_RW_SHA256   SHA-256 (hex) of the read-write Turso token   } at least one; Settings > Assistant >
  *   DB_TOKEN_RO_SHA256   SHA-256 (hex) of the read-only Turso token    } "Show my token's fingerprint" gives it
  *   ALLOWED_ORIGINS      optional, comma-separated, replaces the default https://vintana.onetake.ai
@@ -29,7 +34,7 @@
  *
  * ENDPOINTS:
  *   GET  /health   {"ok": true, "providers": {"claude": bool, "openai": {"configured": bool, "host": string|null}},
- *                  "profitwell": bool}
+ *                  "profitwell": bool, "wise": bool, "airwallex": bool}
  *   GET  /v1/models?provider=claude|openai   Authorization: Bearer <database token>
  *                  The provider's model list: {"models": [{"id", "name"}]}
  *   POST /v1/chat  Authorization: Bearer <database token>
@@ -49,6 +54,12 @@
  *                  Read-only pass-through to ProfitWell's v2 Metrics API (GET /v2/metrics/plans/ and
  *                  GET /v2/metrics/monthly/). Only these two calls and a fixed list of metrics are allowed.
  *                  Answers with ProfitWell's JSON unchanged.
+ *
+ *   POST /v1/balances  Authorization: Bearer <database token>   body {}
+ *                  Current balances from Wise and Airwallex, read only, each one where its secrets are set:
+ *                  {"wise": {"configured", "balances": [{"ref", "currency", "amount", "name"}], "error"?},
+ *                   "airwallex": {...}, "fetched_at"}. Amounts in major units; Airwallex's is total_amount
+ *                  (available + pending + reserved). One provider failing doesn't fail the other.
  *
  * ERRORS (JSON {"error": CODE, "message"?}):
  *   400 BAD_REQUEST, 400 MODEL_NOT_ALLOWED, 401 UNAUTHORIZED, 403 ORIGIN_NOT_ALLOWED, 405 METHOD_NOT_ALLOWED,
@@ -572,9 +583,87 @@ async function handleProfitwell(body: any, origin: string | null) {
   }
 }
 
+// --- Bank balances (Wise, Airwallex) -------------------------------------------------------------------------------
+// Read-only: only these calls are made, and the keys never leave the relay.
+
+const WISE_URL      = 'https://api.wise.com';
+const AIRWALLEX_URL = 'https://api.airwallex.com';
+const secret = (name: string) => (process.env[name] || '').trim();
+const wiseConfigured = () => !!secret('WISE_API_TOKEN');
+const airwallexConfigured = () => !!(secret('AIRWALLEX_CLIENT_ID') && secret('AIRWALLEX_API_KEY'));
+const num = (v: any) => (typeof v === 'number' && isFinite(v) ? v : typeof v === 'string' && v.trim() !== '' && isFinite(Number(v)) ? Number(v) : null);
+
+// Wise balance accounts -> [{ ref, currency, amount, name }]
+function parseWiseBalances(list: any) {
+  if (!Array.isArray(list)) return [];
+  return list.map((b: any) => {
+    const amount = num(b?.amount?.value) ?? num(b?.cashAmount?.value);
+    const currency = b?.currency || b?.amount?.currency;
+    return amount === null || !currency ? null
+      : { ref: String(b.id), currency: String(currency).toUpperCase(), amount, name: b.name || null };
+  }).filter(Boolean);
+}
+
+// Airwallex current balances -> [{ ref, currency, amount, name }]; amount is the total balance
+function parseAirwallexBalances(list: any) {
+  const items = Array.isArray(list) ? list : Array.isArray(list?.items) ? list.items : [];
+  return items.map((b: any) => {
+    const total = num(b?.total_amount)
+      ?? ((num(b?.available_amount) ?? 0) + (num(b?.pending_amount) ?? 0) + (num(b?.reserved_amount) ?? 0));
+    return b?.currency ? { ref: String(b.currency).toUpperCase(), currency: String(b.currency).toUpperCase(), amount: total, name: null } : null;
+  }).filter(Boolean);
+}
+
+async function wiseBalances() {
+  const headers = { Authorization: `Bearer ${secret('WISE_API_TOKEN')}` };
+  let profile = secret('WISE_PROFILE_ID');
+  if (!profile) {
+    const r = await fetch(`${WISE_URL}/v2/profiles`, { headers });
+    if (!r.ok) throw new Error(await errorMessage(r, 'Wise'));
+    const profiles = await r.json();
+    const business = Array.isArray(profiles) ? profiles.find((p: any) => String(p?.type).toUpperCase() === 'BUSINESS') : null;
+    if (!business) throw new Error('No Wise business profile found for this token. Set WISE_PROFILE_ID in the relay secrets.');
+    profile = String(business.id);
+  }
+  if (!/^\d+$/.test(profile)) throw new Error('WISE_PROFILE_ID must be a number.');
+  const r = await fetch(`${WISE_URL}/v4/profiles/${profile}/balances?types=STANDARD`, { headers });
+  if (!r.ok) throw new Error(await errorMessage(r, 'Wise'));
+  return parseWiseBalances(await r.json());
+}
+
+async function airwallexBalances() {
+  const login = await fetch(`${AIRWALLEX_URL}/api/v1/authentication/login`, {
+    method: 'POST',
+    headers: { 'x-client-id': secret('AIRWALLEX_CLIENT_ID'), 'x-api-key': secret('AIRWALLEX_API_KEY'), 'Content-Type': 'application/json' },
+  });
+  if (!login.ok) throw new Error(await errorMessage(login, 'Airwallex'));
+  const { token } = await login.json();
+  if (!token) throw new Error('Airwallex did not return an access token.');
+  const r = await fetch(`${AIRWALLEX_URL}/api/v1/balances/current`, { headers: { Authorization: `Bearer ${token}` } });
+  if (!r.ok) throw new Error(await errorMessage(r, 'Airwallex'));
+  return parseAirwallexBalances(await r.json());
+}
+
+async function handleBalances(origin: string | null) {
+  const one = async (configuredFn: () => boolean, load: () => Promise<any[]>, label: string) => {
+    if (!configuredFn()) return { configured: false, balances: [] };
+    try {
+      return { configured: true, balances: await load() };
+    } catch (e) {
+      console.log(`${label} balances failed`); // no amounts, no tokens in the logs
+      return { configured: true, balances: [], error: (e as Error).message || `${label} could not be reached.` };
+    }
+  };
+  const [wise, airwallex] = await Promise.all([
+    one(wiseConfigured, wiseBalances, 'Wise'),
+    one(airwallexConfigured, airwallexBalances, 'Airwallex'),
+  ]);
+  return json({ wise, airwallex, fetched_at: new Date().toISOString() }, 200, origin);
+}
+
 // --- Routing -----------------------------------------------------------------------------------------------------
 
-const ROUTES: Record<string, number> = { '/v1/chat': MAX_BODY_BYTES, '/v1/statement': STATEMENT_MAX_BYTES, '/v1/profitwell': 4096 };
+const ROUTES: Record<string, number> = { '/v1/chat': MAX_BODY_BYTES, '/v1/statement': STATEMENT_MAX_BYTES, '/v1/profitwell': 4096, '/v1/balances': 1024 };
 
 export async function handle(req: Request): Promise<Response> {
   const origin = req.headers.get('origin');
@@ -586,7 +675,7 @@ export async function handle(req: Request): Promise<Response> {
     return json({ ok: true, providers: {
       claude: configured('claude'),
       openai: { configured: configured('openai'), host: configured('openai') ? hostOf(openaiBase()) : null },
-    }, profitwell: profitwellConfigured() }, 200, origin);
+    }, profitwell: profitwellConfigured(), wise: wiseConfigured(), airwallex: airwallexConfigured() }, 200, origin);
   }
   const isModels = req.method === 'GET' && path === '/v1/models';
   if (!isModels && (req.method !== 'POST' || !(path in ROUTES))) return json({ error: 'METHOD_NOT_ALLOWED' }, 405, origin);
@@ -596,7 +685,9 @@ export async function handle(req: Request): Promise<Response> {
     console.log(`Refused ${req.method} ${path}: ORIGIN_NOT_ALLOWED (origin ${origin})`);
     return json({ error: 'ORIGIN_NOT_ALLOWED' }, 403, origin);
   }
-  const servicesReady = path === '/v1/profitwell' ? profitwellConfigured() : (configured('claude') || configured('openai'));
+  const servicesReady = path === '/v1/profitwell' ? profitwellConfigured()
+    : path === '/v1/balances' ? (wiseConfigured() || airwallexConfigured())
+    : (configured('claude') || configured('openai'));
   if (!(process.env.DB_TOKEN_RW_SHA256 || process.env.DB_TOKEN_RO_SHA256) || !servicesReady) {
     console.log(`Refused ${req.method} ${path}: NOT_CONFIGURED`);
     return json({ error: 'NOT_CONFIGURED' }, 500, origin);
@@ -618,6 +709,7 @@ export async function handle(req: Request): Promise<Response> {
 
   if (path === '/v1/statement') return handleStatement(body, origin);
   if (path === '/v1/profitwell') return handleProfitwell(body, origin);
+  if (path === '/v1/balances') return handleBalances(origin);
 
   const provider = providerOf(body);
   const refused = checkModel(provider, body.model, origin);

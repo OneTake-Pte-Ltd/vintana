@@ -1,7 +1,8 @@
 import { query, execute } from '../db.js';
 import { formatCents, monthLabel, generateMonthRange, currentMonth, prevMonth, getReportingCurrency } from '../utils.js';
 import { payrollCategory } from '../payroll.js';
-import { loadAccounts, loadBalances, cashTotals, accountLabel, monthEnd } from '../bank.js';
+import { loadAccounts, loadBalances, cashTotals, accountLabel, monthEnd, cashPosition, cashSourceText } from '../bank.js';
+import { loadLiveBalances } from '../liveBalances.js';
 import { loadMrrTotals } from '../profitwell.js';
 
 const CAT_ROWS = [
@@ -34,6 +35,7 @@ export default {
     const months = ref([]);
 
     const currentCash = ref(0);
+    const cashSource = ref(''); // shown under Cash Balance when live balances are used
     const burnRate = ref(0);
 
     const showModal = ref(false);
@@ -166,8 +168,12 @@ export default {
 
         const cm = currentMonth();
         const latest = rows.find(r => r.month === cm) || rows[rows.length - 1];
+        // With live balances (Wise, Airwallex; refreshed when more than a day old), the card shows today's cash
+        const position = await loadLiveBalances(settings.value).catch(() => null).then(() => cashPosition()).catch(() => null);
+        if (run !== loadSeq) return;
+        cashSource.value = position?.liveCount ? cashSourceText(position) : '';
         if (latest) {
-          currentCash.value = latest.endCash;
+          currentCash.value = position?.liveCount ? position.total : latest.endCash;
           const totalExp = latest.cogs + latest.rd + latest.sm + latest.ga + latest.other;
           burnRate.value = totalExp - latest.revenue;
         }
@@ -303,7 +309,7 @@ export default {
     return {
       loading, waterfall, months, fundingEvents, accounts, balances, totalsByMonth, fxErrors, accountLabel,
       currency: computed(() => getReportingCurrency()),
-      currentCash, burnRate, runwayMonths,
+      currentCash, cashSource, burnRate, runwayMonths,
       showModal, editingId, form, chartRef,
       openAdd, openEdit, saveFunding, deleteFunding,
       saveBalance, centsToInput,
@@ -321,6 +327,7 @@ export default {
       <div class="bg-white rounded-xl border border-gray-200 p-5">
         <div class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-1">Cash Balance</div>
         <div class="text-2xl font-bold text-gray-900">{{ formatCents(currentCash) }}</div>
+        <div v-if="cashSource" class="text-xs text-gray-400 mt-1">{{ cashSource }}</div>
       </div>
       <div class="bg-white rounded-xl border border-gray-200 p-5">
         <div class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-1">Monthly Burn Rate</div>
