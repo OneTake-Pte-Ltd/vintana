@@ -1,6 +1,6 @@
 import { query } from './db.js';
 import { getBaseScenarioId } from './schema.js';
-import { employeeCost, isEmployedIn, payrollCategory } from './payroll.js';
+import { employeeCost, isEmployedIn, payrollCategory, loadScenarioEmployees } from './payroll.js';
 import { chargeFromMonthly, generateMonthRange, isChargeMonth, weeklyAnchor, weeklyChargeDates, thresholdCharges } from './utils.js';
 
 const pad = n => String(n).padStart(2, '0');
@@ -84,6 +84,65 @@ export function computeUpcomingCharges(items, values, days, now = new Date()) {
     }
   }
   return charges.sort((a, b) => a.date - b.date || b.amount - a.amount);
+}
+
+// --- Runway: how long today's cash covers the upcoming charges ----------------------------------------------------
+
+export const RUNWAY_DAYS = 30;
+// Visible expenses, each with the date of its last charge seen in an imported statement (threshold billing starts there)
+export const ITEMS_WITH_LAST_CHARGE_SQL = `SELECT ei.*, (SELECT MAX(bt.date) FROM bank_transactions bt
+  WHERE bt.expense_item_id = ei.id AND bt.kind = 'expense') AS last_charge_date FROM expense_items ei WHERE ei.visible = 1`;
+
+// Pays the charges of the next RUNWAY_DAYS days (expenses and payroll, `charges`) from `cash`, in date order, with no
+// money coming in. If cash can't cover one of them: { unit: 'days', value, runsOutOn, blockedBy } (days until that
+// charge). If it covers all of them, the regular runway from the monthly `burn`: { unit: 'weeks' | 'months', value,
+// months } (weeks under 2 months), or { unit: 'positive' } when the company isn't burning cash.
+// { unit: 'none' } when the cash balance is unknown. Amounts in cents.
+export function computeRunway({ cash, charges, burn, now = new Date() }) {
+  if (cash === null || cash === undefined) return { unit: 'none' };
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const sorted = [...charges].sort((a, b) => a.date - b.date || b.amount - a.amount);
+  const stop = c => ({ unit: 'days', value: Math.max(0, Math.round((c.date - today) / 864e5)), runsOutOn: c.date, blockedBy: c });
+  if (cash <= 0) {
+    return sorted[0] ? { ...stop(sorted[0]), value: 0, runsOutOn: today } : { unit: 'days', value: 0, runsOutOn: today, blockedBy: null };
+  }
+  let left = cash;
+  for (const c of sorted) {
+    if (left < c.amount) return stop(c);
+    left -= c.amount;
+  }
+  if (!(burn > 0)) return { unit: 'positive' };
+  const months = cash / burn;
+  return months < 2 ? { unit: 'weeks', value: months * 52 / 12, months } : { unit: 'months', value: months, months };
+}
+
+// The runway from data already loaded: expense items (with last_charge_date), their values for the next RUNWAY_DAYS
+// days, the scenario's people and the settings
+export function runwayFromData({ items, values, people, settings, cash, burn, now = new Date() }) {
+  const charges = [
+    ...computeUpcomingCharges(items, values, RUNWAY_DAYS, now),
+    ...computePayrollCharges(people, RUNWAY_DAYS, settings?.payroll_pay_day, settings?.dept_mapping, now),
+  ];
+  return computeRunway({ cash, charges, burn, now });
+}
+
+// Loads what the runway needs for a scenario, then computes it
+export async function loadRunway(scenarioId, cash, burn, settings) {
+  const now = new Date();
+  const [items, values, { employees }] = await Promise.all([
+    query(ITEMS_WITH_LAST_CHARGE_SQL),
+    loadExpenseValues(scenarioId, monthOf(now), horizonMonth(RUNWAY_DAYS, now)),
+    loadScenarioEmployees(scenarioId),
+  ]);
+  return runwayFromData({ items, values, people: employees, settings, cash, burn, now });
+}
+
+// How the runway reads: { value: '9', unit: 'days' }, { value: '6.5', unit: 'weeks' }, { value: '4.2', unit: 'months' }
+export function formatRunway(r) {
+  if (r.unit === 'days') return { value: String(r.value), unit: r.value === 1 ? 'day' : 'days' };
+  if (r.unit === 'weeks') return { value: r.value.toFixed(1), unit: 'weeks' };
+  if (r.unit === 'months') return { value: r.value > 999 ? '999+' : r.value.toFixed(1), unit: 'months' };
+  return { value: '', unit: '' };
 }
 
 // Last month that a window of `days` from today can reach

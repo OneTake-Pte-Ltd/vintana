@@ -7,7 +7,10 @@ import {
   formatCents, formatPct, formatDelta, monthLabel,
   currentMonth, prevMonth, ordinalDay,
 } from '../utils.js';
-import { loadExpenseValues, computeUpcomingCharges, computePayrollCharges, horizonMonth } from '../charges.js';
+import {
+  loadExpenseValues, computeUpcomingCharges, computePayrollCharges, horizonMonth,
+  runwayFromData, formatRunway, ITEMS_WITH_LAST_CHARGE_SQL, RUNWAY_DAYS,
+} from '../charges.js';
 
 const RENEWAL_DAYS = 7;
 
@@ -59,9 +62,23 @@ export default {
     const arr = computed(() => revenueNow.value * 12);
     const arrDelta = computed(() => ({ abs: mrrDelta.value.abs * 12, pct: mrrDelta.value.pct }));
     const burnRate = computed(() => totalExpenses.value + totalPayroll.value - revenueNow.value);
-    const runway = computed(() => {
-      if (cashBalance.value === null || burnRate.value <= 0) return null;
-      return cashBalance.value / burnRate.value;
+    // How long today's cash covers the upcoming charges (days), else cash / monthly burn (weeks or months)
+    const runwayInfo = ref({ unit: 'none' });
+    const runwayText = computed(() => formatRunway(runwayInfo.value));
+    const runwayBar = computed(() => {
+      const r = runwayInfo.value;
+      if (r.unit === 'days') return { pct: Math.min(r.value / RUNWAY_DAYS * 100, 100), color: r.value < 14 ? 'bg-red-500' : 'bg-amber-400',
+        ticks: ['0', '10', '20', '30 days'] };
+      const m = r.months || 0;
+      return { pct: Math.min(m / 36 * 100, 100), color: m < 6 ? 'bg-red-500' : m < 12 ? 'bg-amber-400' : 'bg-emerald-500', ticks: ['0', '12', '24', '36 mo'] };
+    });
+    const runwayWhen = computed(() => {
+      const r = runwayInfo.value;
+      if (r.unit !== 'days') return '';
+      const when = r.value === 0 ? 'today' : r.runsOutOn.toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short' });
+      const c = r.blockedBy;
+      const what = !c ? '' : c.kind === 'payroll' ? `payroll (${c.name})` : `${c.name} (${formatCents(c.amount)})`;
+      return `Cash runs out ${when}${what ? ', before ' + what : ''}`;
     });
     const headcount = computed(() => employees.value.length);
     const deptBreakdown = computed(() => {
@@ -91,8 +108,8 @@ export default {
             loadMrrSeries(sid, prev, month),
             query(`SELECT ec.name AS category, COALESCE(SUM(ev.amount), 0) AS total FROM expense_values ev JOIN expense_items ei ON ev.expense_item_id = ei.id JOIN expense_categories ec ON ei.category_id = ec.id WHERE ev.scenario_id = ? AND ev.month = ? GROUP BY ec.name ORDER BY total DESC`, [sid, month]),
             query(`SELECT name, department FROM employees WHERE start_date <= ? AND (end_date IS NULL OR end_date >= ?)`, [month + '-31', month + '-01']),
-            query(`SELECT ei.*, (SELECT MAX(bt.date) FROM bank_transactions bt WHERE bt.expense_item_id = ei.id AND bt.kind = 'expense') AS last_charge_date FROM expense_items ei WHERE ei.visible = 1`),
-            loadExpenseValues(sid, month, horizonMonth(RENEWAL_DAYS)),
+            query(ITEMS_WITH_LAST_CHARGE_SQL),
+            loadExpenseValues(sid, month, horizonMonth(RUNWAY_DAYS)),
             query(`SELECT month, COALESCE(SUM(amount), 0) AS total FROM expense_values
                    WHERE scenario_id = ? AND month >= ? AND month <= ? GROUP BY month`, [sid, start, end]),
           ]);
@@ -117,6 +134,8 @@ export default {
         // Same charges as the Upcoming Charges page, soonest first
         renewals.value = computeUpcomingCharges(renewItems, renewValues, RENEWAL_DAYS);
         payrollDue.value = computePayrollCharges(people, RENEWAL_DAYS, settings.value?.payroll_pay_day, settings.value?.dept_mapping);
+        runwayInfo.value = runwayFromData({ items: renewItems, values: renewValues, people, settings: settings.value,
+          cash: cashBalance.value, burn: burnRate.value });
       } catch (e) { console.error('Dashboard load error:', e); }
       finally { if (run === loadSeq) { loading.value = false; await nextTick(); renderCharts(); } }
     }
@@ -208,7 +227,7 @@ export default {
     }
 
     return {
-      loading, mrr, mrrDelta, arr, arrDelta, cashBalance, cashSource, burnRate, runway,
+      loading, mrr, mrrDelta, arr, arrDelta, cashBalance, cashSource, burnRate, runwayInfo, runwayText, runwayBar, runwayWhen, RUNWAY_DAYS,
       headcount, deptBreakdown, mrrSeries, hasMrr, expensesByCat, renewals, payrollDue, renewalsTotal, payrollTotal, grandTotal, payrollLabel,
       mrrCanvasRef, expenseCanvasRef, teamCanvasRef, formatCents, formatRenewalDate, RENEWAL_DAYS,
     };
@@ -242,18 +261,18 @@ export default {
     <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
       <div class="bg-white rounded-xl border border-gray-200 p-5">
         <h2 class="text-sm font-semibold text-gray-700 mb-3">Runway</h2>
-        <div v-if="runway !== null">
+        <div v-if="runwayInfo.unit !== 'none' && runwayInfo.unit !== 'positive'">
           <div class="text-3xl font-bold text-gray-900">
-            {{ runway > 999 ? '999+' : runway.toFixed(1) }}
-            <span class="text-base font-normal text-gray-500">months</span>
+            {{ runwayText.value }}
+            <span class="text-base font-normal text-gray-500">{{ runwayText.unit }}</span>
           </div>
+          <p v-if="runwayInfo.unit === 'days'" class="text-sm text-gray-600 mt-1">{{ runwayWhen }}</p>
+          <p v-else class="text-xs text-gray-400 mt-1">Cash covers every charge of the next {{ RUNWAY_DAYS }} days; estimated from the monthly burn.</p>
           <div class="mt-3 w-full bg-gray-100 rounded-full h-2.5">
-            <div class="h-2.5 rounded-full transition-all"
-              :class="runway < 6 ? 'bg-red-500' : runway < 12 ? 'bg-amber-400' : 'bg-emerald-500'"
-              :style="{ width: Math.min(runway / 36 * 100, 100) + '%' }"></div>
+            <div class="h-2.5 rounded-full transition-all" :class="runwayBar.color" :style="{ width: runwayBar.pct + '%' }"></div>
           </div>
           <div class="flex justify-between text-xs text-gray-400 mt-1">
-            <span>0</span><span>12</span><span>24</span><span>36 mo</span>
+            <span v-for="t in runwayBar.ticks" :key="t">{{ t }}</span>
           </div>
         </div>
         <div v-else class="text-gray-400 text-sm py-4">
