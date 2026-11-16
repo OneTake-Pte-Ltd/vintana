@@ -1,6 +1,7 @@
 import { query, execute } from '../db.js';
 import { getBaseScenarioId } from '../schema.js';
-import { formatCents, monthLabel, generateMonthRange, currentMonth, ordinalDay, weeklyAnchor } from '../utils.js';
+import { formatCents, monthLabel, generateMonthRange, currentMonth, ordinalDay, weeklyAnchor, monthlyShare } from '../utils.js';
+import { loadBudgetLines, formulaContexts, lineAmount } from '../budget.js';
 import {
   loadCategoryLookups, categoryOptions, subcategoryOptions, RECURRENCE_OPTIONS, recurrenceLabel, updateExpenseField,
 } from '../expenses.js';
@@ -35,6 +36,13 @@ export default {
     const showAll = ref(false);
     const sortCol = ref(null);
     const sortAsc = ref(true);
+    // Budget lines of each expense, and this month's formula variables to show their amounts
+    const budgetLines = ref({});
+    const formulaCtx = ref({});
+    const expanded = ref(new Set());
+    const toggleLines = id => { const s = new Set(expanded.value); s.has(id) ? s.delete(id) : s.add(id); expanded.value = s; };
+    // A budget line's share of the Budget column (a month's cost), this month
+    const lineMonthly = (row, l) => (row.recurrence === 'one_time' ? lineAmount(l, formulaCtx.value) : monthlyShare(lineAmount(l, formulaCtx.value), row.recurrence));
 
     const months = computed(() => {
       if (!dateRange.value) return [];
@@ -66,6 +74,9 @@ export default {
           ORDER BY ec.sort_order, ei.name
         `, [sid, currentMonth(), baseId, currentMonth()]);
         items.value = rows;
+        const [lines, ctxs] = await Promise.all([loadBudgetLines(), formulaContexts(sid, currentMonth(), currentMonth()).catch(() => ({}))]);
+        budgetLines.value = lines;
+        formulaCtx.value = ctxs[currentMonth()] || {};
       } catch (e) {
         toast('Failed to load expenses: ' + e.message, 'error');
       } finally {
@@ -267,6 +278,7 @@ export default {
     const confirmDelete = async () => {
       if (!deleteTarget.value) return;
       try {
+        await execute('DELETE FROM expense_budget_lines WHERE expense_item_id = ?', [deleteTarget.value.id]).catch(() => {});
         await execute('DELETE FROM expense_items WHERE id = ?', [deleteTarget.value.id]);
         deleteTarget.value = null;
         toast('Expense deleted', 'success');
@@ -277,7 +289,7 @@ export default {
     };
 
     return {
-      items, categories, subcategories, loading, search, categoryFilter, filtered,
+      items, categories, subcategories, loading, search, categoryFilter, filtered, budgetLines, expanded, toggleLines, lineMonthly,
       modalOpen, modalItemId, months, deleteTarget, load,
       includePayroll, currentPayroll, monthlyTotal, categoryDonut, categoryBreakdown, filteredTotal, expensesTrend,
       showAll, hiddenCount, columns, sortCol, sortAsc, toggleSort,
@@ -370,15 +382,21 @@ export default {
               </tr>
             </thead>
             <tbody class="divide-y divide-gray-100">
-              <tr v-for="row in filtered" :key="row.id" class="hover:bg-gray-50">
+              <template v-for="row in filtered" :key="row.id">
+              <tr class="hover:bg-gray-50">
                 <td class="sticky-col px-4 py-3 min-w-[10rem] md:min-w-[15rem]">
                   <div class="flex items-center gap-2 flex-wrap">
+                    <button v-if="budgetLines[row.id]" @click="toggleLines(row.id)" :aria-expanded="expanded.has(row.id)"
+                      :aria-label="(expanded.has(row.id) ? 'Hide' : 'Show') + ' budget lines of ' + row.name" class="-ml-1 p-0.5 rounded text-gray-400 hover:text-gray-700 hover:bg-gray-100">
+                      <svg class="w-3.5 h-3.5 transition-transform" :class="expanded.has(row.id) ? 'rotate-90' : ''" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true"><path d="M9 18l6-6-6-6"/></svg>
+                    </button>
                     <inline-edit :value="row.name" @save="v => saveField(row, 'name', v)">
                       <span class="font-medium text-gray-900" :title="row.charge_label ? 'Charge label: ' + row.charge_label : ''">{{ row.name }}</span>
                     </inline-edit>
                     <span v-if="row.company" class="inline-flex items-center px-2 py-0.5 rounded-full bg-gray-100 text-gray-600 text-xs whitespace-nowrap">{{ row.company }}</span>
                   </div>
                   <div v-if="row.charge_label" class="text-xs text-gray-400 mt-0.5 truncate max-w-[18rem]" :title="row.charge_label">{{ row.charge_label }}</div>
+                  <button v-if="budgetLines[row.id]" @click="toggleLines(row.id)" class="text-xs text-indigo-600 hover:text-indigo-800 mt-0.5">{{ budgetLines[row.id].length }} budget line{{ budgetLines[row.id].length !== 1 ? 's' : '' }}</button>
                 </td>
                 <td class="px-4 py-3 text-gray-600 whitespace-nowrap">
                   <inline-edit :value="row.category_id" :options="catOptions" :display="row.category_name" @save="v => saveField(row, 'category_id', v)"/>
@@ -408,6 +426,16 @@ export default {
                   <button @click.stop="deleteTarget = row" class="text-red-500 hover:text-red-700 text-xs">Delete</button>
                 </td>
               </tr>
+              <!-- Budget lines: what the expense's budget is made of (its forecast is their sum) -->
+              <template v-if="budgetLines[row.id] && expanded.has(row.id)">
+              <tr v-for="l in budgetLines[row.id]" :key="'l' + l.id" class="bg-gray-50/60 text-xs">
+                <td class="sticky-col pl-10 pr-4 py-2 text-gray-700" style="background-color:#fafafa">{{ l.name }}</td>
+                <td colspan="2" class="px-4 py-2 text-gray-400 font-mono truncate max-w-[16rem]" :title="l.formula || ''">{{ l.formula || 'Fixed amount' }}</td>
+                <td class="px-4 py-2 text-right text-gray-700 tabular-nums">{{ formatCents(lineMonthly(row, l)) }}</td>
+                <td colspan="4"></td>
+              </tr>
+              </template>
+              </template>
               <tr v-if="!filtered.length">
                 <td colspan="8" class="px-4 py-8 text-center text-gray-400">No expenses found</td>
               </tr>

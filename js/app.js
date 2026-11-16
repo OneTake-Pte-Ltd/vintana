@@ -2,6 +2,7 @@ import { hasCredentials, query } from './db.js';
 import { checkSchema, getSettings, ensureSchemaUpgrades } from './schema.js';
 import { currentMonth, addMonths, setReportingCurrency } from './utils.js';
 import { autoSync } from './profitwell.js';
+import { recomputeDaily, recomputeComputedExpenses } from './budget.js';
 
 import Sidebar from '../components/Sidebar.js';
 import KpiCard from '../components/KpiCard.js';
@@ -158,7 +159,11 @@ const app = Vue.createApp({
         }
         // ProfitWell is re-read in full once a month, from the 1st. Runs in the background; pages that show MRR
         // reload when it finishes.
-        autoSync(settings.value, toast).then(synced => { if (synced) { loadSettings(); mrrVersion.value++; } });
+        // Formula and budget-line expenses follow customers and months: recomputed after a sync, else once a day
+        autoSync(settings.value, toast).then(async synced => {
+          if (synced) { loadSettings(); await recomputeComputedExpenses().catch(() => 0); mrrVersion.value++; }
+          else if (await recomputeDaily().catch(() => false)) mrrVersion.value++;
+        });
       } catch {
         // will redirect to login via router guard
       }

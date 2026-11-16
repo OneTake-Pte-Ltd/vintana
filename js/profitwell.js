@@ -204,6 +204,7 @@ export async function loadMrrSeries(scenarioId, from, to) {
   const out = lines.map(line => {
     const actual = actualByLine[line.id] || {};
     const base = actual[lastActual]?.mrr || 0;
+    const baseCustomers = actual[lastActual]?.customers || 0;
     const rate = rates[line.id] ?? 0;
     // Average month-on-month net growth over the last TREND_MONTHS actual months
     const growths = [];
@@ -219,7 +220,8 @@ export async function loadMrrSeries(scenarioId, from, to) {
         values[m] = actual[m] || { mrr: 0, customers: 0 };
       } else {
         const n = monthDiff(lastActual, m);
-        values[m] = { mrr: Math.round(base * Math.pow(1 + rate / 100, n)), customers: null };
+        // Customers grow at the line's planned growth rate, like its MRR (used by expense formulas)
+        values[m] = { mrr: Math.round(base * Math.pow(1 + rate / 100, n)), customers: Math.round(baseCustomers * Math.pow(1 + rate / 100, n)) };
         trend[m] = Math.round(base * Math.pow(1 + trendRate / 100, n));
       }
       planned[m] = values[m].mrr;

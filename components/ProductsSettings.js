@@ -4,6 +4,7 @@ import { query, execute, batch } from '../js/db.js';
 import { CURRENCIES, formatCents } from '../js/utils.js';
 import { getSettings, updateSettings } from '../js/schema.js';
 import { syncProfitwell, loadProducts, lastActualMonth, UNASSIGNED_LINE } from '../js/profitwell.js';
+import { recomputeComputedExpenses } from '../js/budget.js';
 
 export default {
   name: 'ProductsSettings',
@@ -54,6 +55,7 @@ export default {
       syncing.value = true;
       try {
         const r = await syncProfitwell();
+        await recomputeComputedExpenses().catch(() => 0); // formula expenses follow the customer counts
         toast(`ProfitWell synced: ${r.plans} plans, ${r.months} months`, 'success');
         await reloadAppSettings?.();
         await changed();

@@ -15,9 +15,11 @@ export default {
       showSuggestions.value = true;
     };
 
+    // Replaces the name being typed (e.g. "cust") with the chosen one
     const insertVariable = (v) => {
       const current = props.modelValue || '';
-      emit('update:modelValue', current + v);
+      const partial = current.match(/[a-zA-Z_][a-zA-Z0-9_.]*$/);
+      emit('update:modelValue', (partial ? current.slice(0, partial.index) : current) + v);
       showSuggestions.value = false;
       if (inputRef.value) inputRef.value.focus();
     };
@@ -29,7 +31,10 @@ export default {
       return props.variables.filter(v => v.toLowerCase().includes(last)).slice(0, 10);
     });
 
-    return { showSuggestions, inputRef, onInput, insertVariable, filteredVars };
+    // Templates can't call setTimeout: the suggestions close a moment after the field loses focus
+    const hideSoon = () => setTimeout(() => { showSuggestions.value = false; }, 200);
+
+    return { showSuggestions, inputRef, onInput, insertVariable, filteredVars, hideSoon };
   },
   template: `
     <div class="relative">
@@ -40,7 +45,7 @@ export default {
           :value="modelValue"
           @input="onInput"
           @focus="showSuggestions = true"
-          @blur="setTimeout(() => showSuggestions = false, 200)"
+          @blur="hideSoon"
           placeholder="e.g. customers.total * 15"
           class="flex-1 px-3 py-1.5 text-sm font-mono border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
         />

@@ -3,6 +3,7 @@ import { formatCents, currentMonth, generateMonthRange, monthLabel } from '../ut
 import { getReportingCurrency } from '../utils.js';
 const money = v => formatCents(Math.round(v * 100));
 import { loadScenarioEmployees, employeeCost, isEmployedIn, DEFAULT_DEPT_MAPPING } from '../payroll.js';
+import { recomputeComputedExpenses } from '../budget.js';
 
 const COLORS = ['#6366f1','#10b981','#f59e0b','#ef4444','#8b5cf6','#06b6d4','#ec4899','#84cc16','#f97316','#14b8a6'];
 const INPUT = 'w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500';
@@ -161,6 +162,7 @@ export default {
           toast('Employee added', 'success');
         }
         showModal.value = false;
+        recomputeComputedExpenses().catch(() => 0); // formulas can use headcount.total and payroll.total
         await loadEmployees(); await nextTick(); renderCharts();
       } catch (e) { toast('Save failed: ' + e.message, 'error'); }
     }
@@ -170,6 +172,7 @@ export default {
         else if (scenarioIsBase.value) await execute('DELETE FROM employees WHERE id=?', [emp.id]);
         else { toast('Cannot delete base employees in a non-base scenario', 'error'); confirmDelete.value = null; return; }
         toast('Employee deleted', 'success'); confirmDelete.value = null;
+        recomputeComputedExpenses().catch(() => 0); // formulas can use headcount.total and payroll.total
         await loadEmployees(); await nextTick(); renderCharts();
       } catch (e) { toast('Delete failed: ' + e.message, 'error'); }
     }
