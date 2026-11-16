@@ -299,8 +299,8 @@ export default {
           <div><label class="block text-xs font-medium text-gray-500 mb-1">Tax % (employer)</label><input v-model.number="form.tax_pct" type="number" step="0.1" min="0" :class="INPUT"/></div>
         </div>
         <div class="grid grid-cols-2 gap-4">
-          <div><label class="block text-xs font-medium text-gray-500 mb-1">Start Date *</label><input v-model="form.start_date" type="month" :class="INPUT"/></div>
-          <div><label class="block text-xs font-medium text-gray-500 mb-1">End Date</label><input v-model="form.end_date" type="month" :class="INPUT"/></div>
+          <div><label class="block text-xs font-medium text-gray-500 mb-1">Start Date *</label><month-picker v-model="form.start_date" block aria-label="Start date"/></div>
+          <div><label class="block text-xs font-medium text-gray-500 mb-1">End Date</label><month-picker v-model="form.end_date" block clearable placeholder="Still employed" aria-label="End date"/></div>
         </div>
         <div v-if="editingEmployee ? editingEmployee._source !== 'scenario' : scenarioIsBase">
           <label class="block text-xs font-medium text-gray-500 mb-1">Charge label</label>

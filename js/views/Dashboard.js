@@ -2,7 +2,7 @@ import { query } from '../db.js';
 import { cashPosition, cashSourceText } from '../bank.js';
 import { loadLiveBalances } from '../liveBalances.js';
 import { loadMrrSeries, mrrChartDatasets, mrrRevenueLine } from '../profitwell.js';
-import { loadScenarioEmployees, employeeCost, isEmployedIn } from '../payroll.js';
+import { loadScenarioEmployees, employeeCost, isEmployedIn, payrollCategory } from '../payroll.js';
 import {
   formatCents, formatPct, formatDelta, monthLabel,
   currentMonth, prevMonth, ordinalDay,
@@ -15,6 +15,7 @@ import {
 const RENEWAL_DAYS = 7;
 
 const COLORS = ['#6366f1', '#f59e0b', '#10b981', '#ef4444', '#8b5cf6'];
+const COGS_PREFIX = 'Cost of Goods Sold'; // the COGS expense category, "Cost of Goods Sold (COGS)"
 const REVENUE_LINE = '_revenue'; // hidden dataset the expenses line shades against (not in legend or tooltip)
 
 function centsTooltip(ctx) { return formatCents(Math.round(ctx.raw * 100)); }
@@ -35,9 +36,10 @@ export default {
     const cashSource = ref(''); // where the cash figure comes from (live balances, statements)
     const totalExpenses = ref(0), totalPayroll = ref(0);
     const mrrSeries = ref(null), expensesByCat = ref([]);
-    const employees = ref([]), renewals = ref([]), payrollDue = ref([]);
+    const renewals = ref([]), payrollDue = ref([]);
+    const cogsByMonth = ref({}); // cents: COGS expenses + payroll of departments mapped to COGS
     const expensesByMonth = ref({}); // cents, expenses + payroll, for the chart's months
-    const mrrCanvasRef = ref(null), expenseCanvasRef = ref(null), teamCanvasRef = ref(null);
+    const mrrCanvasRef = ref(null), expenseCanvasRef = ref(null), marginCanvasRef = ref(null);
     let charts = [];
 
     const hasMrr = computed(() => !!mrrSeries.value && mrrSeries.value.months.some(m => mrrSeries.value.totals[m]));
@@ -80,11 +82,21 @@ export default {
       const what = !c ? '' : c.kind === 'payroll' ? `payroll (${c.name})` : `${c.name} (${formatCents(c.amount)})`;
       return `Cash runs out ${when}${what ? ', before ' + what : ''}`;
     });
-    const headcount = computed(() => employees.value.length);
-    const deptBreakdown = computed(() => {
-      const m = {};
-      employees.value.forEach(e => { const d = e.department || 'Other'; m[d] = (m[d] || 0) + 1; });
-      return Object.entries(m).sort((a, b) => b[1] - a[1]);
+    // Gross margin per month: (MRR - cost of goods sold) / MRR, in %; null without MRR
+    const grossMargin = computed(() => {
+      const s = mrrSeries.value;
+      if (!s) return {};
+      return Object.fromEntries(s.months.map(m => {
+        const mrr = s.totals[m] || 0;
+        return [m, mrr > 0 ? (mrr - (cogsByMonth.value[m] || 0)) / mrr * 100 : null];
+      }));
+    });
+    // The latest actual month's margin, for the card's header
+    const marginNow = computed(() => {
+      const s = mrrSeries.value;
+      if (!s) return null;
+      const m = [...s.months].reverse().find(x => s.isActual(x) && grossMargin.value[x] !== null);
+      return m ? { month: m, pct: grossMargin.value[m] } : null;
     });
 
     // Only the latest load may show its results: an earlier one can finish after it
@@ -98,7 +110,7 @@ export default {
       const range = dateRange.value;
       try {
         const start = range?.start || month, end = range?.end || month;
-        const [series, cash, expenses, scenarioEmp, mrrAround, expCat, empRows, renewItems, renewValues, expMonths] =
+        const [series, cash, expenses, scenarioEmp, mrrAround, expCat, cogsMonths, renewItems, renewValues, expMonths] =
           await Promise.all([
             loadMrrSeries(sid, start, end),
             // Live balances are refreshed first when the cached ones are more than a day old
@@ -107,7 +119,10 @@ export default {
             loadScenarioEmployees(sid),
             loadMrrSeries(sid, prev, month),
             query(`SELECT ec.name AS category, COALESCE(SUM(ev.amount), 0) AS total FROM expense_values ev JOIN expense_items ei ON ev.expense_item_id = ei.id JOIN expense_categories ec ON ei.category_id = ec.id WHERE ev.scenario_id = ? AND ev.month = ? GROUP BY ec.name ORDER BY total DESC`, [sid, month]),
-            query(`SELECT name, department FROM employees WHERE start_date <= ? AND (end_date IS NULL OR end_date >= ?)`, [month + '-31', month + '-01']),
+            query(`SELECT ev.month, COALESCE(SUM(ev.amount), 0) AS total FROM expense_values ev
+                   JOIN expense_items ei ON ei.id = ev.expense_item_id JOIN expense_categories ec ON ec.id = ei.category_id
+                   WHERE ev.scenario_id = ? AND ev.month >= ? AND ev.month <= ? AND ec.name LIKE ? GROUP BY ev.month`,
+                  [sid, start, end, COGS_PREFIX + '%']),
             query(ITEMS_WITH_LAST_CHARGE_SQL),
             loadExpenseValues(sid, month, horizonMonth(RUNWAY_DAYS)),
             query(`SELECT month, COALESCE(SUM(amount), 0) AS total FROM expense_values
@@ -129,7 +144,11 @@ export default {
         const expMap = Object.fromEntries(expMonths.map(r => [r.month, r.total]));
         expensesByMonth.value = Object.fromEntries(series.months.map(m => [m, (expMap[m] || 0) + payrollIn(m)]));
         expensesByCat.value = expCat;
-        employees.value = empRows;
+        const cogsExp = Object.fromEntries(cogsMonths.map(r => [r.month, r.total]));
+        const deptMap = settings.value?.dept_mapping;
+        const cogsPayroll = m => people.filter(e => isEmployedIn(e, m) && payrollCategory(e.department, deptMap).startsWith(COGS_PREFIX))
+          .reduce((s, e) => s + employeeCost(e), 0);
+        cogsByMonth.value = Object.fromEntries(series.months.map(m => [m, (cogsExp[m] || 0) + cogsPayroll(m)]));
 
         // Same charges as the Upcoming Charges page, soonest first
         renewals.value = computeUpcomingCharges(renewItems, renewValues, RENEWAL_DAYS);
@@ -205,13 +224,28 @@ export default {
           },
         });
       }
-      // Team donut chart
-      if (deptBreakdown.value.length) {
-        makeChart(teamCanvasRef, {
-          type: 'doughnut',
-          data: { labels: deptBreakdown.value.map(d => d[0]), datasets: [{ data: deptBreakdown.value.map(d => d[1]), backgroundColor: COLORS.slice(0, deptBreakdown.value.length), borderWidth: 0 }] },
-          options: { responsive: true, maintainAspectRatio: false, cutout: '65%',
-            plugins: { legend: { position: 'right', labels: { boxWidth: 10, padding: 8, font: { size: 11 } } } } },
+      // Gross margin over time: actual months solid, planned months dashed (joined at the last actual month)
+      if (s && hasMrr.value) {
+        const gm = grossMargin.value;
+        const val = m => (gm[m] === null || gm[m] === undefined ? null : Math.round(gm[m] * 10) / 10);
+        const actual = s.months.map(m => (s.isActual(m) ? val(m) : null));
+        const planned = s.months.map(m => (!s.isActual(m) || m === s.lastActual ? val(m) : null));
+        const datasets = [{ label: 'Gross margin', data: actual, borderColor: '#10b981', backgroundColor: 'rgba(16,185,129,0.08)',
+          fill: true, tension: 0.3, pointRadius: 2, borderWidth: 2, spanGaps: false }];
+        if (s.months.some(m => !s.isActual(m))) {
+          datasets.push({ label: 'Planned', data: planned, borderColor: '#10b981', borderDash: [6, 4], fill: false, tension: 0.3, pointRadius: 2, borderWidth: 2 });
+        }
+        makeChart(marginCanvasRef, {
+          type: 'line',
+          data: { labels: s.months.map(monthLabel), datasets },
+          options: { responsive: true, maintainAspectRatio: false,
+            interaction: { mode: 'index', intersect: false },
+            plugins: {
+              legend: { display: datasets.length > 1, position: 'bottom', labels: { usePointStyle: true, boxWidth: 8 } },
+              tooltip: { filter: i => i.raw !== null, callbacks: { label: c => `${c.dataset.label}: ${c.raw.toFixed(1)}%` } },
+            },
+            scales: { y: { suggestedMin: 0, suggestedMax: 100, ticks: { callback: v => v + '%', maxTicksLimit: 6 }, grid: { color: '#f3f4f6' } }, x: { grid: { display: false } } },
+          },
         });
       }
     }
@@ -228,8 +262,8 @@ export default {
 
     return {
       loading, mrr, mrrDelta, arr, arrDelta, cashBalance, cashSource, burnRate, runwayInfo, runwayText, runwayBar, runwayWhen, RUNWAY_DAYS,
-      headcount, deptBreakdown, mrrSeries, hasMrr, expensesByCat, renewals, payrollDue, renewalsTotal, payrollTotal, grandTotal, payrollLabel,
-      mrrCanvasRef, expenseCanvasRef, teamCanvasRef, formatCents, formatRenewalDate, RENEWAL_DAYS,
+      mrrSeries, hasMrr, expensesByCat, marginNow, monthLabel, renewals, payrollDue, renewalsTotal, payrollTotal, grandTotal, payrollLabel,
+      mrrCanvasRef, expenseCanvasRef, marginCanvasRef, formatCents, formatRenewalDate, RENEWAL_DAYS,
     };
   },
   template: `
@@ -252,12 +286,15 @@ export default {
         <p v-if="!hasMrr" class="text-xs text-gray-400 text-center mt-2">No MRR for this period. Sync ProfitWell in Settings.</p>
       </div>
       <div class="bg-white rounded-xl border border-gray-200 p-5">
-        <h2 class="text-sm font-semibold text-gray-700 mb-4">Expenses by Category</h2>
-        <div style="height:280px"><canvas ref="expenseCanvasRef"></canvas></div>
-        <p v-if="expensesByCat.length === 0" class="text-sm text-gray-400 text-center py-8">No expense data for this month</p>
+        <h2 class="text-sm font-semibold text-gray-700 mb-4">Gross margin
+          <span v-if="marginNow" class="font-normal text-gray-400">{{ marginNow.pct.toFixed(1) }}% in {{ monthLabel(marginNow.month) }} · MRR minus COGS (incl. COGS payroll)</span>
+          <span v-else class="font-normal text-gray-400">MRR minus COGS (incl. COGS payroll)</span>
+        </h2>
+        <div style="height:280px"><canvas ref="marginCanvasRef" role="img" aria-label="Gross margin by month, in percent"></canvas></div>
+        <p v-if="!hasMrr" class="text-xs text-gray-400 text-center mt-2">Gross margin needs MRR. Sync ProfitWell in Settings.</p>
       </div>
     </div>
-    <!-- Row 3: Runway + Team Size -->
+    <!-- Row 3: Runway + Expenses by Category -->
     <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
       <div class="bg-white rounded-xl border border-gray-200 p-5">
         <h2 class="text-sm font-semibold text-gray-700 mb-3">Runway</h2>
@@ -280,17 +317,9 @@ export default {
         </div>
       </div>
       <div class="bg-white rounded-xl border border-gray-200 p-5">
-        <h2 class="text-sm font-semibold text-gray-700 mb-3">Team Size</h2>
-        <div class="flex items-center gap-6">
-          <div>
-            <div class="text-3xl font-bold text-gray-900">{{ headcount }}</div>
-            <div class="text-xs text-gray-400">active employees</div>
-          </div>
-          <div v-if="deptBreakdown.length > 0" class="flex-1 min-w-0 relative" style="height:140px">
-            <canvas ref="teamCanvasRef"></canvas>
-          </div>
-          <div v-else class="text-sm text-gray-400">No employees found</div>
-        </div>
+        <h2 class="text-sm font-semibold text-gray-700 mb-3">Expenses by Category <span class="font-normal text-gray-400">this month</span></h2>
+        <div style="height:200px"><canvas ref="expenseCanvasRef"></canvas></div>
+        <p v-if="expensesByCat.length === 0" class="text-sm text-gray-400 text-center py-8">No expense data for this month</p>
       </div>
     </div>
     <!-- Row 4: Upcoming Renewals -->

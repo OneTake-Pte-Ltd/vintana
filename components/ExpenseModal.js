@@ -33,8 +33,9 @@ export default {
       name: '', alias: '', company: '', charge_label: '',
       category_id: props.categories[0]?.id || null, subcategory_id: null,
       formula: '', entryMode: 'manual', amount: '',
-      recurrence: 'monthly', renewal_day: null, billing_threshold: '',
-      start_month: dateRange.value?.start || '', end_month: '', notes: '',
+      // A new expense starts this month, renewing on today's date
+      recurrence: 'monthly', renewal_day: new Date().getDate(), billing_threshold: '',
+      start_month: currentMonth(), end_month: '', notes: '',
     });
     const form = ref(blankForm());
     // Switching to or from weekly or threshold billing converts the amount so the monthly cost stays the same (2,000 a month is about
@@ -251,13 +252,13 @@ export default {
             </div>
             <div>
               <label class="block text-xs font-medium text-gray-500 mb-1">Start Month</label>
-              <input v-model="form.start_month" type="month" :class="INPUT"/>
+              <month-picker v-model="form.start_month" block aria-label="Start month"/>
               <p v-if="form.recurrence === 'annual' || form.recurrence === 'quarterly'" class="text-[11px] text-gray-400 mt-1">The month of the first charge; renewals follow every {{ form.recurrence === 'annual' ? '12' : '3' }} months.</p>
               <p v-else-if="form.recurrence === 'weekly'" class="text-[11px] text-gray-400 mt-1">With the renewal day, the date of the first charge; the next ones follow every 7 days.</p>
             </div>
             <div>
               <label class="block text-xs font-medium text-gray-500 mb-1">End Month</label>
-              <input v-model="form.end_month" type="month" :class="INPUT"/>
+              <month-picker v-model="form.end_month" block clearable placeholder="Ongoing" aria-label="End month"/>
             </div>
             <div class="col-span-2">
               <label class="block text-xs font-medium text-gray-500 mb-1">Notes</label>

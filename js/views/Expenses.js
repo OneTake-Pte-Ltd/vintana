@@ -200,13 +200,25 @@ export default {
 
     const monthlyTotal = computed(() => Object.values(categoryTotals.value).reduce((a, b) => a + b, 0));
 
-    const categoryDonut = computed(() => {
+    // Categories with a cost, in the categories' order: the donut and its legend list (amount and share) beside it
+    const categoryBreakdown = computed(() => {
       const order = categories.value.map(c => c.name);
-      const labels = Object.keys(categoryTotals.value)
+      const total = monthlyTotal.value || 1;
+      return Object.keys(categoryTotals.value)
         .filter(l => categoryTotals.value[l] > 0)
-        .sort((a, b) => (order.indexOf(a) + 1 || 99) - (order.indexOf(b) + 1 || 99));
-      return donutConfig(labels.map(l => catShort[l] || l), labels.map(l => categoryTotals.value[l]), labels.map(l => catColors[l] || '#94a3b8'));
+        .sort((a, b) => (order.indexOf(a) + 1 || 99) - (order.indexOf(b) + 1 || 99))
+        .map(name => ({ name, short: catShort[name] || name, color: catColors[name] || '#94a3b8',
+          amount: categoryTotals.value[name], pct: Math.round(categoryTotals.value[name] / total * 100) }));
     });
+    const categoryDonut = computed(() => {
+      const list = categoryBreakdown.value;
+      const cfg = donutConfig(list.map(c => c.short), list.map(c => c.amount), list.map(c => c.color));
+      cfg.options.plugins.legend = { display: false };
+      return cfg;
+    });
+
+    // Total of the rows shown (search, category filter and "not current" choice applied)
+    const filteredTotal = computed(() => filtered.value.reduce((s, r) => s + (r.cur_amount || 0), 0));
 
     const expensesTrend = computed(() => trendConfig(
       months.value.map(monthLabel),
@@ -267,7 +279,7 @@ export default {
     return {
       items, categories, subcategories, loading, search, categoryFilter, filtered,
       modalOpen, modalItemId, months, deleteTarget, load,
-      includePayroll, currentPayroll, monthlyTotal, categoryDonut, expensesTrend,
+      includePayroll, currentPayroll, monthlyTotal, categoryDonut, categoryBreakdown, filteredTotal, expensesTrend,
       showAll, hiddenCount, columns, sortCol, sortAsc, toggleSort,
       openAdd, openEdit, confirmDelete, saveField, catOptions, subOptionsFor, subName, hasSubcategories,
       RECURRENCE_OPTIONS, recurrenceLabel, formatCents, monthLabel, ordinalDay, weeklyDay,
@@ -302,7 +314,17 @@ export default {
           </div>
           <div class="bg-white rounded-xl border border-gray-200 p-5">
             <span class="text-xs font-medium text-gray-500 uppercase tracking-wider">Cost by Category</span>
-            <chart-wrapper v-if="categoryDonut.data.labels.length" type="doughnut" :data="categoryDonut.data" :options="categoryDonut.options" height="160px" class="mt-2"/>
+            <div v-if="categoryBreakdown.length" class="mt-2 flex items-center gap-3">
+              <chart-wrapper type="doughnut" :data="categoryDonut.data" :options="categoryDonut.options" height="140px" class="w-28 shrink-0"/>
+              <ul class="flex-1 min-w-0 space-y-1 text-xs">
+                <li v-for="c in categoryBreakdown" :key="c.name" class="flex items-center gap-2" :title="c.name">
+                  <span class="w-2.5 h-2.5 rounded-sm shrink-0" :style="{ backgroundColor: c.color }"></span>
+                  <span class="text-gray-600 truncate">{{ c.short }}</span>
+                  <span class="ml-auto text-gray-900 tabular-nums whitespace-nowrap">{{ formatCents(c.amount) }}</span>
+                  <span class="w-9 text-right text-gray-400 tabular-nums">{{ c.pct }}%</span>
+                </li>
+              </ul>
+            </div>
             <p v-else class="text-gray-400 text-sm text-center py-8">No expense data</p>
           </div>
           <div class="bg-white rounded-xl border border-gray-200 p-5">
@@ -390,6 +412,15 @@ export default {
                 <td colspan="8" class="px-4 py-8 text-center text-gray-400">No expenses found</td>
               </tr>
             </tbody>
+            <tfoot v-if="filtered.length">
+              <tr class="border-t-2 border-gray-300 bg-gray-50">
+                <td colspan="3" class="sticky-col px-4 py-3 font-semibold text-gray-900" style="background-color:#f9fafb;box-shadow:none">
+                  Total <span class="font-normal text-gray-500">({{ filtered.length }} expense{{ filtered.length !== 1 ? 's' : '' }} shown)</span>
+                </td>
+                <td class="px-4 py-3 text-right text-base font-bold text-gray-900 tabular-nums whitespace-nowrap">{{ formatCents(filteredTotal) }}</td>
+                <td colspan="4"></td>
+              </tr>
+            </tfoot>
           </table>
         </div>
       </template>
