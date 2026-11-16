@@ -3,6 +3,7 @@
 import { formatCents, monthLabel } from '../utils.js';
 import { donutConfig } from '../miniCharts.js';
 import { loadMrrSeries, saveGrowthRates, mrrChartDatasets } from '../profitwell.js';
+import { recomputeComputedExpenses } from '../budget.js';
 
 const COLORS = ['#6366f1', '#f59e0b', '#10b981', '#ef4444', '#8b5cf6', '#ec4899', '#14b8a6', '#f97316'];
 
@@ -94,7 +95,8 @@ export default {
       const v = parseRate(raw);
       if (v === null) { toast('Enter a growth rate in % per month, e.g. 3', 'error'); return; }
       if (v === line.rate) return;
-      try { await saveGrowthRates(scenarioId.value, [line.line.id], v); await load(); }
+      // Forecast customers grow at these rates, so formula expenses are recomputed
+      try { await saveGrowthRates(scenarioId.value, [line.line.id], v); await recomputeComputedExpenses().catch(() => 0); await load(); }
       catch (e) { toast('Failed to save: ' + e.message, 'error'); }
     }
     async function applyAll() {
@@ -102,6 +104,7 @@ export default {
       if (v === null) { toast('Enter a growth rate in % per month, e.g. 3', 'error'); return; }
       try {
         await saveGrowthRates(scenarioId.value, visibleLines.value.map(l => l.line.id), v);
+        await recomputeComputedExpenses().catch(() => 0);
         toast(`Planned growth set to ${v}% per month for ${visibleLines.value.length} lines`, 'success');
         bulkRate.value = '';
         await load();

@@ -503,7 +503,7 @@ export default {
         </div>
         <div>
           <label class="block text-sm font-medium text-gray-700 mb-1">Month</label>
-          <input v-model="form.month" type="month" class="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+          <month-picker v-model="form.month" block aria-label="Month"/>
         </div>
         <div>
           <label class="block text-sm font-medium text-gray-700 mb-1">Amount ({{ currency }})</label>

@@ -1,5 +1,6 @@
 import { query, execute } from './db.js';
 import { currentMonth, expenseMonthlyValues, forecastEnd, chargeFromMonthly, MULTI_CHARGE } from './utils.js';
+import { loadBudgetLines, isComputed, recomputeComputedExpenses } from './budget.js';
 
 export const RECURRENCE_OPTIONS = [
   { value: 'weekly', label: 'Weekly' },
@@ -66,6 +67,12 @@ const NUMERIC = ['category_id', 'subcategory_id'];
 export async function updateExpenseField(item, field, value, subcategories = [], scenarioId = null) {
   if (!EDITABLE.includes(field)) throw new Error(`Field ${field} can't be edited here`);
   const v = NUMERIC.includes(field) ? (value === null || value === '' ? null : Number(value)) : value;
+  // A computed expense (formula, budget lines): its forecast is recomputed with the new recurrence
+  if (field === 'recurrence' && v !== item.recurrence && isComputed(item, (await loadBudgetLines())[item.id])) {
+    await execute('UPDATE expense_items SET recurrence = ? WHERE id = ?', [v, item.id]);
+    await recomputeComputedExpenses([item.id]);
+    return;
+  }
   const weeklySwitch = field === 'recurrence' && (MULTI_CHARGE.includes(v) || MULTI_CHARGE.includes(item.recurrence));
   if (field === 'recurrence' && scenarioId && v !== item.recurrence && !item.formula && !weeklySwitch) {
     const charge = await currentChargeAmount(item, scenarioId);

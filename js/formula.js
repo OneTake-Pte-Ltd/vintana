@@ -123,6 +123,33 @@ export function getDependencies(formula) {
   return tokens.filter(t => t.type === 'ident').map(t => t.value);
 }
 
+// The formula's exact value (no rounding): for amounts in currency units, where cents matter
+export function evalFormulaExact(formula, context) {
+  if (!formula) return 0;
+  try {
+    const v = evaluate(parse(tokenize(formula)), context);
+    return Number.isFinite(v) ? v : 0;
+  } catch {
+    return 0;
+  }
+}
+
+// Why a formula can't be read, or null when it can. unknown: names it uses that `variables` doesn't list.
+export function formulaProblem(formula, variables = null) {
+  if (!formula || !formula.trim()) return 'The formula is empty.';
+  try {
+    const tokens = tokenize(formula);
+    parse(tokens);
+    if (variables) {
+      const unknown = [...new Set(tokens.filter(t => t.type === 'ident' && !variables.includes(t.value)).map(t => t.value))];
+      if (unknown.length) return `Unknown name${unknown.length > 1 ? 's' : ''}: ${unknown.join(', ')}.`;
+    }
+    return null;
+  } catch (e) {
+    return 'This formula can\'t be read: ' + e.message + '.';
+  }
+}
+
 export function evalFormula(formula, context) {
   if (!formula) return 0;
   try {

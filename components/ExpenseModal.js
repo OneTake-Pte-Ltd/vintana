@@ -1,9 +1,11 @@
 import { query, execute } from '../js/db.js';
 import { getBaseScenarioId } from '../js/schema.js';
 import {
-  monthLabel, generateMonthRange, currentMonth, chargeFromMonthly, monthlyShare, expenseMonthlyValues, forecastEnd, MULTI_CHARGE,
+  monthLabel, generateMonthRange, currentMonth, chargeFromMonthly, formatCents, monthlyShare, expenseMonthlyValues, forecastEnd, MULTI_CHARGE,
 } from '../js/utils.js';
 import { subcategoryOptions, respreadExpense } from '../js/expenses.js';
+import { formulaContexts, variablesOf, loadBudgetLines, saveBudgetLines, recomputeComputedExpenses } from '../js/budget.js';
+import { evalFormulaExact, formulaProblem } from '../js/formula.js';
 
 const INPUT = 'w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500';
 
@@ -33,8 +35,9 @@ export default {
       name: '', alias: '', company: '', charge_label: '',
       category_id: props.categories[0]?.id || null, subcategory_id: null,
       formula: '', entryMode: 'manual', amount: '',
-      recurrence: 'monthly', renewal_day: null, billing_threshold: '',
-      start_month: dateRange.value?.start || '', end_month: '', notes: '',
+      // A new expense starts this month, renewing on today's date
+      recurrence: 'monthly', renewal_day: new Date().getDate(), billing_threshold: '',
+      start_month: currentMonth(), end_month: '', notes: '',
     });
     const form = ref(blankForm());
     // Switching to or from weekly or threshold billing converts the amount so the monthly cost stays the same (2,000 a month is about
@@ -49,6 +52,27 @@ export default {
     });
     const subOptions = computed(() => subcategoryOptions(props.subcategories, form.value.category_id));
     const hasSubcategories = computed(() => props.subcategories.length > 0);
+
+    // --- Formula and budget lines: computed from this month's customers, MRR and payroll (budget.js) ---
+    const formulaCtx = ref(null); // null until loaded; formulas are then checked against its names
+    const formulaVars = computed(() => variablesOf(formulaCtx.value || {}));
+    const budgetLines = ref([]); // [{ name, kind: 'amount' | 'formula', amount (text), formula }]
+    const showProblems = ref(false);
+    const evalNow = formula => Math.round(evalFormulaExact(formula, formulaCtx.value || {}) * 100);
+    const lineNow = l => (l.kind === 'formula' ? evalNow(l.formula) : Math.round((parseFloat(l.amount) || 0) * 100));
+    const budgetTotal = computed(() => budgetLines.value.reduce((s, l) => s + lineNow(l), 0));
+    const formulaCheck = f => formulaProblem(f, formulaCtx.value ? formulaVars.value : null);
+    const lineProblem = l => {
+      if (!l.name.trim()) return 'Give this budget line a name.';
+      if (l.kind === 'formula') return formulaCheck(l.formula);
+      return l.amount === '' || Number.isNaN(parseFloat(l.amount)) ? 'Enter an amount.' : null;
+    };
+    const addLine = () => budgetLines.value.push({ name: '', kind: 'amount', amount: '', formula: '' });
+    const removeLine = i => budgetLines.value.splice(i, 1);
+    const linesPayload = () => budgetLines.value.map(l => ({ name: l.name, formula: l.kind === 'formula' ? l.formula : null,
+      amount: l.kind === 'formula' ? null : Math.round(parseFloat(l.amount) * 100) }));
+    formulaContexts(scenarioId.value, currentMonth(), currentMonth())
+      .then(c => { formulaCtx.value = c[currentMonth()] || {}; }).catch(() => { formulaCtx.value = null; });
 
     const baseScenarioId = getBaseScenarioId;
     // Amount and recurrence as loaded, to tell whether the forecast needs rewriting on save
@@ -80,6 +104,10 @@ export default {
           notes: item.notes || '',
         };
         original.amount = form.value.amount;
+        const lines = (await loadBudgetLines())[props.itemId] || [];
+        budgetLines.value = lines.map(l => ({ name: l.name, kind: l.formula ? 'formula' : 'amount',
+          amount: l.formula ? '' : (l.amount / 100).toFixed(2), formula: l.formula || '' }));
+        if (lines.length) form.value.entryMode = 'budget';
         const vals = await query(`
           SELECT m.month, COALESCE(sv.amount, bv.amount) AS amount
           FROM (${months.value.map(m => `SELECT '${m}' AS month`).join(' UNION ALL ')}) m
@@ -113,6 +141,15 @@ export default {
       const f = form.value;
       if (!f.name || !f.category_id) { toast('Name and category are required', 'error'); return; }
       if (f.recurrence === 'threshold' && !thresholdCents(f)) { toast('Enter the amount at which this provider bills you', 'error'); return; }
+      if (f.entryMode === 'budget') {
+        showProblems.value = true;
+        if (!budgetLines.value.length) { toast('Add at least one budget line, or switch to Manual', 'error'); return; }
+        if (budgetLines.value.some(lineProblem)) { toast('Some budget lines need fixing', 'error'); return; }
+      }
+      if (f.entryMode === 'formula') {
+        const p = formulaCheck(f.formula);
+        if (p) { toast(p, 'error'); return; }
+      }
       saving.value = true;
       try {
         const formulaVal = f.entryMode === 'formula' ? f.formula : null;
@@ -134,6 +171,9 @@ export default {
                 f.start_month || null, f.end_month || null, dateRange.value?.end);
             }
           }
+          // Budget lines are kept only in that mode; a formula or budget lines recompute the forecast in every scenario
+          await saveBudgetLines(props.itemId, f.entryMode === 'budget' ? linesPayload() : []);
+          if (f.entryMode !== 'manual') await recomputeComputedExpenses([props.itemId]);
         } else {
           const res = await execute(`INSERT INTO expense_items (name, alias, company, charge_label, category_id,
             formula, recurrence, renewal_day, start_month, end_month, notes) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
@@ -142,6 +182,8 @@ export default {
           const itemId = res.lastInsertRowid;
           if (itemId && sub) await execute('UPDATE expense_items SET subcategory_id=? WHERE id=?', [sub, itemId]);
           if (itemId && thresholdCents(f)) await execute('UPDATE expense_items SET billing_threshold=? WHERE id=?', [thresholdCents(f), itemId]);
+          if (itemId && f.entryMode === 'budget') await saveBudgetLines(itemId, linesPayload());
+          if (itemId && f.entryMode !== 'manual') await recomputeComputedExpenses([itemId]);
           // For manual entry, seed values across the date range
           if (itemId && f.entryMode === 'manual' && f.amount) {
             const cents = Math.round(parseFloat(f.amount) * 100);
@@ -175,7 +217,8 @@ export default {
     };
 
     return {
-      INPUT, loading, saving, editing, form, editValues, months, subOptions, hasSubcategories,
+      INPUT, loading, saving, editing, form, editValues, months, subOptions, hasSubcategories, formatCents,
+      formulaCtx, formulaVars, budgetLines, budgetTotal, lineNow, lineProblem, showProblems, addLine, removeLine, evalNow, formulaCheck,
       autoAlias, onCategoryChange, save, saveCellValue, monthLabel, emit,
     };
   },
@@ -239,6 +282,8 @@ export default {
               <div class="flex gap-2 mt-1">
                 <button @click="form.entryMode = 'manual'" :class="['px-3 py-1.5 text-xs rounded-lg border', form.entryMode === 'manual' ? 'bg-indigo-50 border-indigo-300 text-indigo-700' : 'border-gray-200 text-gray-500']">Manual</button>
                 <button @click="form.entryMode = 'formula'" :class="['px-3 py-1.5 text-xs rounded-lg border', form.entryMode === 'formula' ? 'bg-indigo-50 border-indigo-300 text-indigo-700' : 'border-gray-200 text-gray-500']">Formula</button>
+                <button @click="form.entryMode = 'budget'; if (!budgetLines.length) addLine()" :class="['px-3 py-1.5 text-xs rounded-lg border', form.entryMode === 'budget' ? 'bg-indigo-50 border-indigo-300 text-indigo-700' : 'border-gray-200 text-gray-500']"
+                  title="Split the budget into lines (fixed amounts or formulas); the expense stays one line for bank statements">Budget lines</button>
               </div>
             </div>
             <div v-if="form.entryMode === 'manual'">
@@ -246,18 +291,47 @@ export default {
               <input v-model="form.amount" type="number" step="0.01" placeholder="0.00" :class="INPUT"/>
             </div>
             <div v-if="form.entryMode === 'formula'">
-              <label class="block text-xs font-medium text-gray-500 mb-1">Formula</label>
-              <input v-model="form.formula" placeholder="e.g. customers.total * 5" :class="INPUT + ' font-mono'"/>
+              <label class="block text-xs font-medium text-gray-500 mb-1">Formula <span class="font-normal text-gray-400">(amount per charge)</span></label>
+              <formula-input v-model="form.formula" :variables="formulaVars"/>
+              <p v-if="form.formula && formulaCheck(form.formula)" class="text-[11px] text-red-600 mt-1">{{ formulaCheck(form.formula) }}</p>
+              <p v-else-if="form.formula" class="text-[11px] text-gray-500 mt-1">This month: {{ formatCents(evalNow(form.formula)) }}. Recomputed for each month from the forecast.</p>
+            </div>
+            <div v-if="form.entryMode === 'budget'">
+              <label class="block text-xs font-medium text-gray-500 mb-1">{{ form.recurrence === 'threshold' ? 'Monthly spend' : 'Amount per charge' }} <span class="font-normal text-gray-400">(this month)</span></label>
+              <div class="px-3 py-2 text-sm rounded-lg bg-gray-50 border border-gray-100 font-semibold text-gray-900 tabular-nums">{{ formatCents(budgetTotal) }}</div>
+            </div>
+            <div v-if="form.entryMode === 'budget'" class="col-span-2 rounded-lg border border-gray-200 p-3">
+              <div class="flex items-baseline justify-between gap-3 flex-wrap mb-2">
+                <span class="text-xs font-medium text-gray-700">Budget lines</span>
+                <span class="text-[11px] text-gray-400">Fixed amounts, or formulas recomputed each month (e.g. customers.total * 0.4). Bank statements still see one expense.</span>
+              </div>
+              <div v-for="(l, i) in budgetLines" :key="i" class="mb-2">
+                <div class="flex items-start gap-2 flex-wrap sm:flex-nowrap">
+                  <input v-model="l.name" placeholder="e.g. Production droplet" :aria-label="'Budget line ' + (i + 1) + ' name'" :class="INPUT + ' sm:flex-1 min-w-[9rem]'"/>
+                  <select v-model="l.kind" :aria-label="'Budget line ' + (i + 1) + ' type'" class="px-2 py-2 text-sm border border-gray-200 rounded-lg bg-white">
+                    <option value="amount">Amount</option><option value="formula">Formula</option>
+                  </select>
+                  <input v-if="l.kind === 'amount'" v-model="l.amount" type="number" step="0.01" placeholder="0.00" :aria-label="'Budget line ' + (i + 1) + ' amount'"
+                    class="w-28 px-3 py-2 text-sm text-right border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+                  <formula-input v-else v-model="l.formula" :variables="formulaVars" class="flex-1 min-w-[12rem]"/>
+                  <span class="w-24 pt-2 text-right text-sm text-gray-700 tabular-nums" :title="l.kind === 'formula' ? 'This month' : ''">{{ formatCents(lineNow(l)) }}</span>
+                  <button type="button" @click="removeLine(i)" class="pt-2 text-gray-400 hover:text-red-500" :aria-label="'Remove budget line ' + (i + 1)">
+                    <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6L6 18M6 6l12 12"/></svg>
+                  </button>
+                </div>
+                <p v-if="(showProblems || (l.kind === 'formula' && l.formula)) && lineProblem(l)" class="text-[11px] text-red-600 mt-1">{{ lineProblem(l) }}</p>
+              </div>
+              <button type="button" @click="addLine" class="text-xs text-indigo-600 hover:text-indigo-800">+ Add budget line</button>
             </div>
             <div>
               <label class="block text-xs font-medium text-gray-500 mb-1">Start Month</label>
-              <input v-model="form.start_month" type="month" :class="INPUT"/>
+              <month-picker v-model="form.start_month" block aria-label="Start month"/>
               <p v-if="form.recurrence === 'annual' || form.recurrence === 'quarterly'" class="text-[11px] text-gray-400 mt-1">The month of the first charge; renewals follow every {{ form.recurrence === 'annual' ? '12' : '3' }} months.</p>
               <p v-else-if="form.recurrence === 'weekly'" class="text-[11px] text-gray-400 mt-1">With the renewal day, the date of the first charge; the next ones follow every 7 days.</p>
             </div>
             <div>
               <label class="block text-xs font-medium text-gray-500 mb-1">End Month</label>
-              <input v-model="form.end_month" type="month" :class="INPUT"/>
+              <month-picker v-model="form.end_month" block clearable placeholder="Ongoing" aria-label="End month"/>
             </div>
             <div class="col-span-2">
               <label class="block text-xs font-medium text-gray-500 mb-1">Notes</label>

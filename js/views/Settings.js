@@ -646,7 +646,7 @@ export default {
             </div>
             <div>
               <label class="block text-sm font-medium text-gray-700 mb-1">Actuals through</label>
-              <input v-model="settings.actuals_through" type="month" class="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+              <month-picker v-model="settings.actuals_through" block clearable placeholder="Not set" aria-label="Actuals through"/>
               <p class="text-xs text-gray-400 mt-1">The last month with real figures. Revenue and P&L treat the months after it as forecasts.</p>
             </div>
             <div>

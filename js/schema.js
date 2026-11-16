@@ -68,6 +68,18 @@ const DDL = [
     created_at    TEXT DEFAULT (datetime('now'))
   )`,
 
+  // What an expense's budget is made of (e.g. DigitalOcean: production droplet, test droplet, storage per customer).
+  // Each line is a fixed amount per charge (cents) or a formula in currency units; the forecast is their sum (budget.js).
+  `CREATE TABLE IF NOT EXISTS expense_budget_lines (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    expense_item_id INTEGER NOT NULL REFERENCES expense_items(id) ON DELETE CASCADE,
+    name            TEXT NOT NULL,
+    amount          INTEGER,
+    formula         TEXT,
+    sort_order      INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT DEFAULT (datetime('now'))
+  )`,
+
   `CREATE TABLE IF NOT EXISTS expense_values (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     expense_item_id INTEGER NOT NULL REFERENCES expense_items(id) ON DELETE CASCADE,
@@ -342,7 +354,7 @@ const ADDED_COLUMNS = {
   },
 };
 
-const ADDED_TABLES = ['expense_subcategories', 'bank_accounts', 'bank_balances', 'statement_imports', 'statement_drafts', 'bank_transactions', 'fx_rates', 'live_balances',
+const ADDED_TABLES = ['expense_subcategories', 'bank_accounts', 'bank_balances', 'statement_imports', 'statement_drafts', 'bank_transactions', 'fx_rates', 'live_balances', 'expense_budget_lines',
   'product_families', 'product_lines', 'pw_plans', 'pw_mrr', 'line_growth'];
 
 // Changes whenever the lists above change, so new upgrades run once on every database, then never again
