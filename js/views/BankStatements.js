@@ -1,14 +1,15 @@
 import { query, execute } from '../db.js';
 import { getBaseScenarioId } from '../schema.js';
-import { formatCents, monthLabelFull } from '../utils.js';
+import { formatCents, monthLabelFull, getReportingCurrency } from '../utils.js';
 import { loadAccounts, accountLabel } from '../bank.js';
 import { loadScenarioEmployees } from '../payroll.js';
 import {
   MAX_PDF_BYTES, KIND_OPTIONS, kindLabel, buildContext, readStatement, prepareReview, needsDecision, findOverlaps,
-  saveReview, findDiscrepancies, applyFix, deleteImport, discrepancyType, discrepancyFixes, relinkReview,
+  saveReview, findDiscrepancies, applyFix, deleteImport, discrepancyType, discrepancyFixes, relinkReview, uniqueAlias,
 } from '../statements.js';
 import { loadCategoryLookups, subcategoryOptions } from '../expenses.js';
 import ExpenseModal from '../../components/ExpenseModal.js';
+import EmployeeModal from '../../components/EmployeeModal.js';
 
 // Colour and tag of each kind of discrepancy
 const D_STYLE = {
@@ -25,7 +26,7 @@ const UNREAD_KEY = 'vintana_unread_statements';
 
 export default {
   name: 'BankStatementsView',
-  components: { ExpenseModal },
+  components: { ExpenseModal, EmployeeModal },
   setup() {
     const { ref, reactive, computed, onMounted, onBeforeUnmount, inject, watch } = Vue;
     const settings = inject('settings');
@@ -276,15 +277,67 @@ export default {
         row.employee_id = Number(v.slice(4));
         row.saveLabel = true;
       } else if (v === 'new') {
-        row.expense_item_id = null;
-        row.newProvider ||= blankProvider(row);
-        row.saveLabel = false;
+        createExpense(row); // the full "Add expense" form, pre-filled from the line
+      } else if (v === 'newemp') {
+        createEmployee(row);
       } else {
         row.expense_item_id = v ? Number(v) : null;
         row.saveLabel = !!v; // the bank's wording becomes the provider's charge label, so next time it matches
       }
     };
-    const setEmployee = (row, v) => { row.employee_id = v ? Number(v) : null; row.confidence = 'high'; row.saveLabel = !!v; };
+    const setEmployee = (row, v) => {
+      if (v === 'newemp') { createEmployee(row); return; }
+      row.employee_id = v ? Number(v) : null; row.confidence = 'high'; row.saveLabel = !!v;
+    };
+
+    // --- Creating an expense or an employee from a line, in the same forms as the Expenses and Payroll pages ---
+    // The new record is saved straight away (it stays if the statement is discarded) and the line is linked to it.
+    // Amounts are pre-filled only when the account is in the reporting currency, since forecasts are in that currency.
+    const creating = ref(null); // { type: 'expense' | 'employee', row, prefill, scenarioId }
+    const lineAmount = row => (reviewAccount.value?.currency === getReportingCurrency() ? (Math.abs(row.amount) / 100).toFixed(2) : '');
+    const createExpense = async row => {
+      const np = row.newProvider || blankProvider(row);
+      const name = (np.name || '').trim();
+      try {
+        creating.value = {
+          type: 'expense', row, scenarioId: await getBaseScenarioId(),
+          prefill: {
+            name, alias: await uniqueAlias(name || 'expense'), company: np.company || '', charge_label: row.description || '',
+            category_id: np.category_id, subcategory_id: np.subcategory_id ?? null, recurrence: np.recurrence || 'one_time',
+            billing_threshold: np.billing_threshold || '', renewal_day: Number((row.date || '').slice(8, 10)) || null,
+            start_month: row.month, end_month: '', amount: lineAmount(row),
+            notes: `Added from bank statement ${review.value?.fileName || ''}`.trim(),
+          },
+        };
+      } catch (e) { toast('Could not open the form: ' + e.message, 'error'); }
+    };
+    const createEmployee = async row => {
+      try {
+        creating.value = {
+          type: 'employee', row, scenarioId: await getBaseScenarioId(),
+          prefill: { name: row.counterparty || row.description || '', salary_eur: lineAmount(row), start_date: row.month,
+            charge_label: row.description || '' },
+        };
+      } catch (e) { toast('Could not open the form: ' + e.message, 'error'); }
+    };
+    const onCreated = async id => {
+      const c = creating.value;
+      if (!c) return;
+      const row = c.row;
+      row.confidence = 'high';
+      row.saveLabel = false; // the bank wording is already the new record's charge label
+      if (c.type === 'expense') {
+        row.kind = 'expense';
+        row.expense_item_id = id;
+        row.newProvider = null;
+      } else {
+        row.kind = 'salary';
+        row.employee_id = id;
+      }
+      await loadLookups();
+      relinkAll(); // other lines waiting for a new provider of the same name are linked to it too
+    };
+    const departments = computed(() => [...new Set(employees.value.map(e => e.department).filter(Boolean))]);
     const employeeName = id => employees.value.find(e => e.id === id)?.name || 'this person';
     const subOptionsFor = np => subcategoryOptions(subcategories.value, np.category_id);
     const onNewCategory = np => { if (!subOptionsFor(np).some(o => o.value === np.subcategory_id)) np.subcategory_id = null; };
@@ -486,7 +539,7 @@ export default {
     const fmtShort = iso => iso ? new Date(iso + 'T00:00:00').toLocaleDateString('en-GB', { day: 'numeric', month: 'short' }) : '';
 
     return {
-      SELECT, INPUT, KIND_OPTIONS, accounts, providers, providerGroups, categories, employees, planned, history, queue,
+      SELECT, INPUT, KIND_OPTIONS, creating, createExpense, onCreated, departments, loadLookups, accounts, providers, providerGroups, categories, employees, planned, history, queue,
       discrepancies, checking, dStyle, sessionImportsCount, discrepancyFixes, elapsed, progressText, employeeName, subOptionsFor, onNewCategory, onNewRecurrence, subcategories,
       dragging, filter, fileInput, openHistory, active, review, reviewAccount, currencyMismatch, rowsShown, toDecide, flaggedCount, totals,
       canSave, confirmDelete, statusLabel, unreadNotice, dismissUnread, readAnyway, clearFinished, cleanCount, waitingCount, bulk, saveAllClean,
@@ -663,14 +716,15 @@ export default {
                 </td>
                 <td class="px-3 py-2">
                   <template v-if="r.kind === 'expense' || r.kind === 'refund'">
-                    <select :value="providerChoice(r)" @change="setProvider(r, $event.target.value)" :class="SELECT + ' w-full'" :aria-label="'Provider for ' + r.description">
+                    <select :value="providerChoice(r)" @change="setProvider(r, $event.target.value); $event.target.value = providerChoice(r)" :class="SELECT + ' w-full'" :aria-label="'Provider for ' + r.description">
                       <option value="">{{ r.kind === 'refund' ? 'Not linked' : 'Choose...' }}</option>
                       <option v-if="r.kind === 'expense'" value="new">+ New provider</option>
                       <optgroup v-for="g in providerGroups" :key="g.name" :label="g.name">
                         <option v-for="p in g.items" :key="p.id" :value="String(p.id)">{{ p.name }}{{ p.company ? ' (' + p.company + ')' : '' }}</option>
                       </optgroup>
-                      <optgroup v-if="r.kind === 'expense' && employees.length" label="Payroll (records the line as a salary)">
+                      <optgroup v-if="r.kind === 'expense'" label="Payroll (records the line as a salary)">
                         <option v-for="e in employees" :key="'emp' + e.id" :value="'emp:' + e.id">{{ e.name }}{{ e.role ? ' (' + e.role + ')' : '' }}</option>
+                        <option value="newemp">+ New employee</option>
                       </optgroup>
                     </select>
                     <div v-if="r.kind === 'expense' && !r.expense_item_id && r.newProvider" class="mt-2 grid grid-cols-2 gap-2">
@@ -692,15 +746,19 @@ export default {
                         Billed each time spend reaches
                         <input v-model="r.newProvider.billing_threshold" type="number" step="0.01" min="0" :class="INPUT + ' w-28'" aria-label="Billing threshold"/>
                       </label>
+                      <button type="button" @click="createExpense(r)" class="col-span-2 text-left text-xs text-indigo-600 hover:text-indigo-800">
+                        Create now, with start and end months and more options...
+                      </button>
                     </div>
                     <label v-if="r.expense_item_id" class="mt-1.5 flex items-center gap-1.5 text-xs text-gray-500">
                       <input type="checkbox" v-model="r.saveLabel"/> Save this bank wording as the provider's charge label
                     </label>
                   </template>
                   <template v-else-if="r.kind === 'salary'">
-                  <select :value="r.employee_id ? String(r.employee_id) : ''" @change="setEmployee(r, $event.target.value)" :class="SELECT + ' w-full'" :aria-label="'Employee for ' + r.description">
+                  <select :value="r.employee_id ? String(r.employee_id) : ''" @change="setEmployee(r, $event.target.value); $event.target.value = r.employee_id ? String(r.employee_id) : ''" :class="SELECT + ' w-full'" :aria-label="'Employee for ' + r.description">
                     <option value="">Choose...</option>
                     <option v-for="e in employees" :key="e.id" :value="String(e.id)">{{ e.name }}{{ e.role ? ' (' + e.role + ')' : '' }}</option>
+                    <option value="newemp">+ New employee</option>
                   </select>
                   <label v-if="r.kind === 'salary' && r.employee_id" class="mt-1.5 flex items-center gap-1.5 text-xs text-gray-500">
                     <input type="checkbox" v-model="r.saveLabel"/> Save this bank wording as {{ employeeName(r.employee_id) }}'s charge label
@@ -793,8 +851,13 @@ export default {
         </div>
       </div>
 
+      <expense-modal v-if="creating && creating.type === 'expense'" :categories="categories" :subcategories="subcategories"
+        :prefill="creating.prefill" :scenario-id="creating.scenarioId" @created="onCreated" @lookups-changed="loadLookups" @close="creating = null"/>
+      <employee-modal v-if="creating && creating.type === 'employee'" :prefill="creating.prefill" :scenario-id="creating.scenarioId"
+        :scenario-is-base="true" :departments="departments" @created="onCreated" @close="creating = null"/>
+
       <expense-modal v-if="editing" :item-id="editing.itemId" :categories="categories" :subcategories="subcategories"
-        @saved="editing.changed = true" @close="onEditClose"/>
+        @saved="editing.changed = true" @lookups-changed="loadLookups" @close="onEditClose"/>
 
       <div v-if="confirmDelete" class="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
         <div class="bg-white rounded-xl p-6 max-w-sm" role="dialog" aria-modal="true">

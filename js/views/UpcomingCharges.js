@@ -302,7 +302,7 @@ export default {
       </template>
 
       <expense-modal v-if="modalItemId !== null" :item-id="modalItemId" :categories="categories" :subcategories="subcategories"
-        @close="modalItemId = null" @saved="load"/>
+        @close="modalItemId = null" @saved="load" @lookups-changed="load"/>
     </div>
   `,
 };

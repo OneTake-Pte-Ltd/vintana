@@ -9,19 +9,24 @@ import { evalFormulaExact, formulaProblem } from '../js/formula.js';
 
 const INPUT = 'w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500';
 
-// Add or edit an expense. Used by the Expenses and Upcoming Charges pages.
-// `itemId` null = add. Emits `saved` after a change and `close` when dismissed.
+// Add or edit an expense. Used by the Expenses, Upcoming Charges and Bank Statements pages.
+// `itemId` null = add; `prefill` sets fields of a new expense (e.g. from a bank statement line); `scenarioId` writes a
+// new expense's forecast to that scenario instead of the selected one. Emits `saved` after a change, `created` with
+// the new expense's id, `lookups-changed` after a category or sub-category is added, and `close` when dismissed.
 export default {
   name: 'ExpenseModal',
   props: {
     itemId: { type: Number, default: null },
     categories: { type: Array, default: () => [] },
     subcategories: { type: Array, default: () => [] },
+    prefill: { type: Object, default: null },
+    scenarioId: { type: Number, default: null },
   },
-  emits: ['close', 'saved'],
+  emits: ['close', 'saved', 'created', 'lookups-changed'],
   setup(props, { emit }) {
     const { ref, computed, inject, onMounted, watch } = Vue;
-    const scenarioId = inject('scenarioId');
+    const selectedScenarioId = inject('scenarioId');
+    const scenarioId = computed(() => props.scenarioId ?? selectedScenarioId.value);
     const dateRange = inject('dateRange');
     const toast = inject('toast');
 
@@ -38,6 +43,7 @@ export default {
       // A new expense starts this month, renewing on today's date
       recurrence: 'monthly', renewal_day: new Date().getDate(), billing_threshold: '',
       start_month: currentMonth(), end_month: '', notes: '',
+      ...(props.prefill || {}),
     });
     const form = ref(blankForm());
     // Switching to or from weekly or threshold billing converts the amount so the monthly cost stays the same (2,000 a month is about
@@ -50,8 +56,56 @@ export default {
       const monthly = before === 'one_time' ? Math.round(parseFloat(f.amount) * 100) : monthlyShare(Math.round(parseFloat(f.amount) * 100), before);
       f.amount = ((now === 'one_time' ? monthly : chargeFromMonthly(monthly, now)) / 100).toFixed(2);
     });
-    const subOptions = computed(() => subcategoryOptions(props.subcategories, form.value.category_id));
-    const hasSubcategories = computed(() => props.subcategories.length > 0);
+    // Categories and sub-categories: the ones passed in, plus any added from this form
+    const cats = ref([...props.categories]);
+    const subs = ref([...props.subcategories]);
+    watch(() => props.categories, v => { cats.value = [...v]; });
+    watch(() => props.subcategories, v => { subs.value = [...v]; });
+    const subOptions = computed(() => subcategoryOptions(subs.value, form.value.category_id));
+    const hasSubcategories = computed(() => subs.value.length > 0);
+
+    // --- Adding a category or sub-category without leaving the form ---
+    const NEW = '__new__';
+    const adding = ref(null); // 'category' | 'subcategory' while its name is being typed
+    const newName = ref('');
+    const startAdding = what => { adding.value = what; newName.value = ''; };
+    const onCategorySelect = e => {
+      if (e.target.value === NEW) { e.target.value = String(form.value.category_id ?? ''); startAdding('category'); return; }
+      form.value.category_id = Number(e.target.value);
+      onCategoryChange();
+    };
+    const onSubcategorySelect = e => {
+      if (e.target.value === NEW) { e.target.value = String(form.value.subcategory_id ?? ''); startAdding('subcategory'); return; }
+      form.value.subcategory_id = e.target.value === '' ? null : Number(e.target.value);
+    };
+    const addLookup = async () => {
+      const name = newName.value.trim();
+      if (!name) return;
+      try {
+        if (adding.value === 'category') {
+          if (cats.value.some(c => c.name.toLowerCase() === name.toLowerCase())) { toast('That category already exists', 'error'); return; }
+          const order = Math.max(0, ...cats.value.map(c => c.sort_order || 0)) + 1;
+          const res = await execute('INSERT INTO expense_categories (name, sort_order) VALUES (?, ?)', [name, order]);
+          cats.value.push({ id: res.lastInsertRowid, name, sort_order: order });
+          form.value.category_id = res.lastInsertRowid;
+          form.value.subcategory_id = null;
+        } else {
+          const catId = form.value.category_id;
+          const siblings = subs.value.filter(sc => sc.category_id === catId);
+          if (siblings.some(sc => sc.name.toLowerCase() === name.toLowerCase())) { toast('That sub-category already exists in this category', 'error'); return; }
+          const order = Math.max(0, ...siblings.map(sc => sc.sort_order || 0)) + 1;
+          const res = await execute('INSERT INTO expense_subcategories (category_id, name, sort_order) VALUES (?, ?, ?)', [catId, name, order]);
+          subs.value.push({ id: res.lastInsertRowid, category_id: catId, name, sort_order: order,
+            category_name: cats.value.find(c => c.id === catId)?.name });
+          form.value.subcategory_id = res.lastInsertRowid;
+        }
+        toast(adding.value === 'category' ? 'Category added' : 'Sub-category added', 'success');
+        adding.value = null;
+        emit('lookups-changed');
+      } catch (e) {
+        toast('Add failed: ' + e.message, 'error');
+      }
+    };
 
     // --- Formula and budget lines: computed from this month's customers, MRR and payroll (budget.js) ---
     const formulaCtx = ref(null); // null until loaded; formulas are then checked against its names
@@ -140,6 +194,7 @@ export default {
     const save = async () => {
       const f = form.value;
       if (!f.name || !f.category_id) { toast('Name and category are required', 'error'); return; }
+      if (f.start_month && f.end_month && f.end_month < f.start_month) { toast('The end month is before the start month', 'error'); return; }
       if (f.recurrence === 'threshold' && !thresholdCents(f)) { toast('Enter the amount at which this provider bills you', 'error'); return; }
       if (f.entryMode === 'budget') {
         showProblems.value = true;
@@ -180,6 +235,7 @@ export default {
             [f.name, f.alias, f.company || null, f.charge_label || null, f.category_id,
              formulaVal, f.recurrence, f.renewal_day || null, f.start_month || null, f.end_month || null, f.notes || null]);
           const itemId = res.lastInsertRowid;
+          if (itemId) emit('created', itemId);
           if (itemId && sub) await execute('UPDATE expense_items SET subcategory_id=? WHERE id=?', [sub, itemId]);
           if (itemId && thresholdCents(f)) await execute('UPDATE expense_items SET billing_threshold=? WHERE id=?', [thresholdCents(f), itemId]);
           if (itemId && f.entryMode === 'budget') await saveBudgetLines(itemId, linesPayload());
@@ -217,7 +273,7 @@ export default {
     };
 
     return {
-      INPUT, loading, saving, editing, form, editValues, months, subOptions, hasSubcategories, formatCents,
+      INPUT, loading, saving, editing, form, cats, NEW, adding, newName, startAdding, onCategorySelect, onSubcategorySelect, addLookup, editValues, months, subOptions, hasSubcategories, formatCents,
       formulaCtx, formulaVars, budgetLines, budgetTotal, lineNow, lineProblem, showProblems, addLine, removeLine, evalNow, formulaCheck,
       autoAlias, onCategoryChange, save, saveCellValue, monthLabel, emit,
     };
@@ -247,15 +303,29 @@ export default {
             </div>
             <div>
               <label class="block text-xs font-medium text-gray-500 mb-1">Category *</label>
-              <select v-model.number="form.category_id" @change="onCategoryChange" :class="INPUT">
-                <option v-for="c in categories" :key="c.id" :value="c.id">{{ c.name }}</option>
+              <select :value="String(form.category_id ?? '')" @change="onCategorySelect" :class="INPUT" aria-label="Category">
+                <option v-for="c in cats" :key="c.id" :value="String(c.id)">{{ c.name }}</option>
+                <option :value="NEW">+ New category...</option>
               </select>
             </div>
             <div>
               <label class="block text-xs font-medium text-gray-500 mb-1">Sub-category</label>
-              <select v-model="form.subcategory_id" :class="INPUT" :disabled="!hasSubcategories">
-                <option v-for="o in subOptions" :key="String(o.value)" :value="o.value">{{ o.label }}</option>
+              <select :value="form.subcategory_id === null || form.subcategory_id === undefined ? '' : String(form.subcategory_id)" @change="onSubcategorySelect"
+                :class="INPUT" :disabled="!hasSubcategories" aria-label="Sub-category">
+                <option v-for="o in subOptions" :key="String(o.value)" :value="o.value === null ? '' : String(o.value)">{{ o.label }}</option>
+                <option v-if="form.category_id" :value="NEW">+ New sub-category...</option>
               </select>
+            </div>
+            <div v-if="adding" class="col-span-2 rounded-lg border border-indigo-200 bg-indigo-50/50 p-3">
+              <label class="block text-xs font-medium text-gray-700 mb-1">
+                {{ adding === 'category' ? 'New category' : 'New sub-category in ' + (cats.find(c => c.id === form.category_id)?.name || 'this category') }}
+              </label>
+              <div class="flex gap-2">
+                <input v-model="newName" @keydown.enter.prevent="addLookup" @keydown.esc.stop="adding = null" :class="INPUT" placeholder="Name"
+                  :aria-label="adding === 'category' ? 'New category name' : 'New sub-category name'"/>
+                <button type="button" @click="addLookup" :disabled="!newName.trim()" class="px-3 py-2 text-sm bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-40">Add</button>
+                <button type="button" @click="adding = null" class="px-3 py-2 text-sm border border-gray-200 rounded-lg hover:bg-gray-50 bg-white">Cancel</button>
+              </div>
             </div>
             <div>
               <label class="block text-xs font-medium text-gray-500 mb-1">Recurrence</label>

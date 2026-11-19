@@ -3,6 +3,7 @@ import { checkSchema, getSettings, ensureSchemaUpgrades } from './schema.js';
 import { currentMonth, addMonths, setReportingCurrency } from './utils.js';
 import { autoSync } from './profitwell.js';
 import { recomputeDaily, recomputeComputedExpenses } from './budget.js';
+import { recordRunwayIfMissing } from './runwayHistory.js';
 
 import Sidebar from '../components/Sidebar.js';
 import KpiCard from '../components/KpiCard.js';
@@ -163,6 +164,8 @@ const app = Vue.createApp({
         autoSync(settings.value, toast).then(async synced => {
           if (synced) { loadSettings(); await recomputeComputedExpenses().catch(() => 0); mrrVersion.value++; }
           else if (await recomputeDaily().catch(() => false)) mrrVersion.value++;
+          // Today's runway, for the homepage history chart, if nobody has recorded it yet
+          recordRunwayIfMissing(settings.value).catch(() => {});
         });
       } catch {
         // will redirect to login via router guard
