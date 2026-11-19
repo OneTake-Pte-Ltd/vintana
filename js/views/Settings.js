@@ -276,7 +276,7 @@ export default {
           'expense_values', 'revenue_products', 'revenue_values', 'employees',
           'employee_overrides', 'scenario_employees', 'cash_actuals', 'funding_events',
           'bank_accounts', 'bank_balances', 'statement_imports', 'bank_transactions', 'fx_rates',
-          'product_families', 'product_lines', 'pw_plans', 'pw_mrr', 'line_growth'];
+          'product_families', 'product_lines', 'pw_plans', 'pw_mrr', 'line_growth', 'runway_history'];
         const dump = {};
         const rows = await Promise.all(tables.map(t => query(`SELECT * FROM ${t}`).catch(() => [])));
         tables.forEach((t, i) => { dump[t] = rows[i]; });
@@ -305,7 +305,7 @@ export default {
           const dump = JSON.parse(text);
           const { batch, execute } = await import('../db.js');
           const { runMigrations } = await import('../schema.js');
-          const tables = ['bank_transactions', 'statement_imports', 'bank_balances', 'bank_accounts', 'fx_rates',
+          const tables = ['bank_transactions', 'statement_imports', 'bank_balances', 'bank_accounts', 'fx_rates', 'runway_history',
             'line_growth', 'pw_mrr', 'pw_plans', 'product_lines', 'product_families',
             'funding_events', 'cash_actuals', 'scenario_employees',
             'employee_overrides', 'employees', 'revenue_values', 'revenue_products',

@@ -11,8 +11,11 @@ import {
   loadExpenseValues, computeUpcomingCharges, computePayrollCharges, horizonMonth,
   runwayFromData, formatRunway, ITEMS_WITH_LAST_CHARGE_SQL, RUNWAY_DAYS,
 } from '../charges.js';
+import { getBaseScenarioId } from '../schema.js';
+import { saveRunwayDay, loadRunwayHistory, today } from '../runwayHistory.js';
 
 const RENEWAL_DAYS = 7;
+const HISTORY_DAYS = 90; // how far back the runway history chart goes
 
 const COLORS = ['#6366f1', '#f59e0b', '#10b981', '#ef4444', '#8b5cf6'];
 const COGS_PREFIX = 'Cost of Goods Sold'; // the COGS expense category, "Cost of Goods Sold (COGS)"
@@ -39,7 +42,8 @@ export default {
     const renewals = ref([]), payrollDue = ref([]);
     const cogsByMonth = ref({}); // cents: COGS expenses + payroll of departments mapped to COGS
     const expensesByMonth = ref({}); // cents, expenses + payroll, for the chart's months
-    const mrrCanvasRef = ref(null), expenseCanvasRef = ref(null), marginCanvasRef = ref(null);
+    const mrrCanvasRef = ref(null), expenseCanvasRef = ref(null), marginCanvasRef = ref(null), runwayCanvasRef = ref(null);
+    const runwayHistory = ref([]); // [{ day, days }] for the base scenario, oldest first
     let charts = [];
 
     const hasMrr = computed(() => !!mrrSeries.value && mrrSeries.value.months.some(m => mrrSeries.value.totals[m]));
@@ -155,6 +159,12 @@ export default {
         payrollDue.value = computePayrollCharges(people, RENEWAL_DAYS, settings.value?.payroll_pay_day, settings.value?.dept_mapping);
         runwayInfo.value = runwayFromData({ items: renewItems, values: renewValues, people, settings: settings.value,
           cash: cashBalance.value, burn: burnRate.value });
+        // The base scenario's runway is kept day by day (the latest figure of the day wins), then charted
+        const isBase = sid === await getBaseScenarioId().catch(() => null);
+        if (isBase) await saveRunwayDay(runwayInfo.value).catch(() => {});
+        const from = new Date();
+        from.setDate(from.getDate() - HISTORY_DAYS);
+        if (run === loadSeq) runwayHistory.value = await loadRunwayHistory(today(from)).catch(() => []);
       } catch (e) { console.error('Dashboard load error:', e); }
       finally { if (run === loadSeq) { loading.value = false; await nextTick(); renderCharts(); } }
     }
@@ -212,6 +222,24 @@ export default {
           },
         });
       }
+      // Runway history: days of runway, one point per recorded day; a gap where the company wasn't burning cash
+      if (runwayHistory.value.length > 1) {
+        const h = runwayHistory.value;
+        const dayLabel = d => new Date(d + 'T00:00:00').toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
+        makeChart(runwayCanvasRef, {
+          type: 'line',
+          data: { labels: h.map(r => dayLabel(r.day)), datasets: [{ label: 'Runway', data: h.map(r => r.days),
+            borderColor: '#6366f1', backgroundColor: 'rgba(99,102,241,0.08)', fill: true, tension: 0.3,
+            pointRadius: h.length > 45 ? 0 : 2, pointHoverRadius: 4, pointHitRadius: 8, borderWidth: 2, spanGaps: false }] },
+          options: { responsive: true, maintainAspectRatio: false,
+            interaction: { mode: 'index', intersect: false },
+            plugins: { legend: { display: false },
+              tooltip: { callbacks: { label: c => c.raw === null ? 'Not burning cash' : `${c.raw} day${c.raw === 1 ? '' : 's'}` } } },
+            scales: { y: { beginAtZero: true, ticks: { maxTicksLimit: 5, callback: v => v + ' d' }, grid: { color: '#f3f4f6' } },
+              x: { grid: { display: false }, ticks: { maxTicksLimit: 6, autoSkip: true } } },
+          },
+        });
+      }
       // Expense bar chart
       if (expensesByCat.value.length) {
         const labels = expensesByCat.value.map(d => d.category);
@@ -263,7 +291,7 @@ export default {
     return {
       loading, mrr, mrrDelta, arr, arrDelta, cashBalance, cashSource, burnRate, runwayInfo, runwayText, runwayBar, runwayWhen, RUNWAY_DAYS,
       mrrSeries, hasMrr, expensesByCat, marginNow, monthLabel, renewals, payrollDue, renewalsTotal, payrollTotal, grandTotal, payrollLabel,
-      mrrCanvasRef, expenseCanvasRef, marginCanvasRef, formatCents, formatRenewalDate, RENEWAL_DAYS,
+      mrrCanvasRef, expenseCanvasRef, marginCanvasRef, runwayCanvasRef, runwayHistory, HISTORY_DAYS, formatCents, formatRenewalDate, RENEWAL_DAYS,
     };
   },
   template: `
@@ -314,6 +342,11 @@ export default {
         </div>
         <div v-else class="text-gray-400 text-sm py-4">
           {{ cashBalance === null ? 'No cash data available' : 'Company is net positive' }}
+        </div>
+        <div class="mt-5 pt-4 border-t border-gray-100">
+          <h3 class="text-xs font-medium text-gray-500 mb-2">Runway over time <span class="font-normal text-gray-400">base scenario, last {{ HISTORY_DAYS }} days</span></h3>
+          <div v-if="runwayHistory.length > 1" style="height:140px"><canvas ref="runwayCanvasRef" role="img" aria-label="Runway in days, one point per day, over the last 90 days"></canvas></div>
+          <p v-else class="text-xs text-gray-400">Runway is recorded once a day when Vintana is opened; the chart appears from the second day.</p>
         </div>
       </div>
       <div class="bg-white rounded-xl border border-gray-200 p-5">

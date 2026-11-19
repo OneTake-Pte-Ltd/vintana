@@ -454,7 +454,7 @@ export default {
       </template>
 
       <expense-modal v-if="modalOpen" :item-id="modalItemId" :categories="categories" :subcategories="subcategories"
-        @close="modalOpen = false" @saved="load"/>
+        @close="modalOpen = false" @saved="load" @lookups-changed="load"/>
 
       <!-- Delete Confirmation -->
       <div v-if="deleteTarget" class="fixed inset-0 bg-black/50 flex items-center justify-center z-50">

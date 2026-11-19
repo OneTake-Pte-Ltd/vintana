@@ -247,7 +247,7 @@ export function relinkReview(review, providers) {
   return n;
 }
 
-const uniqueAlias = async (name) => {
+export const uniqueAlias = async (name) => {
   const base = name.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '') || 'expense';
   const used = new Set((await query('SELECT alias FROM expense_items WHERE alias IS NOT NULL')).map(r => r.alias));
   let alias = base;

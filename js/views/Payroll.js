@@ -1,15 +1,15 @@
 import { execute, query } from '../db.js';
 import { formatCents, currentMonth, generateMonthRange, monthLabel } from '../utils.js';
-import { getReportingCurrency } from '../utils.js';
 const money = v => formatCents(Math.round(v * 100));
 import { loadScenarioEmployees, employeeCost, isEmployedIn, DEFAULT_DEPT_MAPPING } from '../payroll.js';
 import { recomputeComputedExpenses } from '../budget.js';
+import EmployeeModal from '../../components/EmployeeModal.js';
 
 const COLORS = ['#6366f1','#10b981','#f59e0b','#ef4444','#8b5cf6','#06b6d4','#ec4899','#84cc16','#f97316','#14b8a6'];
-const INPUT = 'w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500';
 
 export default {
   name: 'PayrollView',
+  components: { EmployeeModal },
   setup() {
     const { ref, computed, onMounted, onBeforeUnmount, watch, inject, nextTick } = Vue;
     const scenarioId = inject('scenarioId');
@@ -32,8 +32,6 @@ export default {
     const lineCanvas = ref(null);
     let donutChart = null, lineChart = null;
 
-    const blankForm = () => ({ name:'', role:'', department:'', salary_eur:'', tax_pct:0, start_date:'', end_date:'', notes:'', charge_label:'' });
-    const form = ref(blankForm());
 
     // Salaries actually paid, from bank statements: the latest month for each employee
     const lastPaid = ref({});
@@ -121,51 +119,9 @@ export default {
     }
 
     function toggleSort(c) { if (sortCol.value === c) sortAsc.value = !sortAsc.value; else { sortCol.value = c; sortAsc.value = true; } }
-    function openAdd() { editingEmployee.value = null; form.value = blankForm(); showModal.value = true; }
-    function openEdit(emp) {
-      editingEmployee.value = emp;
-      form.value = { name: emp.name, role: emp.role||'', department: emp.department||'',
-        salary_eur: (emp.salary_monthly/100).toFixed(2), tax_pct: emp.tax_pct||0,
-        start_date: emp.start_date, end_date: emp.end_date||'', notes: emp.notes||'', charge_label: emp.charge_label||'' };
-      showModal.value = true;
-    }
-    async function saveEmployee() {
-      const f = form.value;
-      if (!f.name || !f.start_date || !f.salary_eur) { toast('Name, salary and start date are required', 'error'); return; }
-      const cents = Math.round(parseFloat(f.salary_eur) * 100);
-      if (isNaN(cents) || cents < 0) { toast('Invalid salary', 'error'); return; }
-      const end = f.end_date || null;
-      try {
-        if (editingEmployee.value) {
-          const emp = editingEmployee.value;
-          if (emp._source === 'scenario') {
-            await execute('UPDATE scenario_employees SET name=?,role=?,department=?,salary_monthly=?,tax_pct=?,start_date=?,end_date=?,notes=? WHERE id=?',
-              [f.name, f.role, f.department, cents, f.tax_pct, f.start_date, end, f.notes, emp._scenarioEmployeeId]);
-          } else if (!scenarioIsBase.value) {
-            await execute('INSERT OR REPLACE INTO employee_overrides (employee_id,scenario_id,salary_monthly,tax_pct,start_date,end_date) VALUES (?,?,?,?,?,?)',
-              [emp.id, scenarioId.value, cents, f.tax_pct, f.start_date, end]);
-            // The charge label is how bank statements name the person: the same in every scenario
-            await execute('UPDATE employees SET charge_label=? WHERE id=?', [f.charge_label || null, emp.id]);
-          } else {
-            await execute('UPDATE employees SET name=?,role=?,department=?,salary_monthly=?,tax_pct=?,start_date=?,end_date=?,notes=?,charge_label=? WHERE id=?',
-              [f.name, f.role, f.department, cents, f.tax_pct, f.start_date, end, f.notes, f.charge_label || null, emp.id]);
-          }
-          toast('Employee updated', 'success');
-        } else {
-          if (scenarioIsBase.value) {
-            await execute('INSERT INTO employees (name,role,department,salary_monthly,tax_pct,start_date,end_date,notes,charge_label) VALUES (?,?,?,?,?,?,?,?,?)',
-              [f.name, f.role, f.department, cents, f.tax_pct, f.start_date, end, f.notes, f.charge_label || null]);
-          } else {
-            await execute('INSERT INTO scenario_employees (scenario_id,name,role,department,salary_monthly,tax_pct,start_date,end_date,notes) VALUES (?,?,?,?,?,?,?,?,?)',
-              [scenarioId.value, f.name, f.role, f.department, cents, f.tax_pct, f.start_date, end, f.notes]);
-          }
-          toast('Employee added', 'success');
-        }
-        showModal.value = false;
-        recomputeComputedExpenses().catch(() => 0); // formulas can use headcount.total and payroll.total
-        await loadEmployees(); await nextTick(); renderCharts();
-      } catch (e) { toast('Save failed: ' + e.message, 'error'); }
-    }
+    function openAdd() { editingEmployee.value = null; showModal.value = true; }
+    function openEdit(emp) { editingEmployee.value = emp; showModal.value = true; }
+    async function onEmployeeSaved() { await loadEmployees(); await nextTick(); renderCharts(); }
     async function deleteEmployee(emp) {
       try {
         if (emp._source === 'scenario') await execute('DELETE FROM scenario_employees WHERE id=?', [emp._scenarioEmployeeId]);
@@ -204,10 +160,9 @@ export default {
     onBeforeUnmount(() => { if (donutChart) donutChart.destroy(); if (lineChart) lineChart.destroy(); });
     watch([scenarioId, dateRange], async () => { await loadEmployees(); await nextTick(); renderCharts(); }, { deep:true });
 
-    const currency = Vue.computed(() => getReportingCurrency());
-    return { loading, filteredEmployees, paidFor, paidDiffers, monthLabel, currency, showAll, hiddenCount, departments, deptOptions, saveField, deptFilter, sortCol, sortAsc, toggleSort,
-      totalCost, headcount, showModal, editingEmployee, form, openAdd, openEdit, saveEmployee,
-      confirmDelete, deleteEmployee, empCost, donutCanvas, lineCanvas, formatCents, scenarioIsBase, INPUT };
+    return { loading, filteredEmployees, paidFor, paidDiffers, monthLabel, showAll, hiddenCount, departments, deptOptions, saveField, deptFilter, sortCol, sortAsc, toggleSort,
+      totalCost, headcount, showModal, editingEmployee, openAdd, openEdit, onEmployeeSaved, scenarioId,
+      confirmDelete, deleteEmployee, empCost, donutCanvas, lineCanvas, formatCents, scenarioIsBase };
   },
   template: `
 <div class="space-y-6">
@@ -285,39 +240,8 @@ export default {
       </div>
     </div>
   </template>
-  <div v-if="showModal" class="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-    <div class="bg-white rounded-xl w-full max-w-lg max-h-[90vh] overflow-y-auto p-6">
-      <h3 class="text-lg font-semibold text-gray-900 mb-4">{{ editingEmployee ? 'Edit Employee' : 'Add Employee' }}</h3>
-      <div class="space-y-4">
-        <div class="grid grid-cols-2 gap-4">
-          <div><label class="block text-xs font-medium text-gray-500 mb-1">Name *</label><input v-model="form.name" type="text" :class="INPUT"/></div>
-          <div><label class="block text-xs font-medium text-gray-500 mb-1">Role</label><input v-model="form.role" type="text" :class="INPUT"/></div>
-        </div>
-        <div><label class="block text-xs font-medium text-gray-500 mb-1">Department</label>
-          <input v-model="form.department" type="text" list="dept-list" :class="INPUT"/>
-          <datalist id="dept-list"><option v-for="d in departments" :key="d" :value="d"/></datalist>
-        </div>
-        <div class="grid grid-cols-2 gap-4">
-          <div><label class="block text-xs font-medium text-gray-500 mb-1">Monthly Salary ({{ currency }}) *</label><input v-model="form.salary_eur" type="number" step="0.01" min="0" :class="INPUT"/></div>
-          <div><label class="block text-xs font-medium text-gray-500 mb-1">Tax % (employer)</label><input v-model.number="form.tax_pct" type="number" step="0.1" min="0" :class="INPUT"/></div>
-        </div>
-        <div class="grid grid-cols-2 gap-4">
-          <div><label class="block text-xs font-medium text-gray-500 mb-1">Start Date *</label><month-picker v-model="form.start_date" block aria-label="Start date"/></div>
-          <div><label class="block text-xs font-medium text-gray-500 mb-1">End Date</label><month-picker v-model="form.end_date" block clearable placeholder="Still employed" aria-label="End date"/></div>
-        </div>
-        <div v-if="editingEmployee ? editingEmployee._source !== 'scenario' : scenarioIsBase">
-          <label class="block text-xs font-medium text-gray-500 mb-1">Charge label</label>
-          <input v-model="form.charge_label" :class="INPUT" placeholder="As payments to this person appear on the bank statement"/>
-          <p class="text-[11px] text-gray-400 mt-1">Used to recognise payments to this person when reading bank statements.</p>
-        </div>
-        <div><label class="block text-xs font-medium text-gray-500 mb-1">Notes</label><textarea v-model="form.notes" rows="2" :class="INPUT"></textarea></div>
-      </div>
-      <div class="flex justify-end gap-3 mt-6">
-        <button @click="showModal=false" class="px-4 py-2 text-sm border border-gray-200 rounded-lg hover:bg-gray-50">Cancel</button>
-        <button @click="saveEmployee" class="px-4 py-2 text-sm font-medium text-white bg-indigo-600 rounded-lg hover:bg-indigo-700">{{ editingEmployee ? 'Save Changes' : 'Add Employee' }}</button>
-      </div>
-    </div>
-  </div>
+  <employee-modal v-if="showModal" :employee="editingEmployee" :scenario-id="scenarioId" :scenario-is-base="scenarioIsBase"
+    :departments="departments" @saved="onEmployeeSaved" @close="showModal = false"/>
   <div v-if="confirmDelete" class="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
     <div class="bg-white rounded-xl p-6 max-w-sm">
       <h3 class="text-lg font-semibold text-gray-900 mb-2">Delete Employee</h3>

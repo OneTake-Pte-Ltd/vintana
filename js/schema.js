@@ -289,6 +289,13 @@ const DDL = [
     rate_pct    REAL NOT NULL DEFAULT 0,
     PRIMARY KEY (line_id, scenario_id)
   )`,
+
+  // The base scenario's runway, one figure per day (runwayHistory.js). days: null when the company isn't burning cash.
+  `CREATE TABLE IF NOT EXISTS runway_history (
+    day         TEXT PRIMARY KEY,
+    days        INTEGER,
+    recorded_at TEXT
+  )`,
 ];
 
 const SEED = [
@@ -355,7 +362,7 @@ const ADDED_COLUMNS = {
 };
 
 const ADDED_TABLES = ['expense_subcategories', 'bank_accounts', 'bank_balances', 'statement_imports', 'statement_drafts', 'bank_transactions', 'fx_rates', 'live_balances', 'expense_budget_lines',
-  'product_families', 'product_lines', 'pw_plans', 'pw_mrr', 'line_growth'];
+  'product_families', 'product_lines', 'pw_plans', 'pw_mrr', 'line_growth', 'runway_history'];
 
 // Changes whenever the lists above change, so new upgrades run once on every database, then never again
 const UPGRADES_SIGNATURE = JSON.stringify([ADDED_TABLES, Object.entries(ADDED_COLUMNS).map(([t, c]) => [t, Object.keys(c)])]);
@@ -431,7 +438,7 @@ export async function ensureSchemaUpgrades() {
 
 export async function resetAllData() {
   const tables = [
-    'bank_transactions', 'statement_imports', 'bank_balances', 'bank_accounts', 'fx_rates',
+    'bank_transactions', 'statement_imports', 'bank_balances', 'bank_accounts', 'fx_rates', 'runway_history',
     'line_growth', 'pw_mrr', 'pw_plans', 'product_lines', 'product_families',
     'funding_events', 'cash_actuals', 'scenario_employees',
     'employee_overrides', 'employees', 'revenue_values',
