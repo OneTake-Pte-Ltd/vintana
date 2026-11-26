@@ -15,7 +15,7 @@ import {
   weeklyAnchor, weeklyChargeDatesIn, chargeFromMonthly, monthlyShare,
 } from './utils.js';
 import { loadScenarioEmployees, employeeCost, isEmployedIn } from './payroll.js';
-import { respreadExpense } from './expenses.js';
+import { respreadExpense, applyExpensePeriod } from './expenses.js';
 import { loadAccounts, getRate, convert, monthEnd, accountLabel } from './bank.js';
 import { streamChat, AssistantError, assistantChoice, DEFAULT_RELAY_URL } from './assistant.js';
 import { pdfToMarkdown } from './pdfText.js';
@@ -681,6 +681,10 @@ export async function applyFix(fix) {
       return 'Balance updated';
     case 'end_expense':
       await execute('UPDATE expense_items SET end_month = ? WHERE id = ?', [a.month, a.itemId]);
+      { // Its forecast after the end month goes too, in every scenario
+        const item = (await query('SELECT start_month, recurrence FROM expense_items WHERE id = ?', [a.itemId]))[0];
+        await applyExpensePeriod(a.itemId, { start: item?.start_month || null, end: a.month, recurrence: item?.recurrence });
+      }
       return 'End month set';
     case 'update_forecast': {
       const baseId = await baseScenarioId();

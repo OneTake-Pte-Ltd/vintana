@@ -4,9 +4,11 @@ import { formatCents, monthLabel, generateMonthRange } from '../utils.js';
 import { loadCategoryLookups } from '../expenses.js';
 import { payrollCategory } from '../payroll.js';
 import { loadMrrSeries } from '../profitwell.js';
+import ExpenseModal from '../../components/ExpenseModal.js';
 
 export default {
   name: 'ProfitLossView',
+  components: { ExpenseModal },
   setup() {
     const { ref, computed, watch, onMounted, inject } = Vue;
     const scenarioId = inject('scenarioId');
@@ -17,6 +19,19 @@ export default {
 
     const loading = ref(true);
     const rows = ref([]);
+    const router = VueRouter.useRouter();
+
+    // An expense line opens its expense for editing; a payroll line opens the Payroll page
+    const categories = ref([]), subcats = ref([]);
+    const editingId = ref(null);
+    const clickable = row => !!(row.itemId || row.payroll);
+    const openRow = row => {
+      if (row.itemId) editingId.value = row.itemId;
+      else if (row.payroll) router.push('/payroll');
+    };
+    const reloadLookups = async () => {
+      try { const l = await loadCategoryLookups(); categories.value = l.categories; subcats.value = l.subcategories; } catch { /* keep the loaded ones */ }
+    };
 
     // Line order inside each category: alphabetical, or largest total over the viewed period first
     const SORT_KEY = 'vintana_pnl_sort';
@@ -88,7 +103,7 @@ export default {
           query(`SELECT * FROM ${table} WHERE scenario_id = ? AND month >= ? AND month <= ?`, [scenario, first, last]);
 
         // Everything at once; a scenario's values replace the base values
-        const [mrr, { subcategories }, expItems, expBase, expScen, employees] = await Promise.all([
+        const [mrr, lookups, expItems, expBase, expScen, employees] = await Promise.all([
           loadMrrSeries(sid, first, last),
           loadCategoryLookups(),
           query(`
@@ -100,6 +115,10 @@ export default {
           isBase ? [] : valuesOf('expense_values', sid),
           query('SELECT * FROM employees'),
         ]);
+
+        const { subcategories } = lookups;
+        categories.value = lookups.categories;
+        subcats.value = subcategories;
 
         // --- Expenses ---
         const expRaw = isBase ? expBase : overlayValues(expBase, expScen, v => `${v.expense_item_id}:${v.month}`);
@@ -138,13 +157,13 @@ export default {
             const members = inCat.filter(i => i.subcategory_id === sub.id);
             if (!members.length) continue;
             const subRow = { label: sub.name, type: 'subgroup', values: emptyMonths(), indent: true };
-            const children = members.map(it => ({ label: it.name, type: 'item', level: 2, values: lineValues(it) }));
+            const children = members.map(it => ({ label: it.name, type: 'item', level: 2, values: lineValues(it), itemId: it.id }));
             children.forEach(c => { for (const m of ml) subRow.values[m] += c.values[m]; });
             R.push(subRow, ...children);
           }
           const grouped = new Set(subcategories.filter(sc => sc.category_name === categoryName).map(sc => sc.id));
           for (const it of inCat.filter(i => !grouped.has(i.subcategory_id))) {
-            R.push({ label: it.name, type: 'item', values: lineValues(it), indent: true });
+            R.push({ label: it.name, type: 'item', values: lineValues(it), indent: true, itemId: it.id });
           }
         };
 
@@ -187,7 +206,7 @@ export default {
           if (payrollByCat[cat.name]) {
             const pv = emptyMonths();
             for (const m of ml) { pv[m] = (payrollByCat[cat.name] || {})[m] || 0; catTot[m] += pv[m]; }
-            R.push({ label: `${cat.short} Payroll (auto)`, type: 'item', values: pv, indent: true });
+            R.push({ label: `${cat.short} Payroll (auto)`, type: 'item', values: pv, indent: true, payroll: true });
           }
 
           // Expense items in this category
@@ -223,7 +242,8 @@ export default {
       return isForecast(m) ? 'bg-blue-50' : 'bg-white';
     };
 
-    return { rows, sortedRows, sortMode, months, loading, isForecast, formatCents, monthLabel, labelBg, cellBg };
+    return { rows, sortedRows, sortMode, months, loading, isForecast, formatCents, monthLabel, labelBg, cellBg,
+      categories, subcats, editingId, clickable, openRow, reloadLookups, loadData };
   },
   template: `
     <div>
@@ -262,7 +282,10 @@ export default {
             </tr>
           </thead>
           <tbody>
-            <tr v-for="(row, idx) in sortedRows" :key="idx">
+            <tr v-for="(row, idx) in sortedRows" :key="idx"
+                v-bind="clickable(row) ? { tabindex: 0, role: 'button', title: row.payroll ? 'Open in Payroll' : 'Edit ' + row.label } : {}"
+                @click="clickable(row) && openRow(row)" @keydown.enter="clickable(row) && openRow(row)"
+                :class="clickable(row) ? 'cursor-pointer group focus:outline-none' : ''">
               <td class="sticky left-0 z-10 px-4 py-1.5 border-r border-gray-200 whitespace-nowrap"
                   :class="[
                     labelBg(row),
@@ -274,7 +297,7 @@ export default {
                     row.type === 'subgroup' ? 'font-medium text-gray-800' : '',
                     row.level === 2 ? 'pl-12' : row.indent ? 'pl-8' : 'pl-4',
                   ]">
-                {{ row.label }}
+                <span :class="clickable(row) ? 'group-hover:text-indigo-700 group-hover:underline group-focus-visible:text-indigo-700 group-focus-visible:underline' : ''">{{ row.label }}</span>
               </td>
               <td v-for="m in months" :key="m"
                   :class="[
@@ -295,6 +318,8 @@ export default {
           </tbody>
         </table>
       </div>
+      <expense-modal v-if="editingId !== null" :item-id="editingId" :categories="categories" :subcategories="subcats"
+        @close="editingId = null" @saved="loadData" @lookups-changed="reloadLookups"/>
     </div>
   `,
 };

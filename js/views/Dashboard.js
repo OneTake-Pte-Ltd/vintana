@@ -13,6 +13,9 @@ import {
 } from '../charges.js';
 import { getBaseScenarioId } from '../schema.js';
 import { saveRunwayDay, loadRunwayHistory, today } from '../runwayHistory.js';
+import { loadCategoryLookups } from '../expenses.js';
+import ExpenseModal from '../../components/ExpenseModal.js';
+import EmployeeModal from '../../components/EmployeeModal.js';
 
 const RENEWAL_DAYS = 7;
 const HISTORY_DAYS = 90; // how far back the runway history chart goes
@@ -26,6 +29,7 @@ function centsTick(v) { return formatCents(Math.round(v * 100)); }
 
 export default {
   name: 'DashboardView',
+  components: { ExpenseModal, EmployeeModal },
   setup() {
     const { ref, computed, onMounted, onBeforeUnmount, watch, inject, nextTick } = Vue;
     const scenarioId = inject('scenarioId');
@@ -45,6 +49,20 @@ export default {
     const mrrCanvasRef = ref(null), expenseCanvasRef = ref(null), marginCanvasRef = ref(null), runwayCanvasRef = ref(null);
     const runwayHistory = ref([]); // [{ day, days }] for the base scenario, oldest first
     let charts = [];
+
+    // Editing a renewal (expense) or a person in the payroll due, without leaving the Dashboard
+    const people = ref([]), scenarioIsBase = ref(true);
+    const categories = ref([]), subcategories = ref([]);
+    const editingExpenseId = ref(null), editingEmployee = ref(null);
+    const departments = computed(() => [...new Set(people.value.map(e => e.department).filter(Boolean))]);
+    async function loadLookups() {
+      try { ({ categories: categories.value, subcategories: subcategories.value } = await loadCategoryLookups()); }
+      catch { /* the form still opens; its category list is then empty */ }
+    }
+    const openCharge = c => {
+      if (c.kind === 'payroll') editingEmployee.value = c.employee;
+      else editingExpenseId.value = c.id;
+    };
 
     const hasMrr = computed(() => !!mrrSeries.value && mrrSeries.value.months.some(m => mrrSeries.value.totals[m]));
 
@@ -141,6 +159,7 @@ export default {
         totalExpenses.value = expenses[0]?.v || 0;
         // The scenario's people (base employees with its changes, plus its own hires), as on the Payroll page
         const people = scenarioEmp.employees;
+        setPeople(scenarioEmp);
         const payrollIn = m => people.filter(e => isEmployedIn(e, m)).reduce((s, e) => s + employeeCost(e), 0);
         totalPayroll.value = payrollIn(month);
 
@@ -168,6 +187,8 @@ export default {
       } catch (e) { console.error('Dashboard load error:', e); }
       finally { if (run === loadSeq) { loading.value = false; await nextTick(); renderCharts(); } }
     }
+
+    function setPeople(res) { people.value = res.employees; scenarioIsBase.value = res.isBase; }
 
     function destroyCharts() { charts.forEach(c => c.destroy()); charts = []; }
 
@@ -278,7 +299,7 @@ export default {
       }
     }
 
-    onMounted(() => loadData());
+    onMounted(() => { loadData(); loadLookups(); });
     onBeforeUnmount(() => destroyCharts());
     watch(() => [scenarioId.value, dateRange.value, mrrVersion.value], () => loadData(), { deep: true });
 
@@ -291,6 +312,7 @@ export default {
     return {
       loading, mrr, mrrDelta, arr, arrDelta, cashBalance, cashSource, burnRate, runwayInfo, runwayText, runwayBar, runwayWhen, RUNWAY_DAYS,
       mrrSeries, hasMrr, expensesByCat, marginNow, monthLabel, renewals, payrollDue, renewalsTotal, payrollTotal, grandTotal, payrollLabel,
+      categories, subcategories, editingExpenseId, editingEmployee, departments, scenarioIsBase, scenarioId, openCharge, loadData, loadLookups,
       mrrCanvasRef, expenseCanvasRef, marginCanvasRef, runwayCanvasRef, runwayHistory, HISTORY_DAYS, formatCents, formatRenewalDate, RENEWAL_DAYS,
     };
   },
@@ -358,7 +380,7 @@ export default {
     <!-- Row 4: Upcoming Renewals -->
     <div class="bg-white rounded-xl border border-gray-200 p-5">
       <div class="flex items-center justify-between mb-4">
-        <h2 class="text-sm font-semibold text-gray-700">Upcoming Renewals <span class="font-normal text-gray-400">(next {{ RENEWAL_DAYS }} days)</span></h2>
+        <h2 class="text-sm font-semibold text-gray-700">Upcoming Renewals <span class="font-normal text-gray-400">(next {{ RENEWAL_DAYS }} days, click a line to edit it)</span></h2>
         <router-link to="/upcoming" class="text-xs text-indigo-600 hover:text-indigo-800">See all upcoming charges</router-link>
       </div>
       <div v-if="renewals.length || payrollDue.length" class="overflow-x-auto">
@@ -372,13 +394,23 @@ export default {
           </tr>
         </thead>
         <tbody>
-          <tr v-for="r in renewals" :key="r.key" class="border-b border-gray-50">
+          <!-- Each row opens its expense, or the person's payroll, for editing -->
+          <tr v-for="r in renewals" :key="r.key" @click="openCharge(r)" @keydown.enter="openCharge(r)" tabindex="0"
+            :aria-label="'Edit ' + r.name" class="border-b border-gray-50 hover:bg-gray-50 cursor-pointer focus:outline-none focus-visible:bg-indigo-50">
             <td class="sticky-col py-2.5 pr-3 text-gray-900">{{ r.name }}</td>
             <td class="py-2.5 text-gray-500">{{ r.company || '—' }}</td>
             <td class="py-2.5 text-right text-gray-900">{{ formatCents(r.amount) }}</td>
             <td class="py-2.5 text-right text-gray-500" :title="r.estimated ? 'Estimated from the monthly spend' : ''">{{ r.estimated ? '≈ ' : '' }}{{ formatRenewalDate(r) }}</td>
           </tr>
           <tr v-if="!renewals.length"><td colspan="4" class="py-2.5 text-gray-400">No renewals</td></tr>
+          <tr v-for="p in payrollDue" :key="p.key" @click="openCharge(p)" @keydown.enter="openCharge(p)" tabindex="0"
+            :aria-label="'Edit ' + p.name" class="border-b border-gray-50 hover:bg-gray-50 cursor-pointer focus:outline-none focus-visible:bg-indigo-50">
+            <td class="sticky-col py-2.5 pr-3 text-gray-900">{{ p.name }}
+              <span class="ml-1 inline-flex items-center px-1.5 py-0.5 rounded bg-gray-100 text-gray-500 text-[11px]">Payroll</span></td>
+            <td class="py-2.5 text-gray-500">{{ p.company || '—' }}</td>
+            <td class="py-2.5 text-right text-gray-900">{{ formatCents(p.amount) }}</td>
+            <td class="py-2.5 text-right text-gray-500">{{ formatRenewalDate(p) }}</td>
+          </tr>
         </tbody>
         <tfoot class="text-sm">
           <!-- Sub-lines, muted, then the total: a heavier rule, a tinted band and a larger bold amount -->
@@ -403,6 +435,10 @@ export default {
       <p v-else class="text-sm text-gray-400 py-4 text-center">No renewals or payroll in the next {{ RENEWAL_DAYS }} days</p>
     </div>
   </div>
+  <expense-modal v-if="editingExpenseId !== null" :item-id="editingExpenseId" :categories="categories" :subcategories="subcategories"
+    @close="editingExpenseId = null" @saved="loadData" @lookups-changed="loadLookups"/>
+  <employee-modal v-if="editingEmployee" :employee="editingEmployee" :scenario-id="scenarioId" :scenario-is-base="scenarioIsBase"
+    :departments="departments" @saved="loadData" @close="editingEmployee = null"/>
 </div>
   `,
 };
