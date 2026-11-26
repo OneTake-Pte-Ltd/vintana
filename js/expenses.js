@@ -1,6 +1,7 @@
 import { query, execute } from './db.js';
 import { currentMonth, expenseMonthlyValues, forecastEnd, chargeFromMonthly, MULTI_CHARGE } from './utils.js';
 import { loadBudgetLines, isComputed, recomputeComputedExpenses } from './budget.js';
+import { getBaseScenarioId } from './schema.js';
 
 export const RECURRENCE_OPTIONS = [
   { value: 'weekly', label: 'Weekly' },
@@ -42,6 +43,39 @@ export async function respreadExpense(itemId, scenarioId, chargeCents, recurrenc
     ? (startMonth && startMonth >= from ? expenseMonthlyValues(chargeCents, recurrence, startMonth, end) : [])
     : expenseMonthlyValues(chargeCents, recurrence, from, end);
   for (const v of vals) {
+    await execute('INSERT OR IGNORE INTO expense_values (expense_item_id, scenario_id, month, amount, is_actual) VALUES (?,?,?,?,0)',
+      [itemId, scenarioId, v.month, v.amount]);
+  }
+}
+
+// After an expense's start or end month changes: makes the scenario's forecast follow the new period.
+// Forecast values outside [start, end] are removed from the scenario; in a scenario other than the base, the base's
+// forecast values outside the period are hidden with a 0 for this scenario (a scenario value replaces the base value),
+// so other scenarios keep theirs. Actuals read from bank statements are kept. Months the period gained (from this
+// month on) are filled with `chargeCents` on `recurrence`, when given, without replacing values already there.
+export async function applyExpensePeriod(itemId, scenarioId, { start, end, oldStart, oldEnd, chargeCents, recurrence, rangeEnd }) {
+  const outside = `(${start ? 'month < ?' : '0'} OR ${end ? 'month > ?' : '0'})`;
+  const bounds = [start, end].filter(Boolean);
+  if (bounds.length) {
+    await execute(`DELETE FROM expense_values WHERE expense_item_id = ? AND scenario_id = ? AND is_actual = 0 AND ${outside}`,
+      [itemId, scenarioId, ...bounds]);
+    const baseId = await getBaseScenarioId();
+    if (baseId && baseId !== scenarioId) {
+      const baseRows = await query(`SELECT month FROM expense_values WHERE expense_item_id = ? AND scenario_id = ? AND is_actual = 0
+        AND amount <> 0 AND ${outside}`, [itemId, baseId, ...bounds]);
+      for (const r of baseRows) {
+        await execute('INSERT OR IGNORE INTO expense_values (expense_item_id, scenario_id, month, amount, is_actual) VALUES (?,?,?,0,0)',
+          [itemId, scenarioId, r.month]);
+      }
+    }
+  }
+  // Months the period gained, from this month on
+  if (!chargeCents || recurrence === 'one_time') return;
+  const from = start && start > currentMonth() ? start : currentMonth();
+  const to = end || forecastEnd(rangeEnd);
+  if (to < from) return;
+  const gained = m => (oldStart && m < oldStart) || (oldEnd && m > oldEnd);
+  for (const v of expenseMonthlyValues(chargeCents, recurrence, from, to).filter(v => gained(v.month))) {
     await execute('INSERT OR IGNORE INTO expense_values (expense_item_id, scenario_id, month, amount, is_actual) VALUES (?,?,?,?,0)',
       [itemId, scenarioId, v.month, v.amount]);
   }

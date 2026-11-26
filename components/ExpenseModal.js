@@ -3,7 +3,7 @@ import { getBaseScenarioId } from '../js/schema.js';
 import {
   monthLabel, generateMonthRange, currentMonth, chargeFromMonthly, formatCents, monthlyShare, expenseMonthlyValues, forecastEnd, MULTI_CHARGE,
 } from '../js/utils.js';
-import { subcategoryOptions, respreadExpense } from '../js/expenses.js';
+import { subcategoryOptions, respreadExpense, applyExpensePeriod } from '../js/expenses.js';
 import { formulaContexts, variablesOf, loadBudgetLines, saveBudgetLines, recomputeComputedExpenses } from '../js/budget.js';
 import { evalFormulaExact, formulaProblem } from '../js/formula.js';
 
@@ -129,7 +129,7 @@ export default {
       .then(c => { formulaCtx.value = c[currentMonth()] || {}; }).catch(() => { formulaCtx.value = null; });
 
     const baseScenarioId = getBaseScenarioId;
-    // Amount and recurrence as loaded, to tell whether the forecast needs rewriting on save
+    // Amount, recurrence and period as loaded, to tell whether the forecast needs rewriting on save
     let original = null;
 
     onMounted(async () => {
@@ -145,7 +145,7 @@ export default {
           WHERE ei.id = ?`, [sid, currentMonth(), baseId, currentMonth(), props.itemId]);
         const item = rows[0];
         if (!item) { toast('This expense no longer exists', 'error'); emit('close'); return; }
-        original = { amount: '', recurrence: item.recurrence };
+        original = { amount: '', recurrence: item.recurrence, start_month: item.start_month || '', end_month: item.end_month || '' };
         form.value = {
           name: item.name, alias: item.alias || '', company: item.company || '',
           charge_label: item.charge_label || '', category_id: item.category_id,
@@ -229,6 +229,16 @@ export default {
           // Budget lines are kept only in that mode; a formula or budget lines recompute the forecast in every scenario
           await saveBudgetLines(props.itemId, f.entryMode === 'budget' ? linesPayload() : []);
           if (f.entryMode !== 'manual') await recomputeComputedExpenses([props.itemId]);
+          // A new start or end month: forecast values outside the period are removed from the selected scenario, and
+          // months it gained are filled with the current amount (a respread above has already filled them)
+          if ((f.start_month || '') !== original?.start_month || (f.end_month || '') !== original?.end_month) {
+            const fill = f.entryMode === 'manual' && !changed && cents !== null && !Number.isNaN(cents) ? cents : null;
+            await applyExpensePeriod(props.itemId, scenarioId.value, {
+              start: f.start_month || null, end: f.end_month || null,
+              oldStart: original?.start_month || null, oldEnd: original?.end_month || null,
+              chargeCents: fill, recurrence: f.recurrence, rangeEnd: dateRange.value?.end,
+            });
+          }
         } else {
           const res = await execute(`INSERT INTO expense_items (name, alias, company, charge_label, category_id,
             formula, recurrence, renewal_day, start_month, end_month, notes) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
