@@ -229,16 +229,15 @@ export default {
           // Budget lines are kept only in that mode; a formula or budget lines recompute the forecast in every scenario
           await saveBudgetLines(props.itemId, f.entryMode === 'budget' ? linesPayload() : []);
           if (f.entryMode !== 'manual') await recomputeComputedExpenses([props.itemId]);
-          // A new start or end month: forecast values outside the period are removed from the selected scenario, and
-          // months it gained are filled with the current amount (a respread above has already filled them)
-          if ((f.start_month || '') !== original?.start_month || (f.end_month || '') !== original?.end_month) {
-            const fill = f.entryMode === 'manual' && !changed && cents !== null && !Number.isNaN(cents) ? cents : null;
-            await applyExpensePeriod(props.itemId, scenarioId.value, {
-              start: f.start_month || null, end: f.end_month || null,
-              oldStart: original?.start_month || null, oldEnd: original?.end_month || null,
-              chargeCents: fill, recurrence: f.recurrence, rangeEnd: dateRange.value?.end,
-            });
-          }
+          // Forecast values outside the period are removed in every scenario (this also cleans up an expense whose end
+          // month was set before), and months a longer period gained are filled (a respread above has already filled them)
+          const periodChanged = (f.start_month || '') !== original?.start_month || (f.end_month || '') !== original?.end_month;
+          await applyExpensePeriod(props.itemId, {
+            start: f.start_month || null, end: f.end_month || null,
+            oldStart: periodChanged ? original?.start_month || null : null, oldEnd: periodChanged ? original?.end_month || null : null,
+            scenarioId: scenarioId.value, recurrence: f.recurrence, rangeEnd: dateRange.value?.end,
+            chargeCents: f.entryMode === 'manual' && !changed && cents !== null && !Number.isNaN(cents) ? cents : null,
+          });
         } else {
           const res = await execute(`INSERT INTO expense_items (name, alias, company, charge_label, category_id,
             formula, recurrence, renewal_day, start_month, end_month, notes) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
